@@ -33,3 +33,13 @@ export const nextPublishPrice = ({ current, target, maxMoveBps, tick }: PriceSte
   }
   return wanted;
 };
+
+/**
+ * Whether the next publish lands on the target: the walk from a set-up price
+ * to the real one is over, or there never was one.
+ */
+export const withinOneStep = (step: PriceStep): boolean => {
+  if (step.current === 0n) return false;
+  const wanted = roundDownToTick(step.target, step.tick);
+  return wanted > 0n && nextPublishPrice(step) === wanted;
+};

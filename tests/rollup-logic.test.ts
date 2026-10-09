@@ -5,7 +5,7 @@ import { ManualClock } from "../src/engine/clock.js";
 import { BotOrderSecrets, originOf } from "../src/rollup/bot-orders.js";
 import { type Funded, FundingDesk } from "../src/rollup/funding-desk.js";
 import { checkSubmitted } from "../src/rollup/open-request.js";
-import { nextPublishPrice } from "../src/rollup/price-walk.js";
+import { nextPublishPrice, withinOneStep } from "../src/rollup/price-walk.js";
 import {
   type ChainFill,
   type ChainMarket,
@@ -65,6 +65,16 @@ describe("walking the price under the move limit", () => {
 
   it("gives an empty feed the target at once", () => {
     expect(step(0n, 220_050n)).toBe(220_000n);
+  });
+
+  it("is still warming up while the real price is more than one allowed step away", () => {
+    const near = (current: bigint, target: bigint) =>
+      withinOneStep({ current, target, maxMoveBps: 250, tick: 100n });
+    expect(near(150_000n, 139_000n)).toBe(false);
+    expect(near(142_500n, 139_000n)).toBe(true);
+    expect(near(150_000n, 153_700n)).toBe(true);
+    expect(near(150_000n, 153_800n)).toBe(false);
+    expect(near(0n, 139_000n)).toBe(false);
   });
 });
 

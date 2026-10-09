@@ -63,10 +63,10 @@ Prices and sizes cross this boundary as integers (`bigint`), never floats.
 | --- | --- |
 | `GET /health` | `{ ok, venue, network }`; with `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold |
 | `GET /deployment` | `VENUE=rollup` only, public, cacheable for five minutes. What a browser needs to trade on the program directly: `network`, `programId`, `solanaRpcUrl`, `rollupRpcUrl`, `rollupWsUrl` (the URLs a browser should use), `exchange`, `stats`, and per market `marketId` (the on-chain id), `symbol`, `kind`, `market`, `tape`, `priceFeed`, `baseToken` and `quoteToken` (`symbol`, `mint`, `decimals`; `baseToken` is null on a perpetual), `baseDecimals`, `quoteDecimals`, `lotSize` (base atoms per lot) and `tick` (quote atoms per lot), both as decimal text. No key and no role address |
-| `GET /markets` | per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest |
+| `GET /markets` | per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, `warmingUp` (true with `VENUE=rollup` until the chain's price has first reached the real one) |
 | `GET /tape?market=&limit=` | latest fills: price, size, taker side, time, sequence, `makerTag`, `takerTag`. With `VENUE=rollup` each tag is that side's 8-byte receipt from the chain's tape, read as a big-endian unsigned integer and written as decimal text; the websocket's `fill` message carries the same two fields |
 | `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=` | open, high, low, close, volume, start time |
-| `GET /stats` | orders, fills, volume, traders, latency (median, p99, sample size, where measured), updated at |
+| `GET /stats` | orders, fills, volume, traders, latency (median, p99, sample size, where measured), updated at. With `VENUE=rollup` also `botOrdersOutcomeUnknown` `{ total, settledExecutedLate, settledExpired, stillUnknown }`: bot orders, never users', whose outcome could not be told in time and what became of them |
 | `POST /fund` `{ address }` | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP |
 | `POST /fund/prepare` `{ owner, orderKeys[4] }` | `VENUE=rollup` only. `{ transaction, expiresAtMs, amount }`: the unsigned transaction that opens the account and deposits the grant |
 | `POST /fund/submit` `{ owner, transaction }` | `VENUE=rollup` only. `{ amount, reference }` once the transaction executed; `reference` is its signature |
@@ -92,6 +92,18 @@ types, so a new client release is an edit to that one file.
   with the rollup's own clock. The program refuses a price more than its move limit from
   the last one, so a larger real move is walked there one allowed step per publish. A
   refused publish is logged and the next one is tried.
+- **Warming up.** A deployment starts at its set-up price, which can be far from the real
+  one, and every start walks from wherever the chain's price was left. Until the chain's
+  price has first come within one allowed step of the real price, the market is
+  `warmingUp`: the bots place nothing on it, its price updates are not sent to the
+  websocket or kept for the 24h change, any fill on it goes to the tape only and not into
+  candles or counters, and `/v1/health` does not call prices fresh. So the walk never
+  shows as a wick on a chart.
+- **Unknown outcomes.** The client can stop waiting for an order while it may still run;
+  it then says `unknown` and settles it once the rollup's clock is past the order's
+  expiry. Until that settles, the bot sends nothing else (no requote, no resend), and the
+  order is counted neither as placed nor as failed. It then counts as an executed order,
+  late, or as expired. Cancels, syncs and liquidations wait the same way.
 - **Bots.** Each bot is an ordinary trader: its own seat, its own private view, one-time
   order keys. Its owner key comes from its seed, and its order keys follow from the owner
   key. Where each bot's keys stand is saved in the snapshot (indices, no secret) and

@@ -13,6 +13,7 @@ import {
   MarketReader,
   ORDER_TYPE,
   OrderInvalid,
+  OutcomeUnknown,
   OrderKeyManager,
   RESULT_STATUS,
   SEATS,
@@ -27,11 +28,12 @@ import {
   randomSecret,
   sendAndConfirm,
   type OrderKeyCheckpoint,
+  type OrderResult,
   type TapeFill,
   type View,
 } from "@noirwire/orderbook";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.3.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.3.1";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
@@ -117,7 +119,7 @@ export interface ChainOrder {
  * `expired`: no result showed before the order's expiry.
  */
 export type PlaceStatus =
-  "filled" | "rested" | "cancelled" | "refused" | "expired" | "invalid" | "failed";
+  "filled" | "rested" | "cancelled" | "refused" | "expired" | "invalid" | "failed" | "unknown";
 
 export interface PlaceOutcome {
   status: PlaceStatus;
@@ -126,6 +128,13 @@ export interface PlaceOutcome {
   /** From the send to the result showing in the trader's private view, as the client timed it. */
   sendToResultMs: number;
   reason?: string;
+  /**
+   * Only with `unknown`: the client stopped waiting while the order could
+   * still run. Resolves, once the rollup's clock is past the order's expiry
+   * at the latest, to what became of it: executed after all, or `expired`.
+   * The trader sends nothing else until then.
+   */
+  settled?: Promise<PlaceOutcome>;
 }
 
 /**
@@ -558,6 +567,7 @@ export class ProgramTrader {
   private client: TraderClient;
   private signInAgain = false;
   private queue: Promise<unknown> = Promise.resolve();
+  private unsettled: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly rpcUrl: string,
@@ -577,9 +587,23 @@ export class ProgramTrader {
     return this.keys.checkpoint;
   }
 
-  /** One instruction at a time per trader; a failure on the wire signs in again before the next. */
+  /**
+   * A call whose outcome the client could not tell in time. The instruction
+   * may still run until the rollup's clock passes its expiry, so nothing else
+   * of this trader is sent until `settled` says what became of it.
+   */
+  private async afterUnknown<T>(unknown: OutcomeUnknown): Promise<T | null> {
+    if (unknown.cause !== undefined) this.signInAgain = true;
+    return (await unknown.settled) as T | null;
+  }
+
+  /**
+   * One instruction at a time per trader, and none while an earlier one's
+   * outcome is still unknown; a failure on the wire signs in again before the next.
+   */
   private run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
     const next = this.queue.then(async () => {
+      await this.unsettled;
       if (this.signInAgain) {
         const connection = await signedInConnection(this.rpcUrl, this.owner);
         this.client = new TraderClient(
@@ -594,9 +618,11 @@ export class ProgramTrader {
       try {
         return await operation(this.client);
       } catch (error) {
-        const refusedByProgram =
-          error instanceof TransactionFailed || error instanceof OrderInvalid;
-        if (!refusedByProgram) this.signInAgain = true;
+        const answered =
+          error instanceof TransactionFailed ||
+          error instanceof OrderInvalid ||
+          error instanceof OutcomeUnknown;
+        if (!answered) this.signInAgain = true;
         throw error;
       }
     });
@@ -615,7 +641,17 @@ export class ProgramTrader {
     expirySeconds?: number,
   ): Promise<PlaceOutcome> {
     const nothing = { filled: 0n, rested: 0n, sendToResultMs: 0 };
-    return this.run(async (client) => {
+    const placedAs = (result: OrderResult, timing: { sentAt: number; resultAt: number }) => ({
+      status: placeStatusOf(result.status, result.rested),
+      filled: result.filled,
+      rested: result.rested,
+      sendToResultMs: timing.resultAt - timing.sentAt,
+    });
+    const unknownUntil = (settled: Promise<PlaceOutcome>): PlaceOutcome => {
+      this.unsettled = settled.catch(() => undefined);
+      return { status: "unknown", ...nothing, settled };
+    };
+    return this.run(async (client): Promise<PlaceOutcome> => {
       const placed = await client.placeOrder(
         marketId,
         {
@@ -630,15 +666,24 @@ export class ProgramTrader {
         },
         { riskMarkets, expirySeconds },
       );
-      if (placed.outcome === "expired") return { status: "expired" as const, ...nothing };
-      const { status, filled, rested } = placed.result;
-      return {
-        status: placeStatusOf(status, rested),
-        filled,
-        rested,
-        sendToResultMs: placed.resultAt - placed.sentAt,
-      };
+      if (placed.outcome === "expired") return { status: "expired", ...nothing };
+      if (placed.outcome === "placed") return placedAs(placed.result, placed);
+      return unknownUntil(
+        placed.settled.then((settled) =>
+          settled.outcome === "placed"
+            ? placedAs(settled.result, settled)
+            : { status: "expired", ...nothing },
+        ),
+      );
     }).catch((error: unknown): PlaceOutcome => {
+      if (error instanceof OutcomeUnknown) {
+        if (error.cause !== undefined) this.signInAgain = true;
+        return unknownUntil(
+          error.settled.then((result) =>
+            result ? placedAs(result, result) : { status: "expired", ...nothing },
+          ),
+        );
+      }
       if (error instanceof OrderInvalid) {
         return { status: "invalid", ...nothing, reason: error.reason };
       }
@@ -650,16 +695,28 @@ export class ProgramTrader {
   }
 
   /**
-   * Resolves to how many orders were cancelled, or null when no result showed
-   * before the expiry. Throws when the program refused the transaction.
+   * Resolves to how many orders were cancelled, or null when the instruction
+   * never ran. Throws when the program refused the transaction.
    */
   cancelAll(marketId: number): Promise<bigint | null> {
-    return this.run(async (client) => (await client.cancelAll(marketId))?.cancelled ?? null);
+    return this.run(async (client) => {
+      const result = await client.cancelAll(marketId).catch((error: unknown) => {
+        if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
+        throw error;
+      });
+      return result?.cancelled ?? null;
+    });
   }
 
-  /** Brings the view's seat copy up to date. False when no result showed before the expiry. */
+  /** Brings the view's seat copy up to date. False when the instruction never ran. */
   sync(marketId: number): Promise<boolean> {
-    return this.run(async (client) => (await client.syncView(marketId)) !== null);
+    return this.run(async (client) => {
+      const result = await client.syncView(marketId).catch((error: unknown) => {
+        if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
+        throw error;
+      });
+      return result !== null;
+    });
   }
 
   /**
@@ -674,13 +731,12 @@ export class ProgramTrader {
     riskMarkets: number[],
   ): Promise<LiquidationOutcome> {
     return this.run(async (client) => {
-      const result = await client.liquidate(
-        marketId,
-        seat,
-        LIQUIDATE_UP_TO_LOTS,
-        worstPrice,
-        riskMarkets,
-      );
+      const result = await client
+        .liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice, riskMarkets)
+        .catch((error: unknown) => {
+          if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
+          throw error;
+        });
       if (!result) return "noResult" as const;
       return LIQUIDATION_OUTCOME[result.status] ?? ("noResult" as const);
     }).catch((error: unknown): LiquidationOutcome => {

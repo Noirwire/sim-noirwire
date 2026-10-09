@@ -3,4 +3,5 @@ dist
 coverage
 package-lock.json
 data
+data-*
 docs/DESIGN.md

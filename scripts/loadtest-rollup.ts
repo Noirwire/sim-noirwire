@@ -55,6 +55,10 @@ interface Counters {
   filled: number;
   late: number;
   latenciesMs: number[];
+  unknown: number;
+  unknownExecutedLate: number;
+  unknownExpired: number;
+  lateExecutionsMs: number[];
 }
 
 interface LoadTrader {
@@ -171,7 +175,12 @@ export async function main(): Promise<void> {
     filled: 0,
     late: 0,
     latenciesMs: [],
+    unknown: 0,
+    unknownExecutedLate: 0,
+    unknownExpired: 0,
+    lateExecutionsMs: [],
   };
+  const settling: Promise<void>[] = [];
   const random = new SeededRandom(1337);
   const fillsBefore = (await program.stats(chain)).fills;
   const startedAt = Date.now();
@@ -198,6 +207,21 @@ export async function main(): Promise<void> {
           },
           perpMarkets,
         );
+        if (outcome.settled) {
+          counters.unknown += 1;
+          settling.push(
+            outcome.settled.then((settled) => {
+              if (settled.status === "expired") {
+                counters.unknownExpired += 1;
+                return;
+              }
+              counters.unknownExecutedLate += 1;
+              counters.lateExecutionsMs.push(settled.sendToResultMs);
+              if (settled.filled > 0n) counters.filled += 1;
+            }),
+          );
+          continue;
+        }
         if (outcome.status === "expired") {
           counters.expired += 1;
           continue;
@@ -220,11 +244,16 @@ export async function main(): Promise<void> {
     }
   };
   await Promise.all(traders.map(({ trader }) => runTrader(trader)));
+  const elapsedSeconds = (Date.now() - startedAt) / 1_000;
+  // An order whose outcome was unknown may still run until the rollup's
+  // clock passes its expiry: the report waits until every one has settled.
+  await Promise.allSettled(settling);
   await keep(deployment.programId, traders);
 
-  const elapsedSeconds = (Date.now() - startedAt) / 1_000;
   const fillsOnChain = Number((await program.stats(chain)).fills - fillsBefore);
   const sorted = [...counters.latenciesMs].sort((a, b) => a - b);
+  const sortedLate = [...counters.lateExecutionsMs].sort((a, b) => a - b);
+  const notOnTime = counters.late + counters.expired + counters.unknown;
   const isLocal = /127\.0\.0\.1|localhost/.test(rollupRpcUrl);
   const report = {
     venueKind: "RollupVenue",
@@ -250,8 +279,19 @@ export async function main(): Promise<void> {
     },
     lateThresholdMs: lateMs,
     ordersLate: counters.late,
-    lateOrExpiredShare:
-      counters.sent === 0 ? 0 : (counters.late + counters.expired) / counters.sent,
+    outcomeUnknown: {
+      total: counters.unknown,
+      settledExecutedLate: counters.unknownExecutedLate,
+      settledExpired: counters.unknownExpired,
+      stillUnsettled: counters.unknown - counters.unknownExecutedLate - counters.unknownExpired,
+      lateExecutionSendToResultMs: {
+        minMs: sortedLate[0] ?? 0,
+        medianMs: percentile(sortedLate, 0.5),
+        p95Ms: percentile(sortedLate, 0.95),
+        maxMs: sortedLate[sortedLate.length - 1] ?? 0,
+      },
+    },
+    lateOrExpiredOrUnknownShare: counters.sent === 0 ? 0 : notOnTime / counters.sent,
     network: isLocal
       ? "one machine: the load test, the service and its bots, the query filter, the rollup and the Solana validator all on loopback. Not a network number."
       : `remote rollup at ${rollupRpcUrl}, measured from ${hostname()}`,

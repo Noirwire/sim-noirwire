@@ -25,6 +25,8 @@ const PERP_ID = 0;
 const SOL_LOT = 1_000n;
 const SOL_LOTS_PER_UNIT = 1_000n;
 const GRANT_ATOMS = 5_000_000_000n;
+/** Far from the 150 the local set-up publishes, so every start has a walk of several publishes. */
+const REAL_SOL_PRICE = 139;
 
 const localFile = (name: string): string => readFileSync(join(LOCALNET, name), "utf8");
 const deployment = JSON.parse(localFile("deployment.json")) as { programId: string };
@@ -36,7 +38,13 @@ let running: RunningApp;
 let base: string;
 
 interface Body {
-  markets: { id: string; markPrice: string; tickSize: string; lotSize: string }[];
+  markets: {
+    id: string;
+    markPrice: string;
+    tickSize: string;
+    lotSize: string;
+    warmingUp: boolean;
+  }[];
   fills: { sequence: number; price: string; size: string }[] & { user: number; bot: number };
   orders: { user: number; bot: number };
   volume: { user: string; bot: string };
@@ -104,7 +112,7 @@ const signAndSubmit = (user: User, preparedTransaction: string) => {
 const DATA_DIR = join("data", `test-rollup-${Date.now()}`);
 const botSeeds = Array.from({ length: 16 }, () => randomBytes(32).toString("hex")).join(",");
 
-const startService = async (): Promise<void> => {
+const startService = async (): Promise<WarmUp> => {
   const config = loadConfig({
     VENUE: "rollup",
     HOST: "127.0.0.1",
@@ -125,21 +133,57 @@ const startService = async (): Promise<void> => {
   } as NodeJS.ProcessEnv);
   running = await startApp({ ...config, PORT: 0 }, { priceSource: prices });
   base = `http://127.0.0.1:${running.port}`;
-  pushPrices(151.5, 181);
-  await running.botsStarted;
+  pushPrices(REAL_SOL_PRICE, 181);
+  const seen: WarmUp = { warmingUp: false, healthyMeanwhile: false, fillsMeanwhile: 0 };
   await eventually("the service to report healthy", async () => {
-    pushPrices(151.5, 181);
-    return (await getJson("/v1/health")).status === 200;
+    pushPrices(REAL_SOL_PRICE, 181);
+    const market = (await getJson("/v1/markets")).body.markets.find((entry) => entry.id === PERP);
+    const healthy = (await getJson("/v1/health")).status === 200;
+    if (market?.warmingUp) {
+      seen.warmingUp = true;
+      seen.healthyMeanwhile ||= healthy;
+      seen.fillsMeanwhile += (await getJson(`/v1/tape?market=${PERP}&limit=500`)).body.fills.length;
+    }
+    return healthy;
   });
+  return seen;
 };
 
-beforeAll(startService);
+interface WarmUp {
+  warmingUp: boolean;
+  healthyMeanwhile: boolean;
+  fillsMeanwhile: number;
+}
+
+let firstStart: WarmUp;
+
+beforeAll(async () => {
+  firstStart = await startService();
+});
 
 afterAll(async () => {
   await running?.close();
 });
 
 describe("the service on the real program (local network)", () => {
+  it("keeps the walk from the set-up price to the real one out of the chart, the tape and its health", async () => {
+    expect(firstStart.warmingUp).toBe(true);
+    expect(firstStart.healthyMeanwhile).toBe(false);
+    expect(firstStart.fillsMeanwhile).toBe(0);
+
+    const market = (await getJson("/v1/markets")).body.markets.find((entry) => entry.id === PERP);
+    expect(market?.warmingUp).toBe(false);
+    const candles = await eventually("a candle from the first real fills", async () => {
+      const response = await fetch(`${base}/v1/candles?market=${PERP}&interval=1m`);
+      const body = (await response.json()) as { candles: { high: string; low: string }[] };
+      return body.candles.length > 0 && body.candles;
+    });
+    for (const candle of candles) {
+      expect(Number(candle.high)).toBeLessThan(REAL_SOL_PRICE * 1.01);
+      expect(Number(candle.low)).toBeGreaterThan(REAL_SOL_PRICE * 0.99);
+    }
+  });
+
   it("walks a new price onto the chain and reports the chain's mark in /v1/markets", async () => {
     pushPrices(152.3, 181);
     const onChain = await eventually("the feed to reach 152.3", async () => {

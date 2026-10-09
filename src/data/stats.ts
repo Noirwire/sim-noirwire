@@ -16,6 +16,19 @@ export interface PublicStats {
   tradersTotal: number;
   latency: LatencyStats;
   updatedAtMs: number;
+  botOrdersOutcomeUnknown: UnknownOutcomes;
+}
+
+/**
+ * Bot orders whose outcome could not be told in time, and what became of
+ * each once the venue's clock had passed its expiry. None of them is counted
+ * in `bot.orders` until it has settled as executed.
+ */
+export interface UnknownOutcomes {
+  total: number;
+  settledExecutedLate: number;
+  settledExpired: number;
+  stillUnknown: number;
 }
 
 const emptyCounters = (): ActivityCounters => ({ orders: 0, fills: 0, volume: 0n });
@@ -38,6 +51,12 @@ export class StatsTracker {
   private readonly userCounters = emptyCounters();
   private readonly botCounters = emptyCounters();
   private readonly latencyMs: number[] = [];
+  private readonly unknown: UnknownOutcomes = {
+    total: 0,
+    settledExecutedLate: 0,
+    settledExpired: 0,
+    stillUnknown: 0,
+  };
 
   constructor(
     private readonly latencyWindowSize = 500,
@@ -59,6 +78,17 @@ export class StatsTracker {
    */
   setUserOrders(count: number): void {
     this.userCounters.orders = Math.max(0, count);
+  }
+
+  recordBotOrderUnknown(): void {
+    this.unknown.total += 1;
+    this.unknown.stillUnknown += 1;
+  }
+
+  recordBotOrderSettled(executedLate: boolean): void {
+    this.unknown.stillUnknown -= 1;
+    if (executedLate) this.unknown.settledExecutedLate += 1;
+    else this.unknown.settledExpired += 1;
   }
 
   /** Every trader key that has ever placed an order, for the liquidation scan. */
@@ -83,6 +113,7 @@ export class StatsTracker {
     return {
       user: { ...this.userCounters },
       bot: { ...this.botCounters },
+      botOrdersOutcomeUnknown: { ...this.unknown },
       tradersTotal: this.userTraders.size + this.botTraders.size,
       latency: {
         medianMs: percentile(sorted, 0.5),

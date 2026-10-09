@@ -18,6 +18,7 @@ export const registerMarketsRoute = (app: FastifyInstance, ctx: AppContext): voi
         maxLeverage: market.maxLeverage,
         markPrice: moneyOrNull(market.markPrice),
         markPriceUpdatedAtMs: market.markPriceUpdatedAtMs,
+        warmingUp: market.warmingUp ?? false,
         change24hPercent: market.change24h,
         volume24h: money(market.volume24h),
         openInterest: moneyOrNull(market.openInterest),

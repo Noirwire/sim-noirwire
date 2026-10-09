@@ -17,7 +17,7 @@ import type {
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
 import { ChainFeed } from "./chain-feed.js";
 import { FundingDesk } from "./funding-desk.js";
-import { nextPublishPrice } from "./price-walk.js";
+import { nextPublishPrice, withinOneStep } from "./price-walk.js";
 import {
   FIRST_TRADER_SEAT,
   SEAT_COUNT,
@@ -79,6 +79,9 @@ export interface RollupVenueHandlers {
   onFill(event: RollupFill): void;
   onPrice(market: MarketId, price: bigint, publishedAtMs: number): void;
   onBotOrder(trader: TraderKey, outcome: PlaceOutcome): void;
+  /** A bot's order whose outcome could not be told in time; `onBotOrderSettled` follows. */
+  onBotOrderUnknown(trader: TraderKey): void;
+  onBotOrderSettled(trader: TraderKey, executedAfterAll: boolean): void;
   onChainStats(stats: ChainStats): void;
   onError(what: string, error: unknown): void;
 }
@@ -119,11 +122,18 @@ interface MarketState {
   tapeCursor: number;
   recentFills: { atMs: number; notional: bigint }[];
   priceHistory: { atMs: number; price: bigint }[];
+  /**
+   * False until the chain's price has first come within one allowed step of
+   * the real one. A deployment starts at its set-up price and is walked to
+   * the real price under the move limit; nothing on that walk is a market
+   * move, so nothing of it is charted, counted or traded on by the bots.
+   */
+  warmedUp: boolean;
 }
 
 /** Whether the program executed the order and counted it, whatever became of it. */
 export const executed = (outcome: PlaceOutcome): boolean =>
-  outcome.status !== "expired" && outcome.status !== "invalid" && outcome.status !== "failed";
+  !["expired", "invalid", "failed", "unknown"].includes(outcome.status);
 
 const tagOf = (receipt: Uint8Array): bigint => Buffer.from(receipt).readBigUInt64BE(0);
 
@@ -218,6 +228,7 @@ export class RollupVenue implements Venue {
         tapeCursor: 0,
         recentFills: [],
         priceHistory: [],
+        warmedUp: false,
       });
     }
     return venue;
@@ -262,7 +273,8 @@ export class RollupVenue implements Venue {
       state.price.price !== price.price ||
       state.price.publishTimeSeconds !== price.publishTimeSeconds;
     state.price = price;
-    if (!changed || price.price === 0n) return;
+    this.noteWarmUp(state);
+    if (!changed || price.price === 0n || !state.warmedUp) return;
     const simPrice = toSimPrice(state.units, price.price);
     const atMs = price.publishTimeSeconds * 1000;
     state.priceHistory.push({ atMs, price: simPrice });
@@ -270,6 +282,16 @@ export class RollupVenue implements Venue {
       state.priceHistory.shift();
     }
     this.options.handlers.onPrice(state.config.id, simPrice, atMs);
+  }
+
+  private noteWarmUp(state: MarketState): void {
+    if (state.warmedUp || state.target === null || !state.price) return;
+    state.warmedUp = withinOneStep({
+      current: state.price.price,
+      target: roundDownToChainPrice(state.units, state.target, state.chain.tick),
+      maxMoveBps: state.chain.maxMoveBps,
+      tick: state.chain.tick,
+    });
   }
 
   private acceptTape(marketId: number, update: TapeUpdate, readAtMs: number): void {
@@ -286,7 +308,8 @@ export class RollupVenue implements Venue {
 
   private acceptFill(state: MarketState, chainFill: ChainFill): void {
     const sequence = Number(chainFill.sequence);
-    const replayed = sequence <= (this.options.recordedThrough[state.config.id] ?? 0);
+    const replayed =
+      !state.warmedUp || sequence <= (this.options.recordedThrough[state.config.id] ?? 0);
     state.tapeCursor = Math.max(state.tapeCursor, sequence);
     const fill: Fill = {
       market: state.config.id,
@@ -369,6 +392,7 @@ export class RollupVenue implements Venue {
       pricesFresh: states.every((state) => {
         const maxAgeMs = state.chain.maxPriceAgeSeconds * 1000;
         return (
+          state.warmedUp &&
           state.price !== null &&
           state.price.price > 0n &&
           now - state.publishedAtMs < maxAgeMs &&
@@ -395,6 +419,7 @@ export class RollupVenue implements Venue {
         lotSize: toSimSize(state.units, 1n),
         maxLeverage: perp ? Math.floor(10_000 / state.chain.imBps) : 0,
         markPrice: mark,
+        warmingUp: !state.warmedUp,
         markPriceUpdatedAtMs: state.price && mark ? state.price.publishTimeSeconds * 1000 : null,
         change24h:
           mark && reference
@@ -413,7 +438,9 @@ export class RollupVenue implements Venue {
 
   /** Sets where the mark should be. The publish loop walks the chain's price there. */
   async publishPrice(market: MarketId, price: bigint): Promise<void> {
-    this.state(market).target = price;
+    const state = this.state(market);
+    state.target = price;
+    this.noteWarmUp(state);
   }
 
   private bot(trader: TraderKey): BotSpec | undefined {
@@ -501,6 +528,7 @@ export class RollupVenue implements Venue {
     const state = this.state(order.market);
     const mark = state.price?.price ?? 0n;
     if (mark === 0n) return rejected(orderId, order, "no mark price yet");
+    if (!state.warmedUp) return rejected(orderId, order, "the market is warming up");
 
     const { chain, units } = state;
     const band = (mark * BigInt(chain.bandBps)) / 10_000n;
@@ -539,6 +567,18 @@ export class RollupVenue implements Venue {
       this.secrets.retire(secret, Date.now());
       return rejected(orderId, order, error instanceof Error ? error.message : "send failed");
     }
+    if (outcome.settled) {
+      // The order may still run, so it is neither placed nor failed yet, and
+      // this bot does nothing else until the rollup's clock has settled it.
+      this.options.handlers.onBotOrderUnknown(trader);
+      outcome = await outcome.settled.catch((): PlaceOutcome => ({
+        status: "expired",
+        filled: 0n,
+        rested: 0n,
+        sendToResultMs: 0,
+      }));
+      this.options.handlers.onBotOrderSettled(trader, executed(outcome));
+    }
     if (outcome.status !== "rested") this.secrets.retire(secret, Date.now());
     this.recordLatency(outcome);
     this.options.handlers.onBotOrder(trader, outcome);
@@ -553,6 +593,7 @@ export class RollupVenue implements Venue {
       expired: "rejected",
       invalid: "rejected",
       failed: "rejected",
+      unknown: "rejected",
     }[outcome.status] as PlaceResult["status"];
     return {
       orderId,

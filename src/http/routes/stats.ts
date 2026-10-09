@@ -12,6 +12,9 @@ export const registerStatsRoute = (app: FastifyInstance, ctx: AppContext): void 
       volume: { user: money(stats.user.volume), bot: money(stats.bot.volume) },
       tradersTotal: stats.tradersTotal,
       latency: stats.latency,
+      ...(ctx.config.VENUE === "rollup"
+        ? { botOrdersOutcomeUnknown: stats.botOrdersOutcomeUnknown }
+        : {}),
       updatedAtMs: stats.updatedAtMs,
     };
   });

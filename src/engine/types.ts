@@ -14,6 +14,8 @@ export interface MarketInfo {
   maxLeverage: number;
   markPrice: bigint | null;
   markPriceUpdatedAtMs: number | null;
+  /** True while a venue is still bringing its mark from a set-up price to the real one. */
+  warmingUp?: boolean;
   change24h: number | null;
   volume24h: bigint;
   openInterest: bigint | null;

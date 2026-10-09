@@ -197,6 +197,9 @@ const rollupWiring = async (
         data.stats.recordOrder(trader);
         data.stats.recordLatency(outcome.sendToResultMs);
       },
+      onBotOrderUnknown: () => data.stats.recordBotOrderUnknown(),
+      onBotOrderSettled: (_trader, executedAfterAll) =>
+        data.stats.recordBotOrderSettled(executedAfterAll),
       onChainStats: (chain) => {
         ordersAtStart ??= chain.orders;
         chainOrders = chain.orders - ordersAtStart;
