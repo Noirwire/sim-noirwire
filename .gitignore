@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment: only the example is committed
+.env
+.env.*
+!.env.example
+
+# Tests
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# The snapshot directory the service writes candles and fund grants to
+data/
+
+# Load test reports
+loadtest-reports/
+
+# Local tooling
+.idea/
+.vscode/
+.DS_Store
