@@ -6,6 +6,8 @@ export interface SnapshotData {
   savedAtMs: number;
   candles: CandleSnapshotEntry[];
   fundedAddresses: string[];
+  /** Per market, the last on-chain fill sequence already recorded into the candles. */
+  tapeCursors?: Record<string, number>;
 }
 
 const FILE_NAME = "snapshot.json";

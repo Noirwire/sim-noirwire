@@ -37,14 +37,28 @@ export class StatsTracker {
   private readonly botTraders = new Set<TraderKey>();
   private readonly userCounters = emptyCounters();
   private readonly botCounters = emptyCounters();
-  private readonly httpLatencyMs: number[] = [];
+  private readonly latencyMs: number[] = [];
 
-  constructor(private readonly latencyWindowSize = 500) {}
+  constructor(
+    private readonly latencyWindowSize = 500,
+    private readonly latencyMeasuredFrom = "http:request",
+  ) {}
 
   recordOrder(trader: TraderKey): void {
-    const bot = isBotTrader(trader);
-    (bot ? this.botCounters : this.userCounters).orders += 1;
-    (bot ? this.botTraders : this.userTraders).add(trader);
+    (isBotTrader(trader) ? this.botCounters : this.userCounters).orders += 1;
+    this.recordTrader(trader);
+  }
+
+  recordTrader(trader: TraderKey): void {
+    (isBotTrader(trader) ? this.botTraders : this.userTraders).add(trader);
+  }
+
+  /**
+   * For a venue where a user's order is private and only a public total is
+   * known: the user count is that total less the bots' own orders.
+   */
+  setUserOrders(count: number): void {
+    this.userCounters.orders = Math.max(0, count);
   }
 
   /** Every trader key that has ever placed an order, for the liquidation scan. */
@@ -59,13 +73,13 @@ export class StatsTracker {
     bucket.volume += notional;
   }
 
-  recordHttpLatency(sampleMs: number): void {
-    this.httpLatencyMs.push(sampleMs);
-    if (this.httpLatencyMs.length > this.latencyWindowSize) this.httpLatencyMs.shift();
+  recordLatency(sampleMs: number): void {
+    this.latencyMs.push(sampleMs);
+    if (this.latencyMs.length > this.latencyWindowSize) this.latencyMs.shift();
   }
 
   snapshot(nowMs: number): PublicStats {
-    const sorted = [...this.httpLatencyMs].sort((a, b) => a - b);
+    const sorted = [...this.latencyMs].sort((a, b) => a - b);
     return {
       user: { ...this.userCounters },
       bot: { ...this.botCounters },
@@ -74,7 +88,7 @@ export class StatsTracker {
         medianMs: percentile(sorted, 0.5),
         p99Ms: percentile(sorted, 0.99),
         sampleSize: sorted.length,
-        measuredFrom: "http:request",
+        measuredFrom: this.latencyMeasuredFrom,
       },
       updatedAtMs: nowMs,
     };

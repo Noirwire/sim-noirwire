@@ -1,0 +1,83 @@
+# The full local run: `make docker-up` (not `docker compose up` on its own).
+#
+# The local network (a Solana validator, the private rollup and its query
+# filter) runs on this machine, started and set up by the order book
+# repository's Makefile, because the Solana validator has no Linux arm64
+# build to put in a container (docs/DESIGN.md, "Local run in Docker"). The
+# containers here reach it through host.docker.internal.
+#
+#   sim        this service with VENUE=rollup, healthy once prices are on chain
+#   terminal   the trading terminal from ../terminal-noirwire, only with
+#              `--profile terminal`
+#
+# ORDERBOOK_REPO is the absolute path of the order book repository; the
+# Makefile passes it. Its .localnet folder holds the deployment description
+# and the local keys, and is mounted read-only.
+
+name: noirwire-sim
+
+services:
+  sim:
+    container_name: noirwire-sim-service
+    image: noirwire-sim-service:local
+    build:
+      context: .
+    entrypoint: ["node", "/local/local-env.mjs"]
+    environment:
+      VENUE: rollup
+      NETWORK: localnet
+      PORT: "4100"
+      DATA_DIR: /app/data
+      ALLOWED_ORIGINS: http://localhost:${TERMINAL_HOST_PORT:-3100}
+      SOLANA_RPC_URL: http://host.docker.internal:8899
+      ROLLUP_RPC_URL: http://host.docker.internal:6699
+      ROLLUP_WS_URL: ws://host.docker.internal:6700
+      ROLLUP_DIRECT_RPC_URL: http://host.docker.internal:7799
+      SERVICE_LOCATION: a container on the machine that runs the local network
+      FUND_IP_RATE_LIMIT: ${FUND_IP_RATE_LIMIT:-20}
+    volumes:
+      - ${ORDERBOOK_REPO:?Run this through 'make docker-up', which sets ORDERBOOK_REPO}/.localnet:/deployment:ro
+      - ./docker/local-env.mjs:/local/local-env.mjs:ro
+      - noirwire-sim-data:/app/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:${SIM_HOST_PORT:-4100}:4100
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4100/v1/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+
+  terminal:
+    profiles: [terminal]
+    container_name: noirwire-sim-terminal
+    image: noirwire-sim-terminal:local
+    build:
+      context: ${TERMINAL_REPO:-../terminal-noirwire}
+      dockerfile_inline: |
+        FROM node:24-alpine
+        WORKDIR /app
+        COPY package.json package-lock.json ./
+        RUN npm ci
+        COPY . .
+        ENV NEXT_PUBLIC_SIM_URL=http://localhost:${SIM_HOST_PORT:-4100}
+        ENV NEXT_PUBLIC_SIM_WS_URL=ws://localhost:${SIM_HOST_PORT:-4100}/v1/stream
+        ENV NEXT_PUBLIC_NETWORK_LABEL="LOCAL NETWORK"
+        RUN npm run build
+        EXPOSE 3000
+        CMD ["npm", "run", "start"]
+    depends_on:
+      sim:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:${TERMINAL_HOST_PORT:-3100}:3000
+
+volumes:
+  noirwire-sim-data:
+    name: noirwire-sim-data

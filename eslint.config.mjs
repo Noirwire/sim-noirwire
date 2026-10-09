@@ -16,6 +16,7 @@ const domainStaysFrameworkFree = {
     "src/bots/**/*.ts",
     "src/data/**/*.ts",
     "src/config/**/*.ts",
+    "src/rollup/**/*.ts",
   ],
   rules: {
     "no-restricted-imports": [
@@ -47,8 +48,8 @@ export default defineConfig([
     },
   },
   {
-    files: ["scripts/**", "src/main.ts"],
+    files: ["scripts/**", "src/main.ts", "src/app.ts"],
     rules: { "no-console": "off" },
   },
-  globalIgnores(["dist/**", "coverage/**", "data/**", "node_modules/**"]),
+  globalIgnores(["docker/**", "dist/**", "coverage/**", "data/**", "node_modules/**"]),
 ]);

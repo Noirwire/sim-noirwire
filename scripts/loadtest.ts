@@ -171,4 +171,11 @@ ${JSON.stringify(report.machine, null, 2)}
 `;
 }
 
-void main();
+const venueFlag = process.argv.indexOf("--venue");
+const venueKind = venueFlag === -1 ? "memory" : process.argv[venueFlag + 1];
+
+if (venueKind === "rollup") {
+  void import("./loadtest-rollup.js").then((rollup) => rollup.main());
+} else {
+  void main();
+}

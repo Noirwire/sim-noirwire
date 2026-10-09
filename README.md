@@ -51,6 +51,74 @@ curl -X POST http://localhost:4100/v1/dev/orders -H 'content-type: application/j
   -d '{"address":"my-dev-trader","market":"NSOL-NUSD","side":"buy","type":"ioc","price":"100","size":"1"}'
 ```
 
+## Run on the real program
+
+`VENUE=rollup` runs the same service on the on-chain order book program instead of the
+in-process engine: the oracle key publishes prices, every bot is an ordinary trader with
+its own seat and one-time order keys, and the tape, marks and counters are read back from
+the chain. How it works: [docs/DESIGN.md](docs/DESIGN.md), "The rollup venue".
+
+It needs the order book repository beside this one (`../orderbook-noirwire`, or set
+`ORDERBOOK_REPO`), built, with its own tools installed (see its README).
+
+```sh
+make docker-up      # local network on this machine, set up, this service in a container on it
+curl http://localhost:4100/v1/health
+make docker-logs
+make docker-down
+make docker-test    # up, wait for health, smoke check over the published port, down
+make test-rollup    # the integration suite: local network, service in-process, real transactions
+```
+
+`docker compose --profile terminal up` after `make docker-up` adds the trading terminal
+from `../terminal-noirwire` on port 3100. Set `SIM_HOST_PORT` to publish the service on
+another port. The local network uses ports 8899, 7799 and 6699; these targets refuse to
+start a second one and never stop one they did not start.
+
+The local network itself runs on this machine, not in a container: the Solana test
+validator has no Linux arm64 build. The containers reach it through `host.docker.internal`.
+
+The client package is consumed as a release file, `vendor/noirwire-orderbook-<version>.tgz`.
+`make sdk-update` copies a fresh build from the order book repository (`make sdk` there).
+Once releases are published, the `file:` path in `package.json` becomes the release URL
+and `vendor/` goes away.
+
+Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
+start when a required one is missing or a key is not the one the deployment names):
+
+| Variable                                                     | Required   | What it is                                                                            |
+| ------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                             | yes        | Solana. Checked once at start: the service stops if it is mainnet                     |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                            | yes        | The rollup's private endpoint through the query filter, and its websocket             |
+| `ROLLUP_DIRECT_RPC_URL`                                      | local only | The rollup's own port. The local query filter refuses deposits, so they are sent here |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                       | yes        | The deployment description the order book repository's set-up prints                  |
+| `ORACLE_SECRET_KEY`, `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`  | yes        | Secret keys as JSON arrays of 64 bytes: publish prices, co-sign openings, deposit     |
+| `BOT_TRADER_SEEDS`                                           | yes        | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)           |
+| `SERVICE_LOCATION`                                           | no         | Where the service runs; labels the latency figure                                     |
+| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`   | no         | Publish cadence (2 s) and how long a resting bot quote stays valid by itself (30 s)   |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_` | no         | Bot order sizes as notional                                                           |
+| `LIQUIDATOR_SEATS_PER_TICK`                                  | no         | Seats the liquidator tries blind per market per tick                                  |
+
+The fund button with `VENUE=rollup` is two steps, because the user's own key has to sign:
+
+```sh
+# 1. The service builds the transaction that opens the account and deposits 5,000 nUSD.
+curl -X POST http://localhost:4100/v1/fund/prepare -H 'content-type: application/json' \
+  -d '{"owner":"<owner address>","orderKeys":["<key 1>","<key 2>","<key 3>","<key 4>"]}'
+# -> { "transaction": "<base64, unsigned>", "expiresAtMs": ..., "amount": "5000.000000" }
+
+# 2. The user signs it with the owner key and sends it back within 45 seconds.
+curl -X POST http://localhost:4100/v1/fund/submit -H 'content-type: application/json' \
+  -d '{"owner":"<owner address>","transaction":"<base64, signed by the owner>"}'
+# -> { "amount": "5000.000000", "reference": "<transaction signature>" }
+```
+
+`submit` refuses anything that is not byte for byte the transaction `prepare` built (400),
+a request with nothing prepared or prepared too long ago (410), an owner that was funded
+before (409) and too many grants from one IP (429). A 409 from `submit` itself means the
+transaction did not execute and nothing was opened: prepare again. `scripts/smoke.ts` is a
+working client of both steps.
+
 ## Configuration
 
 Every variable and its default is in [.env.example](.env.example). The most load-bearing
@@ -59,7 +127,7 @@ ones:
 | Variable                                        | Default                 | What it does                                                                         |
 | ----------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------ |
 | `PORT`, `HOST`                                  | `4100`, `0.0.0.0`       | Where the HTTP server listens                                                        |
-| `VENUE`                                         | `memory`                | `memory` only for now; `rollup` is reserved for the on-chain client                  |
+| `VENUE`                                         | `memory`                | `memory` (in-process engine) or `rollup` (the on-chain program, see above)           |
 | `DEV_TRADING`                                   | `0`                     | Set to `1` to register the `/v1/dev/*` routes. Only takes effect with `VENUE=memory` |
 | `NETWORK`                                       | `devnet`                | The label every response carries                                                     |
 | `ALLOWED_ORIGINS`                               | `http://localhost:3000` | Comma-separated CORS allow-list                                                      |
@@ -78,12 +146,13 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 
 | Route                                                    | Returns                                                                                                                          |
 | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /health`                                            | `{ ok, venue, network }`                                                                                                         |
+| `GET /health`                                            | `{ ok, venue, network }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold        |
 | `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest                          |
 | `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity                                       |
 | `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                    |
 | `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at |
-| `POST /fund` `{ address }`                               | `{ amount, reference }`; one grant per address, rate limited per IP                                                              |
+| `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                         |
+| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                             |
 | `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                    |
 | `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                    |
 
@@ -99,12 +168,23 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 
 ## Development
 
-| Command         | What it covers                                                                                                                                       |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `make test`     | The vitest suite: matching engine, perp margin/funding/liquidation, a 3,000-operation property test, the house maker, candle bucketing, the HTTP API |
-| `make check`    | `eslint`, `tsc --noEmit`, `prettier --check`                                                                                                         |
-| `make build`    | Compiles `src/` to `dist/`                                                                                                                           |
-| `make loadtest` | Drives `MemoryVenue` with `LOADTEST_TRADERS` concurrent traders for `LOADTEST_SECONDS`, writes `loadtest-reports/latest.{json,md}`                   |
+| Command            | What it covers                                                                                                                                       |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make test`        | The vitest suite: matching engine, perp margin/funding/liquidation, a 3,000-operation property test, the house maker, candle bucketing, the HTTP API |
+| `make check`       | `eslint`, `tsc --noEmit`, `prettier --check`                                                                                                         |
+| `make build`       | Compiles `src/` to `dist/`                                                                                                                           |
+| `make loadtest`    | Drives `MemoryVenue` with `LOADTEST_TRADERS` concurrent traders for `LOADTEST_SECONDS`, writes `loadtest-reports/latest.{json,md}`                   |
+| `make test-rollup` | Starts the local network, sets it up, runs the service on it and asserts prices, fills, the fund flow, the websocket and the bot/user split          |
+
+`make loadtest VENUE=rollup` sends real orders instead: `LOADTEST_TRADERS` traders, each
+opened and funded through a running service's fund routes like any user (raise that
+service's `FUND_IP_RATE_LIMIT` for the run), each sending immediate-or-cancel orders for
+`LOADTEST_SECONDS`. Every order is its own transaction. It needs `DEPLOYMENT_PATH`, takes
+`LOADTEST_ARGS="--sim-url ... --rollup-rpc ... --rollup-ws ... --late-ms 1000"`, and writes
+`loadtest-reports/latest-rollup.json`: orders sent, results confirmed, expired, fills,
+confirmed orders per second, send-to-result median, p95 and p99, and how many orders were
+late or expired. It refuses any rollup endpoint that is not this machine unless that exact
+endpoint is passed with `--allow-rpc <url>`.
 
 No end-to-end browser tests: this is a backend service, and the suite above (engine,
 property, API, websocket) covers its observable behaviour. See [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -123,8 +203,11 @@ src/
   bots/        HouseMaker, NoiseTaker, Liquidator, FundingUpdater, the seeded RNG
   data/        Tape store, candle aggregator, stats (bot/user split), fund ledger, snapshot persistence
   config/      Environment schema (zod), validated once at start
+  rollup/      RollupVenue: the program adapter (the one importer of the client), price walk,
+               chain feed, tape tracker, bot order secrets, seat sweep, funding desk, settings
   http/        Fastify server, routes, the websocket hub
-  main.ts      Wiring and the process lifecycle
+  app.ts       Wiring: venue, bots, price source, server
+  main.ts      The process lifecycle
 ```
 
 ## Deployment
@@ -133,7 +216,8 @@ One Railway service, one replica. The fund ledger and candles live in memory, sn
 to a JSON file on `DATA_DIR` on an interval and on shutdown, and reloaded at start so a
 restart does not lose them. Configuration is environment variables only; nothing secret is
 logged. See [Dockerfile](Dockerfile) for the production image (multi-stage, Node 24,
-non-root).
+non-root); the same image runs `VENUE=rollup`. Exact steps, variables and keys for the
+devnet deployment: [docs/deploy.md](docs/deploy.md), with `.railway/railway.ts`.
 
 ## Licence
 

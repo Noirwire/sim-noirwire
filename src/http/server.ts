@@ -5,6 +5,7 @@ import type { AppContext } from "./context.js";
 import { registerCandlesRoute } from "./routes/candles.js";
 import { registerDevTradingRoutes } from "./routes/dev-trading.js";
 import { registerFundRoute } from "./routes/fund.js";
+import { registerRollupFundRoutes } from "./routes/fund-rollup.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerMarketsRoute } from "./routes/markets.js";
 import { registerStatsRoute } from "./routes/stats.js";
@@ -22,7 +23,8 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   registerTapeRoute(app, ctx);
   registerCandlesRoute(app, ctx);
   registerStatsRoute(app, ctx);
-  registerFundRoute(app, ctx);
+  if (ctx.funding) registerRollupFundRoutes(app, ctx, ctx.funding);
+  else registerFundRoute(app, ctx);
   registerStreamRoute(app, ctx);
 
   if (ctx.config.VENUE === "memory" && ctx.config.DEV_TRADING) {

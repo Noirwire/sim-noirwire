@@ -68,6 +68,24 @@ const envSchema = z.object({
   LIQUIDATOR_STARTING_NUSD: decimalAmount("1000000"),
 
   STATS_LATENCY_WINDOW: intString(500),
+
+  SOLANA_RPC_URL: z.string().optional(),
+  ROLLUP_RPC_URL: z.string().optional(),
+  ROLLUP_WS_URL: z.string().optional(),
+  ROLLUP_DIRECT_RPC_URL: z.string().optional(),
+  DEPLOYMENT_JSON: z.string().optional(),
+  DEPLOYMENT_PATH: z.string().optional(),
+  ORACLE_SECRET_KEY: z.string().optional(),
+  GATE_SECRET_KEY: z.string().optional(),
+  FAUCET_SECRET_KEY: z.string().optional(),
+  BOT_TRADER_SEEDS: z.string().optional(),
+  SERVICE_LOCATION: z.string().default("unnamed machine"),
+  PRICE_PUBLISH_INTERVAL_MS: intString(2_000),
+  ROLLUP_QUOTE_EXPIRY_SECONDS: intString(30),
+  ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("25"),
+  ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),
+  ROLLUP_TAKER_MAX_NUSD: decimalAmount("50"),
+  LIQUIDATOR_SEATS_PER_TICK: intString(4),
 });
 
 export type Config = z.infer<typeof envSchema>;

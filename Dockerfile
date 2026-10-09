@@ -4,6 +4,8 @@
 FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
+# The order book client is a release file kept in vendor/.
+COPY vendor ./vendor
 # No install scripts: nothing this service needs is built at install time,
 # and a dependency's script is code that would run with the build's access.
 RUN npm ci --ignore-scripts
@@ -15,6 +17,7 @@ RUN npm run build
 FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY vendor ./vendor
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # Run: the compiled code and its production dependencies, as a user that
