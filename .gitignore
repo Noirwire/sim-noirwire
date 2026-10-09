@@ -18,10 +18,10 @@ coverage/
 npm-debug.log*
 
 # The snapshot directory the service writes candles and fund grants to
-data/
+/data/
 
 # Load test reports
-loadtest-reports/
+/loadtest-reports/
 
 # Local tooling
 .idea/
