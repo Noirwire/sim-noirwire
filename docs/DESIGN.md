@@ -172,10 +172,39 @@ repository's Makefile, sets it up, then starts this service in a container
 `host.docker.internal`. `--profile terminal` adds the trading terminal from
 `../terminal-noirwire`.
 
-The network is not in a container. MagicBlock ships its rollup and query filter for Linux
-on arm64 and x64, but the Solana test validator underneath has no Linux arm64 release, and
-Docker on an Apple machine is arm64. Running the whole network as an emulated x64
-container was not tried.
+`make docker-up-all` puts the network in a container as well (`--profile network`):
+
+| Container | What it is |
+| --- | --- |
+| `network` | `docker/network.Dockerfile`: Node 24 on Debian 13, the Solana 2.3.11 test validator and MagicBlock's stack from the order book repository's lockfile. `docker/network-entry.mjs` makes a throwaway admin key and starts the stack with the program loaded, as the order book repository's Makefile does. Healthy once the stack reports ready |
+| `setup` | the same image, one shot: the order book repository's `ops/network.ts setup` against `network`, writing the deployment description and the local keys to the `noirwire-sim-deployment` volume |
+| `sim` | starts once `setup` has exited successfully and reads that volume read-only |
+
+The order book repository reaches the image as the additional build context `orderbook`
+(`ORDERBOOK_REPO`): its package files, `sdk/dist`, `ops/`, the validator identity fixture
+and `target/deploy/noirwire_orderbook.so` are copied in, so they must be built first.
+Nothing is written back to it. Inside the compose network the containers use service
+names (`http://network:8899`); the host ports are shifted (18899, 17799, 16699, 14100) so
+the stack never collides with a network on the machine. Each start is a fresh network: the
+entry script empties the deployment volume first.
+
+Three things that are not obvious:
+
+- MagicBlock's stack binds the rollup and the query filter to 127.0.0.1 with no setting
+  for it, so the entry script offers those four ports on the container's own address and
+  passes them through. The Solana validator already listens on every address.
+- MagicBlock's Linux binaries need glibc 2.39, so the image is Debian 13, not 12.
+- The set-up keeps keys readable by their owner only, so the network image runs as the
+  same `node` user as the service image.
+
+The network image is linux/amd64 on every machine. MagicBlock ships its rollup and query
+filter for Linux on arm64 and x64, but the Solana test validator underneath has no Linux
+arm64 release, and Docker on an Apple machine is arm64, so there the image is emulated.
+Measured on an Apple M4 with Docker Desktop's Rosetta emulation (the virtual CPU reports
+AVX2, which the x64 validator needs): the validator produces slots within a second,
+`make docker-test-all` takes about 50 seconds with the images built, and the service's
+`/v1/stats` showed a send-to-result median of 18 ms and a p99 of 99 ms over 477 bot
+orders. With Rosetta switched off Docker falls back to QEMU, which was not tried.
 
 ## Deployment
 

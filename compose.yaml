@@ -1,18 +1,35 @@
-# The full local run: `make docker-up` (not `docker compose up` on its own).
+# The full local run, in two variants. Both go through the Makefile, which
+# passes the settings below; `docker compose up` on its own is not enough.
 #
-# The local network (a Solana validator, the private rollup and its query
-# filter) runs on this machine, started and set up by the order book
-# repository's Makefile, because the Solana validator has no Linux arm64
-# build to put in a container (docs/DESIGN.md, "Local run in Docker"). The
-# containers here reach it through host.docker.internal.
+# `make docker-up`: the local network (a Solana validator, the private rollup
+# and its query filter) runs on this machine, started and set up by the order
+# book repository's Makefile. The containers reach it through
+# host.docker.internal.
+#
+# `make docker-up-all` (`--profile network`): the network runs in a container
+# too, as linux/amd64, because the Solana validator has no Linux arm64 build
+# (docs/DESIGN.md, "Local run in Docker"). The containers reach each other by
+# service name, and the network is published on host ports of its own so it
+# never collides with a network running on this machine.
 #
 #   sim        this service with VENUE=rollup, healthy once prices are on chain
+#   network    the local network, only with `--profile network`
+#   setup      one-shot: the order book repository's local set-up against
+#              `network`, only with `--profile network`
 #   terminal   the trading terminal from ../terminal-noirwire, only with
 #              `--profile terminal`
 #
-# ORDERBOOK_REPO is the absolute path of the order book repository; the
-# Makefile passes it. Its .localnet folder holds the deployment description
-# and the local keys, and is mounted read-only.
+# ORDERBOOK_REPO is the absolute path of the order book repository. On the
+# machine's network its .localnet folder holds the deployment description and
+# the local keys, mounted read-only. With `--profile network` it is the build
+# context the program binary, the set-up script and the client are copied
+# from, and the deployment description lives on a volume the set-up writes.
+#
+# NETWORK_HOST            where the service finds the network
+# NETWORK_PORT_PREFIX     put before 8899, 8900, 7799, 7800, 6699 and 6700 to
+#                         get the host ports the containerised network is
+#                         published on
+# DEPLOYMENT_SOURCE       the folder or volume that holds the deployment
 
 name: noirwire-sim
 
@@ -29,21 +46,25 @@ services:
       PORT: "4100"
       DATA_DIR: /app/data
       ALLOWED_ORIGINS: http://localhost:${TERMINAL_HOST_PORT:-3100}
-      SOLANA_RPC_URL: http://host.docker.internal:8899
-      ROLLUP_RPC_URL: http://host.docker.internal:6699
-      ROLLUP_WS_URL: ws://host.docker.internal:6700
-      DEPOSIT_RPC_URL: http://host.docker.internal:7799
-      PUBLIC_SOLANA_RPC_URL: http://localhost:8899
-      PUBLIC_ROLLUP_RPC_URL: http://localhost:6699
-      PUBLIC_ROLLUP_WS_URL: ws://localhost:6700
+      SOLANA_RPC_URL: http://${NETWORK_HOST:-host.docker.internal}:8899
+      ROLLUP_RPC_URL: http://${NETWORK_HOST:-host.docker.internal}:6699
+      ROLLUP_WS_URL: ws://${NETWORK_HOST:-host.docker.internal}:6700
+      DEPOSIT_RPC_URL: http://${NETWORK_HOST:-host.docker.internal}:7799
+      PUBLIC_SOLANA_RPC_URL: http://localhost:${NETWORK_PORT_PREFIX:-}8899
+      PUBLIC_ROLLUP_RPC_URL: http://localhost:${NETWORK_PORT_PREFIX:-}6699
+      PUBLIC_ROLLUP_WS_URL: ws://localhost:${NETWORK_PORT_PREFIX:-}6700
       SERVICE_LOCATION: a container on the machine that runs the local network
       FUND_IP_RATE_LIMIT: ${FUND_IP_RATE_LIMIT:-20}
     volumes:
-      - ${ORDERBOOK_REPO:?Run this through 'make docker-up', which sets ORDERBOOK_REPO}/.localnet:/deployment:ro
+      - ${DEPLOYMENT_SOURCE:-${ORDERBOOK_REPO:?Run this through the Makefile, which sets ORDERBOOK_REPO}/.localnet}:/deployment:ro
       - ./docker/local-env.mjs:/local/local-env.mjs:ro
       - noirwire-sim-data:/app/data
     extra_hosts:
       - host.docker.internal:host-gateway
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+        required: false
     ports:
       - 127.0.0.1:${SIM_HOST_PORT:-4100}:4100
     healthcheck:
@@ -56,6 +77,55 @@ services:
       timeout: 5s
       retries: 60
       start_period: 5s
+
+  network:
+    profiles: [network]
+    container_name: noirwire-sim-network
+    image: noirwire-sim-network:local
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/network.Dockerfile
+      additional_contexts:
+        orderbook: ${ORDERBOOK_REPO}
+    volumes:
+      - noirwire-sim-deployment:/deployment
+    ports:
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}8899:8899
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}8900:8900
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}7799:7799
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}7800:7800
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}6699:6699
+      - 127.0.0.1:${NETWORK_PORT_PREFIX:-1}6700:6700
+    healthcheck:
+      test: ["CMD", "test", "-f", "/network/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 100
+      start_period: 5s
+
+  setup:
+    profiles: [network]
+    container_name: noirwire-sim-setup
+    image: noirwire-sim-network:local
+    platform: linux/amd64
+    command: ["node_modules/.bin/ts-node", "-P", "tsconfig.json", "ops/network.ts", "setup"]
+    environment:
+      NETWORK: localnet
+      KEYS_DIR: /deployment
+      DEPLOYMENT: /deployment/deployment.json
+      SOLANA_URL: http://network:8899
+      ROLLUP_URL: http://network:7799
+      PRIVATE_URL: http://network:6699
+      DEPOSIT_URL: http://network:7799
+      VALIDATOR: mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
+      EXCHANGE_FLOAT_LAMPORTS: "200000000"
+    volumes:
+      - noirwire-sim-deployment:/deployment
+    depends_on:
+      network:
+        condition: service_healthy
+    restart: "no"
 
   terminal:
     profiles: [terminal]
@@ -84,3 +154,5 @@ services:
 volumes:
   noirwire-sim-data:
     name: noirwire-sim-data
+  noirwire-sim-deployment:
+    name: noirwire-sim-deployment

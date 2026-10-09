@@ -75,8 +75,29 @@ from `../terminal-noirwire` on port 3100. Set `SIM_HOST_PORT` to publish the ser
 another port. The local network uses ports 8899, 7799 and 6699; these targets refuse to
 start a second one and never stop one they did not start.
 
-The local network itself runs on this machine, not in a container: the Solana test
-validator has no Linux arm64 build. The containers reach it through `host.docker.internal`.
+With `make docker-up` the local network itself runs on this machine, not in a container,
+and the containers reach it through `host.docker.internal`.
+
+To run everything in containers, the network included:
+
+```sh
+make docker-up-all    # network container, one-shot set-up container, then this service
+curl http://localhost:14100/v1/health
+make docker-down-all
+make docker-test-all  # up, wait for health, smoke check over the published port, down
+```
+
+This needs only Docker and the order book repository's build outputs
+(`target/deploy/noirwire_orderbook.so` and `sdk/dist`); it says which one is missing. It
+uses none of the ports above, so it runs beside a network on this machine: the service is
+published on 14100 (`ALL_SIM_HOST_PORT`) and the network on 18899/18900, 17799/17800 and
+16699/16700 (`NETWORK_PORT_PREFIX`, `1` by default, goes before each port).
+`make docker-up-all TERMINAL=1` adds the trading terminal.
+
+The network image is linux/amd64, because the Solana test validator has no Linux arm64
+build. On an Apple machine it runs under Docker Desktop's Rosetta emulation, which is on
+by default; see [docs/DESIGN.md](docs/DESIGN.md), "Local run in Docker", for what was
+measured. The first build downloads the Solana release and takes several minutes.
 
 The client package is consumed as a release file, `vendor/noirwire-orderbook-<version>.tgz`.
 `make sdk-update` copies a fresh build from the order book repository (`make sdk` there).
