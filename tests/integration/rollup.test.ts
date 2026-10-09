@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Keypair, Transaction } from "@solana/web3.js";
+import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NVDAX_MINT, type RunningApp, SOL_MINT, startApp } from "../../src/app.js";
 import { loadConfig } from "../../src/config/config.js";
@@ -12,6 +12,7 @@ import {
   firstOrderKeys,
   publicConnection,
 } from "../../src/rollup/program.js";
+import type { PublicDeployment } from "../../src/rollup/public-deployment.js";
 import { dollars } from "../helpers.js";
 
 const LOCALNET = process.env.ORDERBOOK_LOCALNET;
@@ -79,18 +80,14 @@ const pushPrices = (sol: number, nvda: number): void => {
 
 interface User {
   owner: Keypair;
-  orderKeySeed: Uint8Array;
 }
 
-const newUser = (): User => ({
-  owner: Keypair.generate(),
-  orderKeySeed: new Uint8Array(randomBytes(32)),
-});
+const newUser = (): User => ({ owner: Keypair.generate() });
 
 const prepare = (user: User) =>
   postJson("/v1/fund/prepare", {
     owner: user.owner.publicKey.toBase58(),
-    orderKeys: firstOrderKeys(user.orderKeySeed).map((key) => key.toBase58()),
+    orderKeys: firstOrderKeys(user.owner).map((key) => key.toBase58()),
   });
 
 const signAndSubmit = (user: User, preparedTransaction: string) => {
@@ -104,23 +101,25 @@ const signAndSubmit = (user: User, preparedTransaction: string) => {
   });
 };
 
-beforeAll(async () => {
-  const botSeeds = Array.from({ length: 16 }, () => randomBytes(32).toString("hex")).join(",");
+const DATA_DIR = join("data", `test-rollup-${Date.now()}`);
+const botSeeds = Array.from({ length: 16 }, () => randomBytes(32).toString("hex")).join(",");
+
+const startService = async (): Promise<void> => {
   const config = loadConfig({
     VENUE: "rollup",
     HOST: "127.0.0.1",
     NETWORK: "localnet",
-    DATA_DIR: join("data", `test-rollup-${Date.now()}`),
+    DATA_DIR,
     SOLANA_RPC_URL: "http://127.0.0.1:8899",
     ROLLUP_RPC_URL,
     ROLLUP_WS_URL,
-    ROLLUP_DIRECT_RPC_URL: "http://127.0.0.1:7799",
     DEPLOYMENT_PATH: join(LOCALNET, "deployment.json"),
     ORACLE_SECRET_KEY: localFile("localnet-oracle.json"),
     GATE_SECRET_KEY: localFile("localnet-gate.json"),
     FAUCET_SECRET_KEY: localFile("localnet-faucet.json"),
     BOT_TRADER_SEEDS: botSeeds,
     SERVICE_LOCATION: "the test machine",
+    PUBLIC_ROLLUP_RPC_URL: "https://rollup.browser.example",
     NOISE_TAKER_MIN_INTERVAL_MS: "300",
     NOISE_TAKER_MAX_INTERVAL_MS: "900",
   } as NodeJS.ProcessEnv);
@@ -132,7 +131,9 @@ beforeAll(async () => {
     pushPrices(151.5, 181);
     return (await getJson("/v1/health")).status === 200;
   });
-});
+};
+
+beforeAll(startService);
 
 afterAll(async () => {
   await running?.close();
@@ -163,10 +164,20 @@ describe("the service on the real program (local network)", () => {
       return fills.length > 0 && fills;
     });
     const tape = await program.tape(chain, PERP_ID);
-    const first = reported[0] as { sequence: number; price: string; size: string };
+    const first = reported[0] as {
+      sequence: number;
+      price: string;
+      size: string;
+      makerTag: string;
+      takerTag: string;
+    };
     const onChain = tape.fills.find((fill) => Number(fill.sequence) === first.sequence)!;
     expect(BigInt(Math.round(Number(first.price) * 1e6))).toBe(onChain.price * SOL_LOTS_PER_UNIT);
     expect(BigInt(Math.round(Number(first.size) * 1e6))).toBe(onChain.size * SOL_LOT);
+    const asBigEndianDecimal = (receipt: Uint8Array) =>
+      Buffer.from(receipt).readBigUInt64BE(0).toString();
+    expect(first.makerTag).toBe(asBigEndianDecimal(onChain.makerReceipt));
+    expect(first.takerTag).toBe(asBigEndianDecimal(onChain.takerReceipt));
   });
 
   describe("a user funded through the two-step endpoint", () => {
@@ -180,7 +191,7 @@ describe("the service on the real program (local network)", () => {
       expect(funded.status).toBe(200);
       expect(funded.body.amount).toBe("5000.000000");
 
-      trader = await program.existingTrader(ROLLUP_RPC_URL, user.owner, user.orderKeySeed);
+      trader = await program.newTrader(ROLLUP_RPC_URL, user.owner);
       expect(await trader.sync(PERP_ID)).toBe(true);
       expect((await trader.view()).collateral).toBe(GRANT_ATOMS);
     });
@@ -234,6 +245,47 @@ describe("the service on the real program (local network)", () => {
     });
   });
 
+  it("describes the deployment to a browser: market ids and addresses that are the chain's own, the browser's URLs, and no key", async () => {
+    const response = await fetch(`${base}/v1/deployment`);
+    expect(response.headers.get("cache-control")).toContain("public");
+    const text = await response.text();
+    const described = JSON.parse(text) as PublicDeployment;
+
+    expect(described.rollupRpcUrl).toBe("https://rollup.browser.example");
+    expect(described.markets.map((market) => market.symbol).sort()).toEqual(
+      ["NNVDA-PERP", "NSOL-NUSD", "NSOL-PERP"].sort(),
+    );
+    for (const market of described.markets) {
+      const onChain = await program.market(chain, market.marketId);
+      expect(onChain.marketId).toBe(market.marketId);
+      expect(onChain.kind).toBe(market.kind);
+      expect(program.publicAddresses(market.marketId)).toMatchObject({
+        market: market.market,
+        tape: market.tape,
+        priceFeed: market.priceFeed,
+        exchange: described.exchange,
+        stats: described.stats,
+      });
+      expect(await chain.getAccountInfo(new PublicKey(market.tape))).not.toBeNull();
+    }
+
+    const deployed = JSON.parse(localFile("deployment.json")) as Record<string, string>;
+    const secrets = ["oracle", "gate", "faucet"].map((role) => localFile(`localnet-${role}.json`));
+    for (const hidden of [
+      deployed.gate!,
+      deployed.oracle!,
+      deployed.faucet!,
+      ...botSeeds.split(","),
+    ]) {
+      expect(text).not.toContain(hidden);
+    }
+    for (const secret of secrets) {
+      const key = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret) as number[]));
+      expect(text).not.toContain(key.publicKey.toBase58());
+      expect(text).not.toContain(secret.trim().slice(1, 40));
+    }
+  });
+
   it("refuses a prepared transaction that comes back changed, and opens nothing", async () => {
     const user = newUser();
     const other = newUser();
@@ -249,5 +301,22 @@ describe("the service on the real program (local network)", () => {
     });
     expect(refused.status).toBe(400);
     expect((await signAndSubmit(user, prepared.body.transaction)).status).toBe(200);
+  });
+
+  it("picks its bots' one-time order keys up from the saved checkpoint after a restart, and trades on", async () => {
+    await running.close();
+    const saved = JSON.parse(readFileSync(join(DATA_DIR, "snapshot.json"), "utf8")) as {
+      orderKeyCheckpoints: Record<string, { nextIndex: number }>;
+    };
+    const checkpoints = Object.values(saved.orderKeyCheckpoints);
+    expect(checkpoints).toHaveLength(10);
+    expect(Math.max(...checkpoints.map((checkpoint) => checkpoint.nextIndex))).toBeGreaterThan(8);
+
+    await startService();
+    const stats = await eventually("the restarted bots to have orders executed", async () => {
+      const { body } = await getJson("/v1/stats");
+      return body.orders.bot >= 5 && body;
+    });
+    expect(stats.latency.sampleSize).toBeGreaterThan(0);
   });
 });

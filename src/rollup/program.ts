@@ -4,7 +4,7 @@
  * program's own units (prices in quote atoms per lot, sizes in lots), so a
  * new client release is an edit to this file and nothing else.
  */
-import { createPrivateKey, randomBytes, sign } from "node:crypto";
+import { createHash, createPrivateKey, sign } from "node:crypto";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
   Instructions,
@@ -12,22 +12,32 @@ import {
   MARKET_KIND,
   MarketReader,
   ORDER_TYPE,
+  OrderInvalid,
   OrderKeyManager,
   RESULT_STATUS,
   SEATS,
   SIDE,
   TraderClient,
+  TransactionFailed,
   associatedTokenAddress,
   decodeMarket,
+  decodeView,
   ownFills,
   privateConnection,
   randomSecret,
   sendAndConfirm,
+  type OrderKeyCheckpoint,
   type TapeFill,
   type View,
 } from "@noirwire/orderbook";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.2.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.3.0";
+/** The program's error number for "the exchange has opened its daily limit of new seats". */
+export const DAILY_SEAT_LIMIT_ERROR = 6137;
+const ORDER_KEY_SEARCH_WINDOW = 4_096;
+
+/** Where a trader's four live order keys sit in their derivation. It holds no secret. */
+export type KeyCheckpoint = OrderKeyCheckpoint;
 export const FIRST_TRADER_SEAT = 2;
 export const SEAT_COUNT = SEATS;
 
@@ -52,6 +62,14 @@ export interface ChainMarket {
   maxPriceAgeSeconds: number;
   baseToken: number;
   quoteToken: number;
+}
+
+export interface PublicAddresses {
+  exchange: string;
+  stats: string;
+  market: string;
+  tape: string;
+  priceFeed: string;
 }
 
 export interface ChainPrice {
@@ -93,25 +111,29 @@ export interface ChainOrder {
   restingExpirySeconds?: number;
 }
 
-export type PlaceStatus = "filled" | "rested" | "cancelled" | "refused" | "expired";
+/**
+ * `invalid`: refused before signing, by the market's public settings.
+ * `failed`: the transaction landed and the program refused it; nothing changed.
+ * `expired`: no result showed before the order's expiry.
+ */
+export type PlaceStatus =
+  "filled" | "rested" | "cancelled" | "refused" | "expired" | "invalid" | "failed";
 
 export interface PlaceOutcome {
   status: PlaceStatus;
   filled: bigint;
   rested: bigint;
-  /** From the send to the result showing in the trader's private view. */
+  /** From the send to the result showing in the trader's private view, as the client timed it. */
   sendToResultMs: number;
+  reason?: string;
 }
 
+/**
+ * `nothing` covers a seat that is not open, has no position, is healthy, or is past the worst price.
+ * `refused`: the program refused the liquidator itself, as when the seat is its own.
+ */
 export type LiquidationOutcome =
-  | "liquidated"
-  | "seatNotOpen"
-  | "noPosition"
-  | "notLiquidatable"
-  | "stalePrice"
-  | "worstPriceExceeded"
-  | "liquidatorMarginInsufficient"
-  | "noResult";
+  "liquidated" | "nothing" | "stalePrice" | "liquidatorMarginInsufficient" | "refused" | "noResult";
 
 export interface SeatView {
   seat: number;
@@ -137,11 +159,8 @@ const ORDER_TYPE_CODE: Record<ChainOrderType, number> = {
 
 const LIQUIDATION_OUTCOME: Record<number, LiquidationOutcome> = {
   [LIQUIDATION_STATUS.liquidated]: "liquidated",
-  [LIQUIDATION_STATUS.targetSeatNotOpen]: "seatNotOpen",
-  [LIQUIDATION_STATUS.noPosition]: "noPosition",
-  [LIQUIDATION_STATUS.notLiquidatable]: "notLiquidatable",
+  [LIQUIDATION_STATUS.nothingToLiquidate]: "nothing",
   [LIQUIDATION_STATUS.stalePrice]: "stalePrice",
-  [LIQUIDATION_STATUS.worstPriceExceeded]: "worstPriceExceeded",
   [LIQUIDATION_STATUS.liquidatorMarginInsufficient]: "liquidatorMarginInsufficient",
 };
 
@@ -209,19 +228,47 @@ export const refuseMainnet = async (solanaRpcUrl: string): Promise<void> => {
 const CONFIRM_TIMEOUT_MS = 30_000;
 const CONFIRM_POLL_MS = 100;
 
-/** Sends a fully signed transaction and waits until the rollup reports it executed. Throws when it failed. */
-export const sendSignedAndConfirm = async (
+/** The endpoint did not take a transaction that moves tokens: the HTTP status and body it answered with. */
+export class DepositRefused extends Error {
+  constructor(endpoint: string, cause: unknown) {
+    const answer = cause instanceof Error ? cause.message.split("\n")[0] : String(cause);
+    super(`${new URL(endpoint).origin} refused the deposit transaction: ${answer}`);
+    this.name = "DepositRefused";
+  }
+}
+
+/** The transaction executed and the program refused it, with the program's error number when it gave one. */
+export class ProgramRefused extends Error {
+  readonly code: number | null;
+
+  constructor(err: unknown) {
+    super(`the transaction failed: ${JSON.stringify(err)}`);
+    this.name = "ProgramRefused";
+    const detail = (err as { InstructionError?: [number, { Custom?: number }] })
+      ?.InstructionError?.[1];
+    this.code = typeof detail?.Custom === "number" ? detail.Custom : null;
+  }
+}
+
+/**
+ * Sends a fully signed transaction that carries a deposit and waits until the
+ * rollup reports it executed. A refusal at the door is a `DepositRefused`, a
+ * refusal by the program a `ProgramRefused`.
+ */
+export const sendDepositAndConfirm = async (
   connection: Connection,
   transaction: Transaction,
 ): Promise<string> => {
-  const signature = await connection.sendRawTransaction(transaction.serialize(), {
-    skipPreflight: true,
-  });
+  const signature = await connection
+    .sendRawTransaction(transaction.serialize(), { skipPreflight: true })
+    .catch((error: unknown) => {
+      throw new DepositRefused(connection.rpcEndpoint, error);
+    });
   const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const { value } = await connection.getSignatureStatus(signature);
     if (value && value.confirmationStatus !== "processed") {
-      if (value.err) throw new Error(`the transaction failed: ${JSON.stringify(value.err)}`);
+      if (value.err) throw new ProgramRefused(value.err);
       return signature;
     }
     await new Promise((resolve) => setTimeout(resolve, CONFIRM_POLL_MS));
@@ -231,7 +278,14 @@ export const sendSignedAndConfirm = async (
 
 export const newOrderSecret = (): Uint8Array => randomSecret();
 
-export const newOrderKeySeed = (): Uint8Array => new Uint8Array(randomBytes(32));
+/** A trader's order keys all follow from this seed, which follows from its owner key alone. */
+export const orderKeySeedOf = (owner: Keypair): Uint8Array =>
+  new Uint8Array(
+    createHash("sha256")
+      .update("noirwire-sim/order-key-seed/v1")
+      .update(owner.secretKey.subarray(0, 32))
+      .digest(),
+  );
 
 /** Which side of `fill`, if any, was an order placed with one of `secrets`. */
 export const fillRoles = (
@@ -273,12 +327,24 @@ export class Program {
     return Number(new DataView(clock.data.buffer, clock.data.byteOffset).getBigInt64(32, true));
   }
 
+  /** The public addresses the program derives: the exchange, the stats and one market's accounts. */
+  publicAddresses(marketId: number): PublicAddresses {
+    const { addresses } = this.instructions;
+    return {
+      exchange: addresses.exchange.toBase58(),
+      stats: addresses.stats.toBase58(),
+      market: addresses.market(marketId).toBase58(),
+      tape: addresses.tape(marketId).toBase58(),
+      priceFeed: addresses.priceFeed(marketId).toBase58(),
+    };
+  }
+
   async market(connection: Connection, marketId: number): Promise<ChainMarket> {
     const account = await connection.getAccountInfo(this.instructions.addresses.market(marketId));
     if (!account) throw new Error(`market ${marketId} is not on this network`);
     const { params } = decodeMarket(account.data);
     return {
-      marketId,
+      marketId: params.marketId,
       kind: params.kind === MARKET_KIND.perp ? "perp" : "spot",
       tick: params.tick,
       baseLot: params.baseLot,
@@ -354,25 +420,27 @@ export class Program {
     await sendAndConfirm(connection, [this.instructions.updateFunding(marketId)], payer);
   }
 
+  /** Credits the seat of `owner` from the faucet. The program finds the seat through the owner's view. */
   async deposit(
     connection: Connection,
     faucet: Keypair,
     mint: string,
-    seat: number,
+    owner: string,
     target: DepositTarget,
     amount: bigint,
   ): Promise<string> {
-    return sendAndConfirm(
-      connection,
-      [this.depositInstruction(faucet.publicKey, mint, seat, target, amount)],
-      faucet,
+    const latest = await connection.getLatestBlockhash("confirmed");
+    const transaction = new Transaction({ feePayer: faucet.publicKey, ...latest }).add(
+      this.depositInstruction(faucet.publicKey, mint, new PublicKey(owner), target, amount),
     );
+    transaction.sign(faucet);
+    return sendDepositAndConfirm(connection, transaction);
   }
 
   private depositInstruction(
     faucet: PublicKey,
     mint: string,
-    seat: number,
+    owner: PublicKey,
     target: DepositTarget,
     amount: bigint,
   ) {
@@ -381,17 +449,15 @@ export class Program {
       faucet,
       associatedTokenAddress(faucet, mintKey),
       mintKey,
-      seat,
+      owner,
       target === "collateral" ? { collateral: true } : { spot: target.spotToken },
       amount,
     );
   }
 
   /**
-   * One transaction that opens a seat for `owner` and credits `seat` from the
-   * faucet. It carries no signature yet. The program gives a new trader the
-   * lowest free seat, so when `seat` is not that seat the deposit fails and
-   * the whole transaction changes nothing.
+   * One transaction that opens a seat for `owner` and credits it from the
+   * faucet, so the two happen together or not at all. It carries no signature yet.
    */
   async openAndFundTransaction(
     connection: Connection,
@@ -400,7 +466,6 @@ export class Program {
       faucet: PublicKey;
       owner: PublicKey;
       orderKeys: PublicKey[];
-      seat: number;
       mint: string;
       amount: bigint;
     },
@@ -411,7 +476,7 @@ export class Program {
       this.depositInstruction(
         request.faucet,
         request.mint,
-        request.seat,
+        request.owner,
         "collateral",
         request.amount,
       ),
@@ -419,56 +484,74 @@ export class Program {
   }
 
   /**
-   * A trader this service holds the owner key of. Its order keys are drawn
-   * fresh for this process and written to the view, so nothing about them has
-   * to survive a restart.
+   * A trader whose owner key this process holds and whose seat exists, or
+   * null when it has none. Its order keys are picked up from `checkpoint`.
+   * Without one, or when the keys moved further than it reaches, all four
+   * are replaced by the first four of the derivation, signed by the owner.
    */
-  async openOwnTrader(
+  async ownTrader(
     rpcUrl: string,
     owner: Keypair,
-    gate: Keypair,
-    gateConnection: Connection,
-  ): Promise<ProgramTrader> {
+    checkpoint?: KeyCheckpoint,
+  ): Promise<ProgramTrader | null> {
     const connection = await signedInConnection(rpcUrl, owner);
-    const keys = OrderKeyManager.fresh(newOrderKeySeed());
-    const view = this.instructions.addresses.view(owner.publicKey);
-    if (await connection.getAccountInfo(view)) {
+    const account = await connection.getAccountInfo(
+      this.instructions.addresses.view(owner.publicKey),
+    );
+    if (!account) return null;
+    const seed = orderKeySeedOf(owner);
+    let keys: OrderKeyManager | null = null;
+    if (checkpoint) {
+      try {
+        const view = decodeView(account.data);
+        keys = OrderKeyManager.restore(seed, view, checkpoint, ORDER_KEY_SEARCH_WINDOW);
+      } catch {
+        keys = null;
+      }
+    }
+    if (!keys) {
+      keys = OrderKeyManager.fresh(seed);
       await sendAndConfirm(
         connection,
         [this.instructions.setOrderKeys(owner.publicKey, keys.publicKeys)],
         owner,
       );
-    } else {
-      await sendAndConfirm(
-        gateConnection,
-        [this.instructions.openTrader(gate.publicKey, owner.publicKey, keys.publicKeys)],
-        gate,
-        [owner],
-      );
     }
     return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
   }
 
-  /** A trader whose seat already exists, with the four order keys its view was opened with. */
-  async existingTrader(
+  /** As `ownTrader`, and opens the seat with the gate's signature when there is none. */
+  async openOwnTrader(
     rpcUrl: string,
     owner: Keypair,
-    orderKeySeed: Uint8Array,
+    gate: Keypair,
+    gateConnection: Connection,
+    checkpoint?: KeyCheckpoint,
   ): Promise<ProgramTrader> {
-    const connection = await signedInConnection(rpcUrl, owner);
-    return new ProgramTrader(
-      rpcUrl,
-      owner,
-      OrderKeyManager.fresh(orderKeySeed),
-      this.programId,
-      connection,
+    const existing = await this.ownTrader(rpcUrl, owner, checkpoint);
+    if (existing) return existing;
+    const keys = OrderKeyManager.fresh(orderKeySeedOf(owner));
+    await sendAndConfirm(
+      gateConnection,
+      [this.instructions.openTrader(gate.publicKey, owner.publicKey, keys.publicKeys)],
+      gate,
+      [owner],
     );
+    const connection = await signedInConnection(rpcUrl, owner);
+    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
+  }
+
+  /** A trader just opened with `firstOrderKeys(owner)`, before it sent anything. */
+  async newTrader(rpcUrl: string, owner: Keypair): Promise<ProgramTrader> {
+    const connection = await signedInConnection(rpcUrl, owner);
+    const keys = OrderKeyManager.fresh(orderKeySeedOf(owner));
+    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
   }
 }
 
 /** The four public order keys a new trader's view is opened with. */
-export const firstOrderKeys = (orderKeySeed: Uint8Array): PublicKey[] =>
-  OrderKeyManager.fresh(orderKeySeed).publicKeys;
+export const firstOrderKeys = (owner: Keypair): PublicKey[] =>
+  OrderKeyManager.fresh(orderKeySeedOf(owner)).publicKeys;
 
 /** One trader: signs in as its owner, trades with one-time order keys, reads its own view. */
 export class ProgramTrader {
@@ -490,7 +573,11 @@ export class ProgramTrader {
     return this.owner.publicKey.toBase58();
   }
 
-  /** One instruction at a time per trader; a failure signs in again before the next. */
+  get checkpoint(): KeyCheckpoint {
+    return this.keys.checkpoint;
+  }
+
+  /** One instruction at a time per trader; a failure on the wire signs in again before the next. */
   private run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
     const next = this.queue.then(async () => {
       if (this.signInAgain) {
@@ -507,7 +594,9 @@ export class ProgramTrader {
       try {
         return await operation(this.client);
       } catch (error) {
-        this.signInAgain = true;
+        const refusedByProgram =
+          error instanceof TransactionFailed || error instanceof OrderInvalid;
+        if (!refusedByProgram) this.signInAgain = true;
         throw error;
       }
     });
@@ -525,8 +614,8 @@ export class ProgramTrader {
     riskMarkets: number[],
     expirySeconds?: number,
   ): Promise<PlaceOutcome> {
+    const nothing = { filled: 0n, rested: 0n, sendToResultMs: 0 };
     return this.run(async (client) => {
-      const sentAt = performance.now();
       const placed = await client.placeOrder(
         marketId,
         {
@@ -541,16 +630,29 @@ export class ProgramTrader {
         },
         { riskMarkets, expirySeconds },
       );
-      const sendToResultMs = performance.now() - sentAt;
-      if (placed.outcome === "expired") {
-        return { status: "expired", filled: 0n, rested: 0n, sendToResultMs };
-      }
+      if (placed.outcome === "expired") return { status: "expired" as const, ...nothing };
       const { status, filled, rested } = placed.result;
-      return { status: placeStatusOf(status, rested), filled, rested, sendToResultMs };
+      return {
+        status: placeStatusOf(status, rested),
+        filled,
+        rested,
+        sendToResultMs: placed.resultAt - placed.sentAt,
+      };
+    }).catch((error: unknown): PlaceOutcome => {
+      if (error instanceof OrderInvalid) {
+        return { status: "invalid", ...nothing, reason: error.reason };
+      }
+      if (error instanceof TransactionFailed) {
+        return { status: "failed", ...nothing, reason: `program error ${error.code ?? "unknown"}` };
+      }
+      throw error;
     });
   }
 
-  /** Resolves to how many orders were cancelled, or null when no result showed before the expiry. */
+  /**
+   * Resolves to how many orders were cancelled, or null when no result showed
+   * before the expiry. Throws when the program refused the transaction.
+   */
   cancelAll(marketId: number): Promise<bigint | null> {
     return this.run(async (client) => (await client.cancelAll(marketId))?.cancelled ?? null);
   }
@@ -579,8 +681,11 @@ export class ProgramTrader {
         worstPrice,
         riskMarkets,
       );
-      if (!result) return "noResult";
-      return LIQUIDATION_OUTCOME[result.status] ?? "noResult";
+      if (!result) return "noResult" as const;
+      return LIQUIDATION_OUTCOME[result.status] ?? ("noResult" as const);
+    }).catch((error: unknown): LiquidationOutcome => {
+      if (error instanceof TransactionFailed) return "refused";
+      throw error;
     });
   }
 }

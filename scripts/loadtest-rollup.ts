@@ -13,11 +13,12 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { cpus, hostname, platform, release, totalmem } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Keypair, Transaction } from "@solana/web3.js";
 import { SeededRandom } from "../src/bots/rng.js";
 import {
   CLIENT_RELEASE,
+  type KeyCheckpoint,
   Program,
   type ProgramTrader,
   firstOrderKeys,
@@ -26,6 +27,12 @@ import {
 import { requireAllowedRpc } from "../src/rollup/rpc-allow-list.js";
 
 const REPORT_DIR = "loadtest-reports";
+/**
+ * The traders of earlier runs, with their owner keys, in the git-ignored data
+ * folder. They are reused, because the program opens only so many new seats a
+ * day. They hold test tokens on a test network and nothing else.
+ */
+const TRADERS_FILE = join("data", "loadtest-traders.json");
 
 const flag = (name: string, fallback: string): string => {
   const at = process.argv.indexOf(name);
@@ -42,15 +49,50 @@ interface Counters {
   sent: number;
   confirmed: number;
   expired: number;
+  invalid: number;
+  refusedByProgram: number;
   failed: number;
   filled: number;
   late: number;
   latenciesMs: number[];
 }
 
-const openThroughTheService = async (simUrl: string, program: Program, rollupRpcUrl: string) => {
+interface LoadTrader {
+  owner: Keypair;
+  trader: ProgramTrader;
+}
+
+interface KeptTrader {
+  programId: string;
+  owner: number[];
+  checkpoint: KeyCheckpoint;
+}
+
+const readKept = async (programId: string): Promise<KeptTrader[]> => {
+  try {
+    const kept = JSON.parse(await readFile(TRADERS_FILE, "utf8")) as KeptTrader[];
+    return kept.filter((entry) => entry.programId === programId);
+  } catch {
+    return [];
+  }
+};
+
+const keep = async (programId: string, traders: LoadTrader[]): Promise<void> => {
+  const kept: KeptTrader[] = traders.map(({ owner, trader }) => ({
+    programId,
+    owner: Array.from(owner.secretKey),
+    checkpoint: trader.checkpoint,
+  }));
+  await mkdir(dirname(TRADERS_FILE), { recursive: true });
+  await writeFile(TRADERS_FILE, JSON.stringify(kept), { mode: 0o600 });
+};
+
+const openThroughTheService = async (
+  simUrl: string,
+  program: Program,
+  rollupRpcUrl: string,
+): Promise<LoadTrader> => {
   const owner = Keypair.generate();
-  const orderKeySeed = new Uint8Array(randomBytes(32));
   const post = async (path: string, payload: unknown) => {
     const response = await fetch(`${simUrl}${path}`, {
       method: "POST",
@@ -64,7 +106,7 @@ const openThroughTheService = async (simUrl: string, program: Program, rollupRpc
   const address = owner.publicKey.toBase58();
   const prepared = await post("/v1/fund/prepare", {
     owner: address,
-    orderKeys: firstOrderKeys(orderKeySeed).map((key) => key.toBase58()),
+    orderKeys: firstOrderKeys(owner).map((key) => key.toBase58()),
   });
   const transaction = Transaction.from(Buffer.from(prepared.transaction!, "base64"));
   transaction.partialSign(owner);
@@ -74,7 +116,7 @@ const openThroughTheService = async (simUrl: string, program: Program, rollupRpc
       .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString("base64"),
   });
-  return program.existingTrader(rollupRpcUrl, owner, orderKeySeed);
+  return { owner, trader: await program.newTrader(rollupRpcUrl, owner) };
 };
 
 export async function main(): Promise<void> {
@@ -104,16 +146,27 @@ export async function main(): Promise<void> {
   const chain = publicConnection(rollupRpcUrl, rollupWsUrl);
   const { tick, minNotional } = await program.market(chain, market.id);
 
-  console.log(`Opening and funding ${traderCount} traders through ${simUrl} ...`);
-  const traders: ProgramTrader[] = [];
-  for (let at = 0; at < traderCount; at += 1) {
+  const traders: LoadTrader[] = [];
+  for (const kept of (await readKept(deployment.programId)).slice(0, traderCount)) {
+    const owner = Keypair.fromSecretKey(Uint8Array.from(kept.owner));
+    const trader = await program.ownTrader(rollupRpcUrl, owner, kept.checkpoint);
+    if (trader) traders.push({ owner, trader });
+  }
+  const reused = traders.length;
+  console.log(
+    `Reusing ${reused} traders from ${TRADERS_FILE}; opening ${traderCount - reused} through ${simUrl} ...`,
+  );
+  while (traders.length < traderCount) {
     traders.push(await openThroughTheService(simUrl, program, rollupRpcUrl));
+    await keep(deployment.programId, traders);
   }
 
   const counters: Counters = {
     sent: 0,
     confirmed: 0,
     expired: 0,
+    invalid: 0,
+    refusedByProgram: 0,
     failed: 0,
     filled: 0,
     late: 0,
@@ -149,6 +202,14 @@ export async function main(): Promise<void> {
           counters.expired += 1;
           continue;
         }
+        if (outcome.status === "invalid") {
+          counters.invalid += 1;
+          continue;
+        }
+        if (outcome.status === "failed") {
+          counters.refusedByProgram += 1;
+          continue;
+        }
         counters.confirmed += 1;
         counters.latenciesMs.push(outcome.sendToResultMs);
         if (outcome.sendToResultMs > lateMs) counters.late += 1;
@@ -158,7 +219,8 @@ export async function main(): Promise<void> {
       }
     }
   };
-  await Promise.all(traders.map(runTrader));
+  await Promise.all(traders.map(({ trader }) => runTrader(trader)));
+  await keep(deployment.programId, traders);
 
   const elapsedSeconds = (Date.now() - startedAt) / 1_000;
   const fillsOnChain = Number((await program.stats(chain)).fills - fillsBefore);
@@ -170,8 +232,11 @@ export async function main(): Promise<void> {
     client: CLIENT_RELEASE,
     market: symbol,
     traderCount,
+    tradersReused: reused,
     durationSeconds: elapsedSeconds,
     ordersSent: counters.sent,
+    ordersRefusedBeforeSigning: counters.invalid,
+    ordersRefusedByTheProgram: counters.refusedByProgram,
     resultsConfirmed: counters.confirmed,
     ordersExpired: counters.expired,
     sendsFailed: counters.failed,

@@ -61,9 +61,18 @@ BOT_TRADER_SEEDS=<seed>,<seed>,...
 ```
 
 Set by the code, not by hand: `VENUE=rollup`, `NETWORK=devnet`, `DATA_DIR=/app/data`,
-`SERVICE_LOCATION` (the Railway region, which labels the latency figure). Do not set
-`ROLLUP_DIRECT_RPC_URL`: it is the rollup's own port on a local network and does not exist
-on a hosted one.
+`SERVICE_LOCATION` (the Railway region, which labels the latency figure). Deposits go to
+the `depositUrl` in the deployment description, which on devnet is the private endpoint;
+set `DEPOSIT_RPC_URL` only to send them somewhere else.
+
+## The daily limit on new accounts
+
+The program opens at most `maxSeatsPerDay` new seats a day (100 in the order book
+repository's set-up). The ten bots count on their first start. Once it is reached,
+`POST /v1/fund/submit` answers 503 `daily limit reached` until the next day. To raise it,
+the exchange's admin sends `update_exchange` with a larger `maxSeatsPerDay` (the order
+book repository's ops script holds the settings). Seats that were opened and never used
+can be closed by the admin with `close_unused_trader`.
 
 ## Check it
 
@@ -81,16 +90,21 @@ per 2.5%.
 
 ## Before the first deploy
 
-- **Deposits through the hosted endpoint are unproven.** On the local network the query
-  filter refuses every deposit transaction, signed in or not, and the service sends
-  deposits to the rollup's own port instead (`ROLLUP_DIRECT_RPC_URL`). A hosted rollup
-  has no such port. If devnet's endpoint refuses deposits as well, the bots cannot be
-  funded and `/v1/health` will stay at `botsFunded: false`. Try one deposit there first.
-- The local rollup is version 0.14.10 and devnet's is newer. Nothing here was measured
-  there.
+- **Whether the hosted endpoint accepts the program's `deposit` is the one unknown.** The
+  local query filter refuses any program but the token program naming a private token
+  balance; the hosted endpoint accepts a plain transfer, and nobody has sent it this
+  deposit yet. If it refuses, the service says so at once: the first bot's funding fails,
+  the log line reads `<endpoint> refused the deposit transaction: <status> <body>`, the
+  process exits, and `/v1/fund/submit` would answer 502 with the same text. Read the
+  first deploy's log for that line.
+- What the service already does for the hosted endpoint: every key that sends is signed
+  in first (it answers 401 otherwise); public data is read anonymously; nothing reads a
+  transaction back, a token account or custody; a failed send signs in again before the
+  next. A round trip from Europe is about 200 ms, so a maker's requote of ten orders takes
+  a few seconds there. None of this was run against devnet from this repository.
 
 ## Do not change
 
 Keep it at one replica. The fund limits are counted in one process's memory, two oracles
-would refuse each other's prices, and the fund routes are only safe while one process
-holds the gate key (see `docs/DESIGN.md`, "Funding a user").
+would refuse each other's prices, two processes would move the same bots' order keys
+under each other, and the liquidator's sweep covers only the seats this process opened.

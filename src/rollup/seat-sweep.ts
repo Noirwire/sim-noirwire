@@ -1,42 +1,31 @@
-const WRAP_AFTER_EMPTY_SEATS = 16;
-
 /**
- * Which seats the liquidator tries next. Nobody can read the ledger, so
+ * Which seats the liquidator tries next. Nobody can read the ledger, and an
+ * attempt on an empty seat reads the same as one on a healthy trader, so
  * liquidation is tried blind by seat number, a few seats per tick. The
- * program fills seats from the lowest number up, so a long run of seats that
- * are not open means the end of the occupied range, and the sweep starts
- * over instead of walking the whole empty table.
+ * program fills seats from the lowest number up and every new seat needs the
+ * gate's signature, so no seat lies beyond the number of accounts the gate
+ * ever opened: the sweep walks that far and starts over.
  */
 export class SeatSweep {
   private cursor: number;
-  private emptyRun = 0;
 
   constructor(
     private readonly firstSeat: number,
     private readonly seatCount: number,
+    private readonly seatsEverOpened: () => number,
   ) {
     this.cursor = firstSeat;
   }
 
   next(count: number): number[] {
+    const end = Math.min(this.seatCount, this.firstSeat + Math.max(1, this.seatsEverOpened()));
     const seats: number[] = [];
     for (let taken = 0; taken < count; taken += 1) {
+      if (this.cursor >= end) this.cursor = this.firstSeat;
       seats.push(this.cursor);
-      this.cursor = this.cursor + 1 >= this.seatCount ? this.firstSeat : this.cursor + 1;
+      this.cursor += 1;
     }
     return seats;
-  }
-
-  report(seatOpen: boolean): void {
-    if (seatOpen) {
-      this.emptyRun = 0;
-      return;
-    }
-    this.emptyRun += 1;
-    if (this.emptyRun >= WRAP_AFTER_EMPTY_SEATS) {
-      this.cursor = this.firstSeat;
-      this.emptyRun = 0;
-    }
   }
 }
 

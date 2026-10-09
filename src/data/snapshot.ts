@@ -8,6 +8,8 @@ export interface SnapshotData {
   fundedAddresses: string[];
   /** Per market, the last on-chain fill sequence already recorded into the candles. */
   tapeCursors?: Record<string, number>;
+  /** Per bot owner address, where its one-time order keys stand. No secret: indices only. */
+  orderKeyCheckpoints?: Record<string, { indices: number[]; nextIndex: number }>;
 }
 
 const FILE_NAME = "snapshot.json";

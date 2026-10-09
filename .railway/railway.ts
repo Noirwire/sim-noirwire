@@ -42,7 +42,7 @@ export default defineRailway(() => {
     },
     // ONE replica, on purpose: the fund limits are counted in the memory of one
     // process, a second oracle would fight the first over the publish gap, and
-    // the fund routes rely on this process being the only holder of the gate key.
+    // two processes would move the same bots' one-time order keys under each other.
     replicas: 1,
     // Candles, fund grants and the tape cursors, written every 30 seconds.
     volumeMounts: { "/app/data": volume("sim-data") },

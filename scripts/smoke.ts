@@ -5,7 +5,6 @@
  *
  *   npx tsx scripts/smoke.ts --url http://127.0.0.1:4100
  */
-import { randomBytes } from "node:crypto";
 import { Keypair, Transaction } from "@solana/web3.js";
 import { firstOrderKeys } from "../src/rollup/program.js";
 
@@ -64,7 +63,7 @@ const main = async (): Promise<void> => {
   const owner = Keypair.generate();
   const request = {
     owner: owner.publicKey.toBase58(),
-    orderKeys: firstOrderKeys(new Uint8Array(randomBytes(32))).map((key) => key.toBase58()),
+    orderKeys: firstOrderKeys(owner).map((key) => key.toBase58()),
   };
   const prepared = await call("/v1/fund/prepare", request);
   check("a fresh key is offered its open-and-fund transaction", prepared.status === 200);

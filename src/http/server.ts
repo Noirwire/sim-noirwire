@@ -6,6 +6,7 @@ import { registerCandlesRoute } from "./routes/candles.js";
 import { registerDevTradingRoutes } from "./routes/dev-trading.js";
 import { registerFundRoute } from "./routes/fund.js";
 import { registerRollupFundRoutes } from "./routes/fund-rollup.js";
+import { registerDeploymentRoute } from "./routes/deployment.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerMarketsRoute } from "./routes/markets.js";
 import { registerStatsRoute } from "./routes/stats.js";
@@ -19,6 +20,7 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   await app.register(websocket);
 
   registerHealthRoute(app, ctx);
+  if (ctx.deployment) registerDeploymentRoute(app, ctx.deployment);
   registerMarketsRoute(app, ctx);
   registerTapeRoute(app, ctx);
   registerCandlesRoute(app, ctx);

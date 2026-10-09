@@ -23,7 +23,7 @@ import { buildServer } from "./http/server.js";
 import { JupiterPriceSource } from "./prices/jupiter-price-source.js";
 import type { PriceSource } from "./prices/price-source.js";
 import { Program, refuseMainnet } from "./rollup/program.js";
-import { type BotSpec, RollupVenue } from "./rollup/rollup-venue.js";
+import { type BotSpec, RollupVenue, executed } from "./rollup/rollup-venue.js";
 import { loadRollupSettings } from "./rollup/settings.js";
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -59,7 +59,7 @@ interface BotSizes {
 interface VenueWiring {
   venue: Venue;
   botVenue: Venue;
-  context: Pick<AppContext, "funding" | "readiness">;
+  context: Pick<AppContext, "funding" | "readiness" | "deployment">;
   sizes(market: MarketConfig): Promise<BotSizes>;
   liquidationTargets(): TraderKey[];
   /** Runs once every bot is open and funded, before the first bot tick. */
@@ -74,17 +74,21 @@ const logError = (what: string, error: unknown): void => {
   console.error(`sim-noirwire: ${what}`, detail);
 };
 
+const ticksInFlight = new Set<Promise<unknown>>();
+
 /** A timer callback that never overlaps itself: a slow tick is skipped over, not stacked. */
 const oneAtATime = (what: string, work: () => Promise<unknown>): (() => void) => {
   let busy = false;
   return () => {
     if (busy) return;
     busy = true;
-    work()
+    const tick = work()
       .catch((error) => logError(what, error))
       .finally(() => {
         busy = false;
+        ticksInFlight.delete(tick);
       });
+    ticksInFlight.add(tick);
   };
 };
 
@@ -137,6 +141,7 @@ const rollupWiring = async (
   config: Config,
   data: Pick<AppContext, "tape" | "candles" | "hub" | "stats">,
   snapshot: SnapshotData | null,
+  usersEverOpened: () => number,
 ): Promise<VenueWiring> => {
   const takerKeys = Array.from({ length: config.NOISE_TAKER_COUNT }, (_, i) => takerTraderKey(i));
   const roles: Omit<BotSpec, "owner">[] = [
@@ -173,6 +178,8 @@ const rollupWiring = async (
     latencyWindowSize: config.STATS_LATENCY_WINDOW,
     measuredFrom: config.SERVICE_LOCATION,
     recordedThrough: snapshot?.tapeCursors ?? {},
+    keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
+    usersEverOpened,
     handlers: {
       onFill: ({ fill, origin, replayed }) => {
         if (replayed) {
@@ -185,7 +192,7 @@ const rollupWiring = async (
       onPrice: (market, price, publishedAtMs) =>
         data.hub.broadcastPrice(market, price, publishedAtMs),
       onBotOrder: (trader, outcome) => {
-        if (outcome.status === "expired") return;
+        if (!executed(outcome)) return;
         botOrdersExecuted += 1;
         data.stats.recordOrder(trader);
         data.stats.recordLatency(outcome.sendToResultMs);
@@ -233,8 +240,13 @@ const rollupWiring = async (
     venue,
     botVenue,
     context: {
-      funding: venue.fundingDesk(liquidatorTraderKey, config.FUND_AMOUNT_NUSD, systemClock),
+      funding: venue.fundingDesk(config.FUND_AMOUNT_NUSD, systemClock),
       readiness: () => venue.readiness(),
+      deployment: venue.publicDeployment({
+        solanaRpcUrl: config.PUBLIC_SOLANA_RPC_URL ?? settings.solanaRpcUrl,
+        rollupRpcUrl: config.PUBLIC_ROLLUP_RPC_URL ?? settings.rollupRpcUrl,
+        rollupWsUrl: config.PUBLIC_ROLLUP_WS_URL ?? settings.rollupWsUrl,
+      }),
     },
     sizes: async (market) => {
       const { markPrice, lotSize } = await marketInfo(market);
@@ -263,7 +275,10 @@ const rollupWiring = async (
       for (const key of roles.map((role) => role.key)) data.stats.recordTrader(key);
     },
     onPricePoint: () => {},
-    snapshotExtras: () => ({ tapeCursors: venue.tapeCursors() }),
+    snapshotExtras: () => ({
+      tapeCursors: venue.tapeCursors(),
+      orderKeyCheckpoints: venue.keyCheckpoints(),
+    }),
     stop: () => venue.stop(),
   };
 };
@@ -302,7 +317,7 @@ export const startApp = async (
 
   const wiring =
     config.VENUE === "rollup"
-      ? await rollupWiring(config, data, existingSnapshot)
+      ? await rollupWiring(config, data, existingSnapshot, () => fundLedger.exportSnapshot().length)
       : memoryWiring(config, data);
   const { venue, botVenue } = wiring;
 
@@ -441,6 +456,9 @@ export const startApp = async (
       closed = true;
       for (const timer of timers) clearInterval(timer);
       priceSource.stop();
+      // A bot's order still on its way moves its order keys on: the snapshot
+      // is taken once every tick has finished, so the checkpoints are final.
+      await Promise.allSettled([...ticksInFlight]);
       await wiring.stop();
       await saveSnapshot();
       await server.close();

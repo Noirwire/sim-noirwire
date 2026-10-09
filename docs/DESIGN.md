@@ -62,8 +62,9 @@ Prices and sizes cross this boundary as integers (`bigint`), never floats.
 | Route | Returns |
 | --- | --- |
 | `GET /health` | `{ ok, venue, network }`; with `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold |
+| `GET /deployment` | `VENUE=rollup` only, public, cacheable for five minutes. What a browser needs to trade on the program directly: `network`, `programId`, `solanaRpcUrl`, `rollupRpcUrl`, `rollupWsUrl` (the URLs a browser should use), `exchange`, `stats`, and per market `marketId` (the on-chain id), `symbol`, `kind`, `market`, `tape`, `priceFeed`, `baseToken` and `quoteToken` (`symbol`, `mint`, `decimals`; `baseToken` is null on a perpetual), `baseDecimals`, `quoteDecimals`, `lotSize` (base atoms per lot) and `tick` (quote atoms per lot), both as decimal text. No key and no role address |
 | `GET /markets` | per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest |
-| `GET /tape?market=&limit=` | latest fills: price, size, taker side, time, sequence |
+| `GET /tape?market=&limit=` | latest fills: price, size, taker side, time, sequence, `makerTag`, `takerTag`. With `VENUE=rollup` each tag is that side's 8-byte receipt from the chain's tape, read as a big-endian unsigned integer and written as decimal text; the websocket's `fill` message carries the same two fields |
 | `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=` | open, high, low, close, volume, start time |
 | `GET /stats` | orders, fills, volume, traders, latency (median, p99, sample size, where measured), updated at |
 | `POST /fund` `{ address }` | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP |
@@ -92,13 +93,20 @@ types, so a new client release is an edit to that one file.
   the last one, so a larger real move is walked there one allowed step per publish. A
   refused publish is logged and the next one is tried.
 - **Bots.** Each bot is an ordinary trader: its own seat, its own private view, one-time
-  order keys. Its owner key comes from its seed; its order keys are drawn fresh at every
-  start and written to its view. Bots are topped up from the faucet to their starting
+  order keys. Its owner key comes from its seed, and its order keys follow from the owner
+  key. Where each bot's keys stand is saved in the snapshot (indices, no secret) and
+  picked up at the next start; without a usable checkpoint the owner replaces all four
+  keys. An order the client refuses before signing, or the program refuses after, comes
+  back to the bot as a rejected order at once. Bots are topped up from the faucet to their starting
   balance, never above it, so a restart does not pay them twice. Every resting quote
   carries a 30 second expiry of its own. Funding is advanced by the rollup's scheduler;
   `updateFunding` sends the instruction only for a market that has none scheduled.
 - **Liquidation.** Nobody can read the ledger, so the liquidator tries a few seat numbers
-  per tick, blind, and starts over after a long run of empty seats.
+  per tick, blind. An attempt on an empty seat reads the same as one on a healthy trader,
+  so the sweep cannot see where the occupied seats end. It walks as many seats as this
+  service ever opened (its bots plus every user it funded; seats fill from the lowest
+  number) and starts over. Seats opened with the gate key by anything else lie outside it.
+  A liquidation adds nothing to the public order, fill or volume counters.
 - **Public data.** The tape, the price feeds and the stats are read from the chain over
   the rollup's websocket, anonymously, and re-read in full every five seconds. Fills are
   followed by sequence number, so a dropped notification is filled in from the tape
@@ -109,7 +117,10 @@ types, so a new client release is an edit to that one file.
   when both sides are bots; anything else has a user on a side. User orders are the
   chain's order count less the bots' own.
 - **Latency.** `/v1/stats` reports the time from a bot's send to the result showing in
-  its private view, labelled with `SERVICE_LOCATION`.
+  its private view, as the client itself times it, labelled with `SERVICE_LOCATION`.
+- **Deposits** go to the deployment's `depositUrl`: the rollup's own port on the local
+  stack, the private endpoint on a hosted one. `DEPOSIT_RPC_URL` overrides it. An endpoint
+  that refuses a deposit at the door is reported with its HTTP status and body.
 - **Health.** `/v1/health` answers 200 only when the public accounts were read in the
   last 15 seconds, every market's price on chain is fresh and was published by this
   process, and every bot is open and funded.
@@ -128,14 +139,18 @@ Two steps, one transaction:
 
 One grant per owner address and the per-IP limit apply to both steps.
 
-A deposit names a seat by number, and the program does not tell anyone but the owner
-which seat a new account got. It does give out the lowest free seat. So `prepare` finds
-that seat first, by blind liquidation attempts whose result says only whether a seat is
-open, and the deposit names it. If the seat is taken in between, the deposit fails and
-the whole transaction with it: nothing is opened, and the user prepares again. This is
-safe only while this process is the only holder of the gate key, which is one reason for
-one replica. The search is one attempt per open seat on the first request after a start
-and one or two afterwards.
+A deposit names its beneficiary by owner key, so the grant can only reach the account the
+same transaction opens. `submit` answers:
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Opened and funded |
+| 400 | Not the transaction that was prepared, or the owner's signature is missing or wrong |
+| 409 | This owner was funded before, or the program refused the opening (the account exists). Nothing changed |
+| 410 | Nothing prepared for this owner, or prepared more than 45 seconds ago |
+| 429 | Too many grants from this IP |
+| 502 | The rollup endpoint refused the transaction; the body carries its HTTP status and answer |
+| 503 | `daily limit reached`: the program opens only so many new seats a day (`maxSeatsPerDay`) |
 
 ### Local run in Docker
 

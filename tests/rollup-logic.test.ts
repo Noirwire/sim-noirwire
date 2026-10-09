@@ -1,10 +1,20 @@
 import { ROLE, receipt } from "@noirwire/orderbook";
-import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { type Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
+import { ManualClock } from "../src/engine/clock.js";
 import { BotOrderSecrets, originOf } from "../src/rollup/bot-orders.js";
+import { type Funded, FundingDesk } from "../src/rollup/funding-desk.js";
 import { checkSubmitted } from "../src/rollup/open-request.js";
 import { nextPublishPrice } from "../src/rollup/price-walk.js";
-import { type ChainFill, type ChainTape, fillRoles } from "../src/rollup/program.js";
+import {
+  type ChainFill,
+  type ChainMarket,
+  type ChainTape,
+  Program,
+  fillRoles,
+  firstOrderKeys,
+} from "../src/rollup/program.js";
+import { publicDeployment } from "../src/rollup/public-deployment.js";
 import { requireAllowedRpc } from "../src/rollup/rpc-allow-list.js";
 import { SeatSweep } from "../src/rollup/seat-sweep.js";
 import { loadRollupSettings } from "../src/rollup/settings.js";
@@ -180,17 +190,88 @@ describe("telling a bot's fill from a user's by receipt", () => {
 
 describe("the liquidator's blind sweep", () => {
   it("walks the seats a few at a time and wraps at the end of the table", () => {
-    const sweep = new SeatSweep(2, 6);
+    const sweep = new SeatSweep(2, 6, () => 2_000);
     expect(sweep.next(3)).toEqual([2, 3, 4]);
     expect(sweep.next(3)).toEqual([5, 2, 3]);
   });
 
-  it("starts over after a long run of empty seats instead of walking the empty table", () => {
-    const sweep = new SeatSweep(2, 2_048);
-    sweep.next(20);
-    sweep.report(true);
-    for (let empty = 0; empty < 16; empty += 1) sweep.report(false);
-    expect(sweep.next(2)).toEqual([2, 3]);
+  it("walks only as far as the gate ever opened seats, and further once it opens more", () => {
+    let opened = 3;
+    const sweep = new SeatSweep(2, 2_048, () => opened);
+    expect(sweep.next(4)).toEqual([2, 3, 4, 2]);
+    opened = 5;
+    expect(sweep.next(4)).toEqual([3, 4, 5, 6]);
+  });
+});
+
+describe("the funding desk when the transaction does not go through", () => {
+  const gate = Keypair.generate();
+  const faucet = Keypair.generate();
+  const submitWith = async (network: {
+    send(): Promise<string>;
+    err?: unknown;
+  }): Promise<Funded> => {
+    const connection = {
+      rpcEndpoint: "https://rollup.example/?token=secret",
+      getLatestBlockhash: async () => ({
+        blockhash: PublicKey.default.toBase58(),
+        lastValidBlockHeight: 1,
+      }),
+      sendRawTransaction: () => network.send(),
+      getSignatureStatus: async () => ({
+        value: { confirmationStatus: "confirmed", err: network.err ?? null },
+      }),
+    } as unknown as Connection;
+    const desk = new FundingDesk({
+      program: new Program(Keypair.generate().publicKey.toBase58()),
+      connection,
+      gate,
+      faucet,
+      mint: Keypair.generate().publicKey.toBase58(),
+      amountAtoms: 5_000_000_000n,
+      clock: new ManualClock(1_000),
+      onError: () => {},
+    });
+    const owner = Keypair.generate();
+    const address = owner.publicKey.toBase58();
+    const prepared = await desk.prepare(
+      address,
+      firstOrderKeys(owner).map((key) => key.toBase58()),
+    );
+    if (!prepared.ok) throw new Error("prepare failed");
+    const transaction = Transaction.from(Buffer.from(prepared.transaction, "base64"));
+    transaction.partialSign(owner);
+    const signed = transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
+    return desk.submit(address, signed.toString("base64"));
+  };
+
+  it("says the daily limit is reached when the program refuses a new seat for that reason", async () => {
+    const funded = await submitWith({
+      send: async () => "signature",
+      err: { InstructionError: [0, { Custom: 6137 }] },
+    });
+    expect(funded).toMatchObject({ ok: false, status: 503 });
+    expect(funded.ok ? "" : funded.reason).toContain("daily limit reached");
+  });
+
+  it("passes on the endpoint's own status and body when it refuses the deposit, without the sign-in token", async () => {
+    const funded = await submitWith({
+      send: async () => {
+        throw new Error('403 Forbidden: {"error":"Access denied"}');
+      },
+    });
+    expect(funded).toMatchObject({ ok: false, status: 502 });
+    const reason = funded.ok ? "" : funded.reason;
+    expect(reason).toContain('403 Forbidden: {"error":"Access denied"}');
+    expect(reason).not.toContain("secret");
+  });
+
+  it("reports any other refusal by the program as an account that was not opened", async () => {
+    const funded = await submitWith({
+      send: async () => "signature",
+      err: { InstructionError: [0, { Custom: 6003 }] },
+    });
+    expect(funded).toMatchObject({ ok: false, status: 409 });
   });
 });
 
@@ -225,6 +306,81 @@ describe("units between the service and the program", () => {
   });
 });
 
+describe("the public deployment description", () => {
+  const address = () => Keypair.generate().publicKey.toBase58();
+  const roles = { gate: address(), oracle: address(), faucet: address() };
+  const deployment = {
+    network: "localnet",
+    programId: address(),
+    ...roles,
+    depositUrl: "http://internal-rollup:7799",
+    tokens: [
+      { index: 0, symbol: "nUSD", decimals: 6, mint: address() },
+      { index: 1, symbol: "nSOL", decimals: 9, mint: address() },
+    ],
+    markets: [
+      { id: 0, symbol: "NSOL-PERP", kind: "perp" as const, baseDecimals: 9 },
+      { id: 2, symbol: "NSOL-NUSD", kind: "spot" as const, baseDecimals: 9 },
+    ],
+  };
+  const chainMarket = (
+    marketId: number,
+    kind: "perp" | "spot",
+    baseToken: number,
+  ): ChainMarket => ({
+    marketId,
+    kind,
+    tick: 100n,
+    baseLot: 1_000_000n,
+    minSize: 1n,
+    minNotional: 1_000_000n,
+    bandBps: 400,
+    imBps: 1_000,
+    maxMoveBps: 250,
+    minPublishGapSeconds: 1,
+    maxPriceAgeSeconds: 10,
+    baseToken,
+    quoteToken: 0,
+  });
+  const addresses = () => ({
+    exchange: "exchange-address",
+    stats: "stats-address",
+    market: address(),
+    tape: address(),
+    priceFeed: address(),
+  });
+  const described = publicDeployment(
+    deployment,
+    {
+      solanaRpcUrl: "https://solana.example",
+      rollupRpcUrl: "https://rollup.example",
+      rollupWsUrl: "wss://rollup.example",
+    },
+    [
+      { chain: chainMarket(0, "perp", 0), addresses: addresses() },
+      { chain: chainMarket(2, "spot", 1), addresses: addresses() },
+    ],
+  );
+
+  it("names the gate, the oracle, the faucet and the service's own deposit URL nowhere", () => {
+    const text = JSON.stringify(described);
+    for (const hidden of [...Object.values(roles), deployment.depositUrl]) {
+      expect(text).not.toContain(hidden);
+    }
+  });
+
+  it("gives a spot market both token mints and a perpetual only its quote", () => {
+    const [perp, spot] = described.markets;
+    expect(perp).toMatchObject({ marketId: 0, baseToken: null, lotSize: "1000000", tick: "100" });
+    expect(perp!.quoteToken.mint).toBe(deployment.tokens[0]!.mint);
+    expect(spot!.baseToken).toEqual({
+      symbol: "nSOL",
+      mint: deployment.tokens[1]!.mint,
+      decimals: 9,
+    });
+  });
+});
+
 describe("the rollup settings", () => {
   const key = () => Keypair.generate();
   const oracle = key();
@@ -242,7 +398,8 @@ describe("the rollup settings", () => {
       oracle: oracle.publicKey.toBase58(),
       faucet: faucet.publicKey.toBase58(),
       tokens: [],
-      markets: [{ id: 0, symbol: "NSOL-PERP", kind: "perp" }],
+      depositUrl: "http://127.0.0.1:7799",
+      markets: [{ id: 0, symbol: "NSOL-PERP", kind: "perp", baseDecimals: 9 }],
     }),
     ORACLE_SECRET_KEY: secret(oracle),
     GATE_SECRET_KEY: secret(gate),

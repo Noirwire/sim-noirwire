@@ -32,7 +32,10 @@ services:
       SOLANA_RPC_URL: http://host.docker.internal:8899
       ROLLUP_RPC_URL: http://host.docker.internal:6699
       ROLLUP_WS_URL: ws://host.docker.internal:6700
-      ROLLUP_DIRECT_RPC_URL: http://host.docker.internal:7799
+      DEPOSIT_RPC_URL: http://host.docker.internal:7799
+      PUBLIC_SOLANA_RPC_URL: http://localhost:8899
+      PUBLIC_ROLLUP_RPC_URL: http://localhost:6699
+      PUBLIC_ROLLUP_WS_URL: ws://localhost:6700
       SERVICE_LOCATION: a container on the machine that runs the local network
       FUND_IP_RATE_LIMIT: ${FUND_IP_RATE_LIMIT:-20}
     volumes:

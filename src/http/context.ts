@@ -5,6 +5,7 @@ import type { TapeStore } from "../data/tape-store.js";
 import type { Config } from "../config/config.js";
 import type { Venue } from "../engine/types.js";
 import type { FundingDesk } from "../rollup/funding-desk.js";
+import type { PublicDeployment } from "../rollup/public-deployment.js";
 import type { Readiness } from "../rollup/rollup-venue.js";
 import type { Hub } from "./hub.js";
 
@@ -20,4 +21,6 @@ export interface AppContext {
   funding?: FundingDesk;
   /** VENUE=rollup only: whether the service is connected, pricing and funded. */
   readiness?: () => Readiness;
+  /** VENUE=rollup only: what a browser needs to trade on the program directly. */
+  deployment?: PublicDeployment;
 }

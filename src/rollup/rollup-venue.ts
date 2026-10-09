@@ -26,6 +26,7 @@ import {
   type ChainPrice,
   type ChainStats,
   type DepositTarget,
+  type KeyCheckpoint,
   type PlaceOutcome,
   type Program,
   type ProgramTrader,
@@ -35,6 +36,7 @@ import {
   publicConnection,
   signedInConnection,
 } from "./program.js";
+import { type BrowserUrls, type PublicDeployment, publicDeployment } from "./public-deployment.js";
 import { SeatSweep, seatOfTarget, seatTarget } from "./seat-sweep.js";
 import type { RollupSettings } from "./settings.js";
 import type { TapeUpdate } from "./tape-tracker.js";
@@ -50,11 +52,6 @@ import {
   toSimSize,
 } from "./units.js";
 
-/**
- * The program stores no decimals for a perpetual's base, and the deployment
- * description does not carry them, so they are stated here per base asset.
- */
-const BASE_DECIMALS: Record<string, number> = { SOL: 9, NVDAx: 6 };
 const CHAIN_TOKEN_OF: Record<string, string> = { nUSD: "nUSD", SOL: "nSOL" };
 const COLLATERAL_TOKEN = "nUSD";
 const SPOT_COLLATERAL_BALANCE = "nUSD (spot)";
@@ -97,6 +94,10 @@ export interface RollupVenueOptions {
   measuredFrom: string;
   /** Per market, the last fill sequence an earlier run already recorded. */
   recordedThrough: Record<MarketId, number>;
+  /** Per bot owner address, where its order keys stood when an earlier run last saved. */
+  keyCheckpoints: Record<string, KeyCheckpoint>;
+  /** How many user accounts this service's gate key has opened, ever. */
+  usersEverOpened(): number;
   handlers: RollupVenueHandlers;
 }
 
@@ -119,6 +120,10 @@ interface MarketState {
   recentFills: { atMs: number; notional: bigint }[];
   priceHistory: { atMs: number; price: bigint }[];
 }
+
+/** Whether the program executed the order and counted it, whatever became of it. */
+export const executed = (outcome: PlaceOutcome): boolean =>
+  outcome.status !== "expired" && outcome.status !== "invalid" && outcome.status !== "failed";
 
 const tagOf = (receipt: Uint8Array): bigint => Buffer.from(receipt).readBigUInt64BE(0);
 
@@ -149,11 +154,16 @@ export class RollupVenue implements Venue {
   private readonly secrets = new BotOrderSecrets();
   private readonly listeners = new Set<(fill: Fill) => void>();
   private readonly latencySamplesMs: number[] = [];
-  private readonly sweep = new SeatSweep(FIRST_TRADER_SEAT, SEAT_COUNT);
+  private readonly sweep = new SeatSweep(
+    FIRST_TRADER_SEAT,
+    SEAT_COUNT,
+    () => this.options.bots.length + this.options.usersEverOpened(),
+  );
   private readonly startedAtMs = Date.now();
   private chainStats: ChainStats | null = null;
   private publishTimer: ReturnType<typeof setInterval> | null = null;
   private orderCounter = 0;
+  private liquidatorSeat: number | null = null;
 
   private constructor(
     private readonly options: RollupVenueOptions,
@@ -171,11 +181,13 @@ export class RollupVenue implements Venue {
         signedInConnection(settings.rollupRpcUrl, key),
       ),
     );
-    // The local query filter refuses every transaction that moves tokens into
-    // custody, so deposits go to the rollup's own port where one is named.
-    const faucetConnection = settings.rollupDirectRpcUrl
-      ? directConnection(settings.rollupDirectRpcUrl)
-      : faucetSignedIn;
+    // A hosted endpoint takes a transaction only from a signed-in caller; the
+    // local stack's own port, where its deposits go, takes one from anyone.
+    const depositsThroughTheFilter =
+      new URL(settings.depositRpcUrl).host === new URL(settings.rollupRpcUrl).host;
+    const faucetConnection = depositsThroughTheFilter
+      ? faucetSignedIn
+      : directConnection(settings.depositRpcUrl);
     const deployed = options.markets.map((config) =>
       settings.deployment.markets.find((market) => market.symbol === config.id)!,
     );
@@ -194,12 +206,10 @@ export class RollupVenue implements Venue {
     venue = new RollupVenue(options, oracleConnection!, gateConnection!, faucetConnection!, feed);
     for (const [at, config] of options.markets.entries()) {
       const chain = await program.market(feedConnection, deployed[at]!.id);
-      const baseDecimals = BASE_DECIMALS[config.base];
-      if (baseDecimals === undefined) throw new Error(`no base decimals known for ${config.base}`);
       venue.states.set(config.id, {
         config,
         chain,
-        units: marketUnits(chain.baseLot, baseDecimals),
+        units: marketUnits(chain.baseLot, deployed[at]!.baseDecimals),
         scheduledFunding: deployed[at]!.fundingTaskId !== undefined,
         price: null,
         target: null,
@@ -338,6 +348,19 @@ export class RollupVenue implements Venue {
     return cursors;
   }
 
+  /** What a browser needs to trade on the program directly, with the URLs a browser should use. */
+  publicDeployment(urls: BrowserUrls): PublicDeployment {
+    const { program, settings } = this.options;
+    return publicDeployment(
+      settings.deployment,
+      urls,
+      [...this.states.values()].map(({ chain }) => ({
+        chain,
+        addresses: program.publicAddresses(chain.marketId),
+      })),
+    );
+  }
+
   readiness(): Readiness {
     const now = Date.now();
     const states = [...this.states.values()];
@@ -412,6 +435,7 @@ export class RollupVenue implements Venue {
           bot.owner,
           this.options.settings.gate,
           this.gateConnection,
+          this.options.keyCheckpoints[bot.owner.publicKey.toBase58()],
         )
         .finally(() => this.opening.delete(trader));
       this.opening.set(trader, opening);
@@ -459,7 +483,7 @@ export class RollupVenue implements Venue {
         this.faucetConnection,
         this.options.settings.faucet,
         chainToken.mint,
-        view.seat,
+        programTrader.address,
         target,
         wanted - held,
       );
@@ -486,15 +510,8 @@ export class RollupVenue implements Venue {
         : mark - band + ((chain.tick - ((mark - band) % chain.tick)) % chain.tick);
     const price = order.price === undefined ? bandEdge : toChainPrice(units, order.price);
     const size = toChainSize(units, order.size);
-    if (price === null || price <= 0n || price % chain.tick !== 0n) {
-      return rejected(orderId, order, "price is not on the tick");
-    }
-    if (size === null || size < chain.minSize) {
-      return rejected(orderId, order, "size is below the minimum or not a whole number of lots");
-    }
-    if (price * size < chain.minNotional) {
-      return rejected(orderId, order, "notional is below the minimum");
-    }
+    if (price === null) return rejected(orderId, order, "price is finer than the market counts");
+    if (size === null) return rejected(orderId, order, "size is not a whole number of lots");
 
     const rests = order.type === "limit" || order.type === "postOnly";
     const secret = newOrderSecret();
@@ -534,6 +551,8 @@ export class RollupVenue implements Venue {
       cancelled: outcome.filled > 0n ? "partiallyFilled" : "cancelled",
       refused: "rejected",
       expired: "rejected",
+      invalid: "rejected",
+      failed: "rejected",
     }[outcome.status] as PlaceResult["status"];
     return {
       orderId,
@@ -546,12 +565,12 @@ export class RollupVenue implements Venue {
           ? "no result before the order expired"
           : outcome.status === "refused"
             ? "post-only order would match"
-            : undefined,
+            : outcome.reason,
     };
   }
 
   private recordLatency(outcome: PlaceOutcome): void {
-    if (outcome.status === "expired") return;
+    if (!executed(outcome)) return;
     this.latencySamplesMs.push(outcome.sendToResultMs);
     if (this.latencySamplesMs.length > this.options.latencyWindowSize) {
       this.latencySamplesMs.shift();
@@ -635,42 +654,30 @@ export class RollupVenue implements Venue {
   async liquidate(liquidator: TraderKey, target: TraderKey, market: MarketId): Promise<boolean> {
     const seat = seatOfTarget(target);
     if (seat === null) return false;
-    const outcome = await this.tryLiquidation(liquidator, seat, market);
-    if (outcome !== "noResult" && outcome !== "stalePrice") {
-      this.sweep.report(outcome !== "seatNotOpen");
-    }
+    const state = this.state(market);
+    const mark = state.price?.price ?? 0n;
+    if (mark === 0n) return false;
+    const programTrader = await this.traderOf(liquidator);
+    this.liquidatorSeat ??= (await programTrader.view()).seat;
+    if (seat === this.liquidatorSeat) return false;
+    const outcome = await programTrader.liquidate(
+      state.chain.marketId,
+      seat,
+      mark,
+      this.perpMarketIds(),
+    );
     return outcome === "liquidated";
   }
 
-  private async tryLiquidation(liquidator: TraderKey, seat: number, market: MarketId) {
-    const state = this.state(market);
-    const mark = state.price?.price ?? 0n;
-    if (mark === 0n) return "noResult" as const;
-    const programTrader = await this.traderOf(liquidator);
-    return programTrader.liquidate(state.chain.marketId, seat, mark, this.perpMarketIds());
+  /** Where every open bot's order keys stand, by owner address, to save and restore from. */
+  keyCheckpoints(): Record<string, KeyCheckpoint> {
+    const checkpoints: Record<string, KeyCheckpoint> = { ...this.options.keyCheckpoints };
+    for (const trader of this.traders.values()) checkpoints[trader.address] = trader.checkpoint;
+    return checkpoints;
   }
 
-  /**
-   * Whether a seat is open, learned the only way the program allows: a blind
-   * liquidation attempt, whose result only the liquidator can read. Null when
-   * the attempt said nothing either way.
-   */
-  private async seatIsOpen(prober: TraderKey, seat: number): Promise<boolean | null> {
-    const perp = [...this.states.values()].find((state) => state.chain.kind === "perp");
-    if (!perp) return null;
-    const outcome = await this.tryLiquidation(prober, seat, perp.config.id);
-    if (outcome === "noResult" || outcome === "stalePrice") return null;
-    return outcome !== "seatNotOpen";
-  }
-
-  private async ownSeats(): Promise<number[]> {
-    const seats: number[] = [];
-    for (const trader of this.traders.values()) seats.push((await trader.view()).seat);
-    return seats;
-  }
-
-  /** The desk that opens and funds users, probing seats through the bot trader `prober`. */
-  fundingDesk(prober: TraderKey, amount: bigint, clock: Clock): FundingDesk {
+  /** The desk that opens and funds users. */
+  fundingDesk(amount: bigint, clock: Clock): FundingDesk {
     const { settings, program } = this.options;
     const collateral = settings.deployment.tokens.find(
       (token) => token.symbol === CHAIN_TOKEN_OF[COLLATERAL_TOKEN],
@@ -684,8 +691,7 @@ export class RollupVenue implements Venue {
       mint: collateral.mint,
       amountAtoms: toChainAmount(amount, collateral.decimals),
       clock,
-      seatIsOpen: (seat) => this.seatIsOpen(prober, seat),
-      knownOpenSeats: () => this.ownSeats(),
+      onError: this.options.handlers.onError,
     });
   }
 

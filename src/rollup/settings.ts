@@ -10,6 +10,7 @@ const deploymentSchema = z.object({
   gate: address,
   oracle: address,
   faucet: address,
+  depositUrl: z.url(),
   tokens: z.array(
     z.object({
       index: z.number().int().nonnegative(),
@@ -23,6 +24,7 @@ const deploymentSchema = z.object({
       id: z.number().int().nonnegative(),
       symbol: z.string(),
       kind: z.enum(["spot", "perp"]),
+      baseDecimals: z.number().int().nonnegative(),
       fundingTaskId: z.number().optional(),
     }),
   ),
@@ -35,7 +37,7 @@ export interface RollupEnv {
   SOLANA_RPC_URL?: string;
   ROLLUP_RPC_URL?: string;
   ROLLUP_WS_URL?: string;
-  ROLLUP_DIRECT_RPC_URL?: string;
+  DEPOSIT_RPC_URL?: string;
   DEPLOYMENT_JSON?: string;
   DEPLOYMENT_PATH?: string;
   ORACLE_SECRET_KEY?: string;
@@ -48,8 +50,12 @@ export interface RollupSettings {
   solanaRpcUrl: string;
   rollupRpcUrl: string;
   rollupWsUrl: string;
-  /** The rollup's own port, for deposits on a local network whose query filter refuses them. */
-  rollupDirectRpcUrl?: string;
+  /**
+   * Where deposits are sent: the deployment's `depositUrl` (the rollup's own
+   * port on the local stack, the private endpoint on a hosted one) unless
+   * DEPOSIT_RPC_URL names another.
+   */
+  depositRpcUrl: string;
   deployment: Deployment;
   oracle: Keypair;
   gate: Keypair;
@@ -142,7 +148,7 @@ export const loadRollupSettings = (
     solanaRpcUrl: env.SOLANA_RPC_URL!,
     rollupRpcUrl: env.ROLLUP_RPC_URL!,
     rollupWsUrl: env.ROLLUP_WS_URL!,
-    rollupDirectRpcUrl: env.ROLLUP_DIRECT_RPC_URL || undefined,
+    depositRpcUrl: env.DEPOSIT_RPC_URL || deployment.depositUrl,
     deployment,
     ...roles,
     botOwners: botOwnersFrom(env.BOT_TRADER_SEEDS!, botCount),

@@ -86,18 +86,19 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                     | Required   | What it is                                                                            |
-| ------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                             | yes        | Solana. Checked once at start: the service stops if it is mainnet                     |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                            | yes        | The rollup's private endpoint through the query filter, and its websocket             |
-| `ROLLUP_DIRECT_RPC_URL`                                      | local only | The rollup's own port. The local query filter refuses deposits, so they are sent here |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                       | yes        | The deployment description the order book repository's set-up prints                  |
-| `ORACLE_SECRET_KEY`, `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`  | yes        | Secret keys as JSON arrays of 64 bytes: publish prices, co-sign openings, deposit     |
-| `BOT_TRADER_SEEDS`                                           | yes        | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)           |
-| `SERVICE_LOCATION`                                           | no         | Where the service runs; labels the latency figure                                     |
-| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`   | no         | Publish cadence (2 s) and how long a resting bot quote stays valid by itself (30 s)   |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_` | no         | Bot order sizes as notional                                                           |
-| `LIQUIDATOR_SEATS_PER_TICK`                                  | no         | Seats the liquidator tries blind per market per tick                                  |
+| Variable                                                                 | Required | What it is                                                                          |
+| ------------------------------------------------------------------------ | -------- | ----------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start: the service stops if it is mainnet                   |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket           |
+| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`         |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own   |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                |
+| `ORACLE_SECRET_KEY`, `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`              | yes      | Secret keys as JSON arrays of 64 bytes: publish prices, co-sign openings, deposit   |
+| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)         |
+| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                   |
+| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`               | no       | Publish cadence (2 s) and how long a resting bot quote stays valid by itself (30 s) |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                         |
+| `LIQUIDATOR_SEATS_PER_TICK`                                              | no       | Seats the liquidator tries blind per market per tick                                |
 
 The fund button with `VENUE=rollup` is two steps, because the user's own key has to sign:
 
@@ -115,9 +116,11 @@ curl -X POST http://localhost:4100/v1/fund/submit -H 'content-type: application/
 
 `submit` refuses anything that is not byte for byte the transaction `prepare` built (400),
 a request with nothing prepared or prepared too long ago (410), an owner that was funded
-before (409) and too many grants from one IP (429). A 409 from `submit` itself means the
-transaction did not execute and nothing was opened: prepare again. `scripts/smoke.ts` is a
-working client of both steps.
+before or whose account exists already (409) and too many grants from one IP (429). It
+answers 503 `daily limit reached` when the program has opened its daily number of new
+seats, and 502 with the endpoint's own status and body when the rollup refuses the
+transaction. In every refusal nothing was opened. `scripts/smoke.ts` is a working client
+of both steps.
 
 ## Configuration
 
@@ -144,17 +147,18 @@ ones:
 Prefix `/v1`. Every price, size and balance in a response is a plain decimal string (never
 a float, never a raw `bigint`), scaled from the engine's internal fixed-point integers.
 
-| Route                                                    | Returns                                                                                                                          |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /health`                                            | `{ ok, venue, network }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold        |
-| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest                          |
-| `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity                                       |
-| `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                    |
-| `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at |
-| `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                         |
-| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                             |
-| `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                    |
-| `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                    |
+| Route                                                    | Returns                                                                                                                                                                                                                                                |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /health`                                            | `{ ok, venue, network }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold                                                                                                                              |
+| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest                                                                                                                                                |
+| `GET /deployment`                                        | `VENUE=rollup` only, public, cacheable. Program id, the URLs a browser should use, exchange and stats addresses, and per market its on-chain id, addresses, token mints, decimals, lot size and tick. No key. Fields: [docs/DESIGN.md](docs/DESIGN.md) |
+| `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity. With `VENUE=rollup` `makerTag` and `takerTag` are the chain's 8-byte receipts as big-endian unsigned decimal text                                          |
+| `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                                                                                                                                          |
+| `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at                                                                                                                       |
+| `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                                                                                                                                               |
+| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                   |
+| `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                                                                                                                                          |
+| `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                                                                                                                                          |
 
 ## How numbers are labelled
 
@@ -179,7 +183,11 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 `make loadtest VENUE=rollup` sends real orders instead: `LOADTEST_TRADERS` traders, each
 opened and funded through a running service's fund routes like any user (raise that
 service's `FUND_IP_RATE_LIMIT` for the run), each sending immediate-or-cancel orders for
-`LOADTEST_SECONDS`. Every order is its own transaction. It needs `DEPLOYMENT_PATH`, takes
+`LOADTEST_SECONDS`. Every order is its own transaction. The program opens only so many new
+seats a day (100 in the local set-up, the service's ten bots included), so the traders are
+kept in `data/loadtest-traders.json` and reused by the next run; only the missing ones are
+opened. More than about 90 new traders in a day needs the admin to raise `maxSeatsPerDay`
+(see [docs/deploy.md](docs/deploy.md)). It needs `DEPLOYMENT_PATH`, takes
 `LOADTEST_ARGS="--sim-url ... --rollup-rpc ... --rollup-ws ... --late-ms 1000"`, and writes
 `loadtest-reports/latest-rollup.json`: orders sent, results confirmed, expired, fills,
 confirmed orders per second, send-to-result median, p95 and p99, and how many orders were
