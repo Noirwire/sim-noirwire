@@ -35,6 +35,7 @@ const MARKETS_FOR_MINT: Record<string, string[]> = {
 };
 
 const STATS_BROADCAST_INTERVAL_MS = 2_000;
+const WAIT_FOR_TICKS_ON_CLOSE_MS = 10_000;
 
 export interface RunningApp {
   server: FastifyInstance;
@@ -467,7 +468,11 @@ export const startApp = async (
       priceSource.stop();
       // A bot's order still on its way moves its order keys on: the snapshot
       // is taken once every tick has finished, so the checkpoints are final.
-      await Promise.allSettled([...ticksInFlight]);
+      // The wait is bounded: a stop must not depend on the network answering.
+      await Promise.race([
+        Promise.allSettled([...ticksInFlight]),
+        new Promise((resolve) => setTimeout(resolve, WAIT_FOR_TICKS_ON_CLOSE_MS)),
+      ]);
       await wiring.stop();
       await saveSnapshot();
       await server.close();

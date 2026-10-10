@@ -18,6 +18,8 @@ type JupiterPriceResponse = Record<string, JupiterPriceEntry>;
 const DEFAULT_BASE_URL = "https://lite-api.jup.ag/price/v3";
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 8;
+/** A poll that is never answered is given up, or the next one would never be scheduled. */
+const REQUEST_TIMEOUT_MS = 5_000;
 
 const toScaledPrice = (usdPrice: number): bigint => BigInt(Math.round(usdPrice * Number(SCALE)));
 
@@ -51,7 +53,9 @@ export class JupiterPriceSource implements PriceSource {
     const poll = async (): Promise<void> => {
       if (this.stopped) return;
       try {
-        const response = await fetch(`${this.baseUrl}?ids=${this.ids.join(",")}`);
+        const response = await fetch(`${this.baseUrl}?ids=${this.ids.join(",")}`, {
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
         if (response.status === 429) {
           this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, this.maxBackoffMultiplier);
         } else if (!response.ok) {

@@ -5,7 +5,14 @@
  * new client release is an edit to this file and nothing else.
  */
 import { createHash, createPrivateKey, sign } from "node:crypto";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import {
+  Connection,
+  type FetchFn,
+  Keypair,
+  PublicKey,
+  Transaction,
+  type TransactionInstruction,
+} from "@solana/web3.js";
 import {
   Instructions,
   LIQUIDATION_STATUS,
@@ -24,7 +31,8 @@ import {
   decodeMarket,
   decodeView,
   ownFills,
-  privateConnection,
+  signIn,
+  websocketUrl,
   randomSecret,
   sendAndConfirm,
   type OrderKeyCheckpoint,
@@ -214,28 +222,109 @@ const signerOf = (key: Keypair) => {
   return async (message: Uint8Array) => new Uint8Array(sign(null, message, privateKey));
 };
 
+export const REQUEST_TIMEOUT_MS = 8_000;
+const SIGN_IN_TIMEOUT_MS = 10_000;
+
+type Fetch = typeof fetch;
+
+/**
+ * A request that is never answered is given up after `timeoutMs`. Without
+ * this one silent connection would hold a loop's turn forever: every request
+ * this service makes to a network goes out through it.
+ */
+export const fetchWithin =
+  (timeoutMs: number, transport: Fetch = fetch): Fetch =>
+  (input, init) =>
+    transport(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+
+/** Rejects when `work` has not settled after `timeoutMs`. */
+export const within = <T>(work: Promise<T>, timeoutMs: number, what: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} got no answer in ${timeoutMs} ms`)),
+      timeoutMs,
+    );
+    work.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+
+const connectionTo = (rpcUrl: string, wsUrl?: string): Connection =>
+  new Connection(rpcUrl, {
+    commitment: "confirmed",
+    wsEndpoint: wsUrl,
+    fetch: fetchWithin(REQUEST_TIMEOUT_MS) as FetchFn,
+  });
+
 /** A connection for public accounts only: the tape, the price feeds, the stats, the markets. */
 export const publicConnection = (rpcUrl: string, wsUrl: string): Connection =>
-  new Connection(rpcUrl, { commitment: "confirmed", wsEndpoint: wsUrl });
+  connectionTo(rpcUrl, wsUrl);
 
 /** The rollup's own port, which takes any transaction without a sign-in. Reachable on a local network only. */
-export const directConnection = (rpcUrl: string): Connection => new Connection(rpcUrl, "confirmed");
+export const directConnection = (rpcUrl: string): Connection => connectionTo(rpcUrl);
 
 /** Signs `key` in to the private endpoint. The query filter accepts sends only from a signed-in caller. */
-export const signedInConnection = (rpcUrl: string, key: Keypair): Promise<Connection> =>
-  privateConnection(rpcUrl, key.publicKey, signerOf(key));
+export const signedInConnection = async (rpcUrl: string, key: Keypair): Promise<Connection> => {
+  const token = await within(
+    signIn(rpcUrl, key.publicKey, signerOf(key)),
+    SIGN_IN_TIMEOUT_MS,
+    "signing in",
+  );
+  return connectionTo(`${rpcUrl}?token=${token}`, `${websocketUrl(rpcUrl)}?token=${token}`);
+};
+
+/**
+ * A key's signed-in connection, made again after anything went wrong with
+ * it: a token can expire and a connection can die, and neither says so.
+ */
+export class Session {
+  private current: Promise<Connection> | null = null;
+
+  constructor(private readonly open: () => Promise<Connection>) {}
+
+  static signedIn(rpcUrl: string, key: Keypair): Session {
+    return new Session(() => signedInConnection(rpcUrl, key));
+  }
+
+  static of(connection: Connection): Session {
+    return new Session(async () => connection);
+  }
+
+  connection(): Promise<Connection> {
+    this.current ??= this.open().catch((error: unknown) => {
+      this.current = null;
+      throw error;
+    });
+    return this.current;
+  }
+
+  /** The next caller signs in afresh. */
+  renew(): void {
+    this.current = null;
+  }
+
+  /** Runs `work` on the connection, and renews it unless the program itself gave the answer. */
+  async use<T>(work: (connection: Connection) => Promise<T>): Promise<T> {
+    try {
+      return await work(await this.connection());
+    } catch (error) {
+      if (!(error instanceof ProgramRefused)) this.renew();
+      throw error;
+    }
+  }
+}
 
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
 /** This service moves test tokens only. It stops before sending anything if Solana is mainnet. */
 export const refuseMainnet = async (solanaRpcUrl: string): Promise<void> => {
-  const genesis = await new Connection(solanaRpcUrl, "confirmed").getGenesisHash();
+  const genesis = await connectionTo(solanaRpcUrl).getGenesisHash();
   if (genesis === MAINNET_GENESIS) {
     throw new Error("SOLANA_RPC_URL is mainnet. This service never runs there.");
   }
 };
 
 const CONFIRM_TIMEOUT_MS = 30_000;
+/** A price is stale on chain after ten seconds: a publish that takes longer is given up for the next. */
+const PUBLISH_WITHIN_MS = 8_000;
 const CONFIRM_POLL_MS = 100;
 
 /** The endpoint did not take a transaction that moves tokens: the HTTP status and body it answered with. */
@@ -274,7 +363,16 @@ export const sendDepositAndConfirm = async (
     .catch((error: unknown) => {
       throw new DepositRefused(connection.rpcEndpoint, error);
     });
-  const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+  return confirmedWithin(connection, signature, CONFIRM_TIMEOUT_MS);
+};
+
+/** Waits until the rollup reports `signature` executed, for `timeoutMs` at most. */
+export const confirmedWithin = async (
+  connection: Connection,
+  signature: string,
+  timeoutMs: number,
+): Promise<string> => {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const { value } = await connection.getSignatureStatus(signature);
     if (value && value.confirmationStatus !== "processed") {
@@ -283,8 +381,31 @@ export const sendDepositAndConfirm = async (
     }
     await new Promise((resolve) => setTimeout(resolve, CONFIRM_POLL_MS));
   }
-  throw new Error(`transaction ${signature} was not confirmed in ${CONFIRM_TIMEOUT_MS} ms`);
+  throw new Error(`transaction ${signature} was not confirmed in ${timeoutMs} ms`);
 };
+
+/** Signs, sends and confirms one short-lived instruction, all inside `timeoutMs`. */
+const sendWithin = (
+  connection: Connection,
+  instruction: TransactionInstruction,
+  payer: Keypair,
+  timeoutMs: number,
+): Promise<string> =>
+  within(
+    (async () => {
+      const latest = await connection.getLatestBlockhash("confirmed");
+      const transaction = new Transaction({ feePayer: payer.publicKey, ...latest }).add(
+        instruction,
+      );
+      transaction.sign(payer);
+      const signature = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+      });
+      return confirmedWithin(connection, signature, timeoutMs);
+    })(),
+    timeoutMs,
+    "the transaction",
+  );
 
 export const newOrderSecret = (): Uint8Array => randomSecret();
 
@@ -420,15 +541,21 @@ export class Program {
     price: bigint,
   ): Promise<void> {
     const publishTime = BigInt(await this.clockSeconds(connection));
-    await sendAndConfirm(
+    await sendWithin(
       connection,
-      [this.instructions.publishPrice(oracle.publicKey, marketId, price, publishTime)],
+      this.instructions.publishPrice(oracle.publicKey, marketId, price, publishTime),
       oracle,
+      PUBLISH_WITHIN_MS,
     );
   }
 
   async updateFunding(connection: Connection, payer: Keypair, marketId: number): Promise<void> {
-    await sendAndConfirm(connection, [this.instructions.updateFunding(marketId)], payer);
+    await sendWithin(
+      connection,
+      this.instructions.updateFunding(marketId),
+      payer,
+      PUBLISH_WITHIN_MS,
+    );
   }
 
   /** Credits the seat of `owner` from the faucet. The program finds the seat through the owner's view. */
@@ -581,6 +708,9 @@ export class ProgramTrader {
     this.client = new TraderClient(connection, connection, owner.publicKey, keys, programId);
   }
 
+  /** How many instructions the caller keeps in flight at once: one unless set, four at most. */
+  inFlightLimit = 1;
+
   get address(): string {
     return this.owner.publicKey.toBase58();
   }
@@ -603,9 +733,24 @@ export class ProgramTrader {
    * One instruction at a time per trader, and none while an earlier one's
    * outcome is still unknown; a failure on the wire signs in again before the next.
    */
-  private run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
-    const next = this.queue.then(async () => {
-      await this.unsettled;
+  private async run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
+    if (this.inFlightLimit > 1) return this.runOne(operation, false);
+    const next = this.queue.then(() => this.runOne(operation, true));
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * With several instructions in flight (a view has four order key slots, so
+   * up to four), an unknown outcome holds back only its own slot, which the
+   * client keeps out of use until it settles.
+   */
+  private async runOne<T>(
+    operation: (client: TraderClient) => Promise<T>,
+    waitForUnknown: boolean,
+  ): Promise<T> {
+    {
+      if (waitForUnknown) await this.unsettled;
       if (this.signInAgain) {
         const connection = await signedInConnection(this.rpcUrl, this.owner);
         this.client = new TraderClient(
@@ -627,9 +772,7 @@ export class ProgramTrader {
         if (!answered) this.signInAgain = true;
         throw error;
       }
-    });
-    this.queue = next.catch(() => undefined);
-    return next;
+    }
   }
 
   view(): Promise<SeatView> {

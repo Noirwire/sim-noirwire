@@ -99,6 +99,15 @@ types, so a new client release is an edit to that one file.
   websocket or kept for the 24h change, any fill on it goes to the tape only and not into
   candles or counters, and `/v1/health` does not call prices fresh. So the walk never
   shows as a wick on a chart.
+- **A network that fails or goes silent.** Every request to the rollup and to the price
+  source is given up after a few seconds, a publish after eight. So a request that is
+  never answered costs its loop one turn, not all of them: the price loop, the chain
+  feed, the bots and the liquidator each try again on their next tick. A key's signed-in
+  connection is made afresh after any failure on it, since a token can expire silently.
+  `/v1/health` turns 503 while the network is away and 200 again within seconds of its
+  return, with no restart. The integration suite cuts the service's network (refused,
+  then silent) and asserts exactly that. A stop never waits on the network for more than
+  twenty seconds.
 - **Unknown outcomes.** The client can stop waiting for an order while it may still run;
   it then says `unknown` and settles it once the rollup's clock is past the order's
   expiry. Until that settles, the bot sends nothing else (no requote, no resend), and the

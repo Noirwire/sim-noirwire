@@ -1,4 +1,4 @@
-import { type Connection, type Keypair, PublicKey } from "@solana/web3.js";
+import { type Keypair, PublicKey } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
 import { checkSubmitted } from "./open-request.js";
 import {
@@ -6,6 +6,7 @@ import {
   DepositRefused,
   type Program,
   ProgramRefused,
+  type Session,
   sendDepositAndConfirm,
 } from "./program.js";
 
@@ -21,7 +22,8 @@ export type Funded =
 
 export interface FundingDeskOptions {
   program: Program;
-  connection: Connection;
+  /** The faucet's signed-in connection, renewed after a failure on the wire. */
+  session: Session;
   gate: Keypair;
   faucet: Keypair;
   mint: string;
@@ -74,14 +76,16 @@ export class FundingDesk {
     for (const [other, request] of this.prepared) {
       if (request.expiresAtMs <= now) this.prepared.delete(other);
     }
-    const transaction = await this.options.program.openAndFundTransaction(this.options.connection, {
-      gate: this.options.gate.publicKey,
-      faucet: this.options.faucet.publicKey,
-      owner: ownerKey,
-      orderKeys: keys as PublicKey[],
-      mint: this.options.mint,
-      amount: this.options.amountAtoms,
-    });
+    const transaction = await this.options.session.use((connection) =>
+      this.options.program.openAndFundTransaction(connection, {
+        gate: this.options.gate.publicKey,
+        faucet: this.options.faucet.publicKey,
+        owner: ownerKey,
+        orderKeys: keys as PublicKey[],
+        mint: this.options.mint,
+        amount: this.options.amountAtoms,
+      }),
+    );
     const expiresAtMs = now + PREPARED_FOR_MS;
     this.prepared.set(owner, { message: transaction.serializeMessage(), expiresAtMs });
     return {
@@ -113,7 +117,9 @@ export class FundingDesk {
     this.prepared.delete(owner);
     checked.transaction.partialSign(this.options.gate, this.options.faucet);
     try {
-      const signature = await sendDepositAndConfirm(this.options.connection, checked.transaction);
+      const signature = await this.options.session.use((connection) =>
+        sendDepositAndConfirm(connection, checked.transaction),
+      );
       return { ok: true, signature };
     } catch (error) {
       this.options.onError("opening and funding a user failed", error);

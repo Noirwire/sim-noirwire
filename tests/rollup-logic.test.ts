@@ -12,7 +12,12 @@ import {
   type ChainTape,
   Program,
   fillRoles,
+  ProgramRefused,
+  Session,
+  confirmedWithin,
+  fetchWithin,
   firstOrderKeys,
+  within,
 } from "../src/rollup/program.js";
 import { publicDeployment } from "../src/rollup/public-deployment.js";
 import { requireAllowedRpc } from "../src/rollup/rpc-allow-list.js";
@@ -215,6 +220,66 @@ describe("the liquidator's blind sweep", () => {
   });
 });
 
+describe("a network that fails and hangs", () => {
+  const hangingTransport: typeof fetch = (_input, init) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+    });
+
+  it("gives up a request that is never answered, instead of waiting on it forever", async () => {
+    const startedAt = Date.now();
+    await expect(fetchWithin(50, hangingTransport)("http://rollup.example")).rejects.toThrow();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it("gives up any call that does not settle in its time", async () => {
+    await expect(within(new Promise(() => {}), 30, "signing in")).rejects.toThrow("signing in");
+    await expect(within(Promise.resolve(7), 30, "a read")).resolves.toBe(7);
+  });
+
+  it("gives up waiting for a transaction that never shows as executed", async () => {
+    const neverExecuted = {
+      getSignatureStatus: async () => ({ value: null }),
+    } as unknown as Connection;
+    await expect(confirmedWithin(neverExecuted, "signature", 250)).rejects.toThrow("not confirmed");
+  });
+
+  it("signs in afresh after a failure on the wire, and keeps the connection after the program's own refusal", async () => {
+    let signIns = 0;
+    const session = new Session(async () => {
+      signIns += 1;
+      return { id: signIns } as unknown as Connection;
+    });
+    const idOf = (connection: Connection) => (connection as unknown as { id: number }).id;
+
+    expect(await session.use(async (connection) => idOf(connection))).toBe(1);
+    await expect(
+      session.use(async () => {
+        throw new Error("fetch failed");
+      }),
+    ).rejects.toThrow("fetch failed");
+    expect(await session.use(async (connection) => idOf(connection))).toBe(2);
+
+    await expect(
+      session.use(async () => {
+        throw new ProgramRefused({ InstructionError: [0, { Custom: 6038 }] });
+      }),
+    ).rejects.toThrow();
+    expect(await session.use(async (connection) => idOf(connection))).toBe(2);
+  });
+
+  it("tries to sign in again after a sign-in that failed", async () => {
+    let attempts = 0;
+    const session = new Session(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("401 Unauthorized");
+      return {} as Connection;
+    });
+    await expect(session.connection()).rejects.toThrow("401");
+    await expect(session.connection()).resolves.toBeDefined();
+  });
+});
+
 describe("the funding desk when the transaction does not go through", () => {
   const gate = Keypair.generate();
   const faucet = Keypair.generate();
@@ -235,7 +300,7 @@ describe("the funding desk when the transaction does not go through", () => {
     } as unknown as Connection;
     const desk = new FundingDesk({
       program: new Program(Keypair.generate().publicKey.toBase58()),
-      connection,
+      session: Session.of(connection),
       gate,
       faucet,
       mint: Keypair.generate().publicKey.toBase58(),

@@ -1,4 +1,4 @@
-import type { Connection, Keypair } from "@solana/web3.js";
+import type { Keypair } from "@solana/web3.js";
 import type { FillOrigin } from "../data/stats.js";
 import type { Clock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
@@ -34,7 +34,7 @@ import {
   fillRoles,
   newOrderSecret,
   publicConnection,
-  signedInConnection,
+  Session,
 } from "./program.js";
 import { type BrowserUrls, type PublicDeployment, publicDeployment } from "./public-deployment.js";
 import { SeatSweep, seatOfTarget, seatTarget } from "./seat-sweep.js";
@@ -180,27 +180,24 @@ export class RollupVenue implements Venue {
 
   private constructor(
     private readonly options: RollupVenueOptions,
-    private readonly oracleConnection: Connection,
-    private readonly gateConnection: Connection,
-    private readonly faucetConnection: Connection,
+    private readonly oracle: Session,
+    private readonly gate: Session,
+    private readonly faucet: Session,
     private readonly feed: ChainFeed,
   ) {}
 
   static async connect(options: RollupVenueOptions): Promise<RollupVenue> {
     const { program, settings } = options;
     const feedConnection = publicConnection(settings.rollupRpcUrl, settings.rollupWsUrl);
-    const [oracleConnection, gateConnection, faucetSignedIn] = await Promise.all(
-      [settings.oracle, settings.gate, settings.faucet].map((key) =>
-        signedInConnection(settings.rollupRpcUrl, key),
-      ),
-    );
+    const oracle = Session.signedIn(settings.rollupRpcUrl, settings.oracle);
+    const gate = Session.signedIn(settings.rollupRpcUrl, settings.gate);
     // A hosted endpoint takes a transaction only from a signed-in caller; the
     // local stack's own port, where its deposits go, takes one from anyone.
     const depositsThroughTheFilter =
       new URL(settings.depositRpcUrl).host === new URL(settings.rollupRpcUrl).host;
-    const faucetConnection = depositsThroughTheFilter
-      ? faucetSignedIn
-      : directConnection(settings.depositRpcUrl);
+    const faucet = depositsThroughTheFilter
+      ? Session.signedIn(settings.rollupRpcUrl, settings.faucet)
+      : Session.of(directConnection(settings.depositRpcUrl));
     const deployed = options.markets.map((config) =>
       settings.deployment.markets.find((market) => market.symbol === config.id)!,
     );
@@ -216,7 +213,7 @@ export class RollupVenue implements Venue {
         onError: options.handlers.onError,
       },
     );
-    venue = new RollupVenue(options, oracleConnection!, gateConnection!, faucetConnection!, feed);
+    venue = new RollupVenue(options, oracle, gate, faucet, feed);
     for (const [at, config] of options.markets.entries()) {
       const chain = await program.market(feedConnection, deployed[at]!.id);
       venue.states.set(config.id, {
@@ -355,11 +352,13 @@ export class RollupVenue implements Venue {
         tick: state.chain.tick,
       });
       if (price === 0n) return;
-      await this.options.program.publishPrice(
-        this.oracleConnection,
-        this.options.settings.oracle,
-        state.chain.marketId,
-        price,
+      await this.oracle.use((connection) =>
+        this.options.program.publishPrice(
+          connection,
+          this.options.settings.oracle,
+          state.chain.marketId,
+          price,
+        ),
       );
       state.publishedAtMs = Date.now();
       void this.advanceFunding(state);
@@ -380,10 +379,12 @@ export class RollupVenue implements Venue {
     if (state.chain.kind !== "perp" || Date.now() - state.fundingTriedAtMs < intervalMs) return;
     state.fundingTriedAtMs = Date.now();
     try {
-      await this.options.program.updateFunding(
-        this.oracleConnection,
-        this.options.settings.oracle,
-        state.chain.marketId,
+      await this.oracle.use((connection) =>
+        this.options.program.updateFunding(
+          connection,
+          this.options.settings.oracle,
+          state.chain.marketId,
+        ),
       );
       state.fundingUpdates += 1;
     } catch (error) {
@@ -498,13 +499,15 @@ export class RollupVenue implements Venue {
     }
     let opening = this.opening.get(trader);
     if (!opening) {
-      opening = this.options.program
-        .openOwnTrader(
-          this.options.settings.rollupRpcUrl,
-          bot.owner,
-          this.options.settings.gate,
-          this.gateConnection,
-          this.options.keyCheckpoints[bot.owner.publicKey.toBase58()],
+      opening = this.gate
+        .use((gateConnection) =>
+          this.options.program.openOwnTrader(
+            this.options.settings.rollupRpcUrl,
+            bot.owner,
+            this.options.settings.gate,
+            gateConnection,
+            this.options.keyCheckpoints[bot.owner.publicKey.toBase58()],
+          ),
         )
         .finally(() => this.opening.delete(trader));
       this.opening.set(trader, opening);
@@ -548,13 +551,15 @@ export class RollupVenue implements Venue {
     }
     for (const { target, held } of targets) {
       if (held >= wanted) continue;
-      await this.options.program.deposit(
-        this.faucetConnection,
-        this.options.settings.faucet,
-        chainToken.mint,
-        programTrader.address,
-        target,
-        wanted - held,
+      await this.faucet.use((connection) =>
+        this.options.program.deposit(
+          connection,
+          this.options.settings.faucet,
+          chainToken.mint,
+          programTrader.address,
+          target,
+          wanted - held,
+        ),
       );
     }
     this.funded.add(trader);
@@ -760,7 +765,7 @@ export class RollupVenue implements Venue {
     if (!collateral) throw new Error("the deployment has no nUSD token");
     return new FundingDesk({
       program,
-      connection: this.faucetConnection,
+      session: this.faucet,
       gate: settings.gate,
       faucet: settings.faucet,
       mint: collateral.mint,

@@ -23,6 +23,8 @@ import {
   type ProgramTrader,
   firstOrderKeys,
   publicConnection,
+  sendDepositAndConfirm,
+  signedInConnection,
 } from "../src/rollup/program.js";
 import { requireAllowedRpc } from "../src/rollup/rpc-allow-list.js";
 
@@ -33,6 +35,9 @@ const REPORT_DIR = "loadtest-reports";
  * day. They hold test tokens on a test network and nothing else.
  */
 const TRADERS_FILE = join("data", "loadtest-traders.json");
+const GRANT_NUSD = 5_000n;
+/** The service re-reads the tape every five seconds at the latest. */
+const TAPE_CATCH_UP_MS = 6_000;
 
 const flag = (name: string, fallback: string): string => {
   const at = process.argv.indexOf(name);
@@ -72,23 +77,34 @@ interface KeptTrader {
   checkpoint: KeyCheckpoint;
 }
 
-const readKept = async (programId: string): Promise<KeptTrader[]> => {
+const readAllKept = async (): Promise<KeptTrader[]> => {
   try {
-    const kept = JSON.parse(await readFile(TRADERS_FILE, "utf8")) as KeptTrader[];
-    return kept.filter((entry) => entry.programId === programId);
+    return JSON.parse(await readFile(TRADERS_FILE, "utf8")) as KeptTrader[];
   } catch {
     return [];
   }
 };
 
+const readKept = async (programId: string): Promise<KeptTrader[]> =>
+  (await readAllKept()).filter((entry) => entry.programId === programId);
+
+const sameOwner = (a: number[], b: number[]): boolean => a.every((byte, at) => byte === b[at]);
+
+/**
+ * Updates this run's traders in the file and leaves every other one in it:
+ * a trader's key is its seat, and a seat is not given back.
+ */
 const keep = async (programId: string, traders: LoadTrader[]): Promise<void> => {
-  const kept: KeptTrader[] = traders.map(({ owner, trader }) => ({
+  const current: KeptTrader[] = traders.map(({ owner, trader }) => ({
     programId,
     owner: Array.from(owner.secretKey),
     checkpoint: trader.checkpoint,
   }));
+  const others = (await readAllKept()).filter(
+    (entry) => !current.some((trader) => sameOwner(trader.owner, entry.owner)),
+  );
   await mkdir(dirname(TRADERS_FILE), { recursive: true });
-  await writeFile(TRADERS_FILE, JSON.stringify(kept), { mode: 0o600 });
+  await writeFile(TRADERS_FILE, JSON.stringify([...current, ...others]), { mode: 0o600 });
 };
 
 const openThroughTheService = async (
@@ -123,14 +139,59 @@ const openThroughTheService = async (
   return { owner, trader: await program.newTrader(rollupRpcUrl, owner) };
 };
 
+/**
+ * `--open keys`: the same open-and-fund transaction the service's fund routes
+ * build, signed here with the gate and faucet keys (GATE_SECRET_KEY_FILE,
+ * FAUCET_SECRET_KEY_FILE), for when a running service must not be disturbed.
+ */
+const openWithTheKeys = async (
+  program: Program,
+  rollupRpcUrl: string,
+  rawDeployment: string,
+): Promise<LoadTrader> => {
+  const keyAt = async (name: string): Promise<Keypair> => {
+    const path = process.env[name];
+    if (!path) throw new Error(`--open keys needs ${name}.`);
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(await readFile(path, "utf8"))));
+  };
+  const gate = await keyAt("GATE_SECRET_KEY_FILE");
+  const faucet = await keyAt("FAUCET_SECRET_KEY_FILE");
+  const { tokens } = JSON.parse(rawDeployment) as {
+    tokens: { symbol: string; mint: string; decimals: number }[];
+  };
+  const collateral = tokens.find((token) => token.symbol === "nUSD");
+  if (!collateral) throw new Error("The deployment has no nUSD token.");
+  const owner = Keypair.generate();
+  const connection = await signedInConnection(rollupRpcUrl, faucet);
+  const transaction = await program.openAndFundTransaction(connection, {
+    gate: gate.publicKey,
+    faucet: faucet.publicKey,
+    owner: owner.publicKey,
+    orderKeys: firstOrderKeys(owner),
+    mint: collateral.mint,
+    amount: GRANT_NUSD * 10n ** BigInt(collateral.decimals),
+  });
+  transaction.sign(gate, owner, faucet);
+  await sendDepositAndConfirm(connection, transaction);
+  return { owner, trader: await program.newTrader(rollupRpcUrl, owner) };
+};
+
 export async function main(): Promise<void> {
   const traderCount = Number(flag("--traders", "20"));
   const seconds = Number(flag("--seconds", "10"));
+  if (!Number.isInteger(traderCount) || traderCount < 1 || !(seconds > 0)) {
+    throw new Error(
+      "--traders must be a whole number of at least 1 and --seconds a positive number.",
+    );
+  }
   const lateMs = Number(flag("--late-ms", "1000"));
   const simUrl = flag("--sim-url", "http://127.0.0.1:4100");
   const rollupRpcUrl = flag("--rollup-rpc", "http://127.0.0.1:6699");
   const rollupWsUrl = flag("--rollup-ws", "ws://127.0.0.1:6700");
   const symbol = flag("--market", "NSOL-PERP");
+  const inFlight = Math.min(4, Math.max(1, Number(flag("--in-flight", "1"))));
+  const openDirectly = flag("--open", "service") === "keys";
+  const label = flag("--label", "latest-rollup");
   requireAllowedRpc([rollupRpcUrl, rollupWsUrl], flags("--allow-rpc"));
 
   const rawDeployment =
@@ -161,7 +222,11 @@ export async function main(): Promise<void> {
     `Reusing ${reused} traders from ${TRADERS_FILE}; opening ${traderCount - reused} through ${simUrl} ...`,
   );
   while (traders.length < traderCount) {
-    traders.push(await openThroughTheService(simUrl, program, rollupRpcUrl));
+    traders.push(
+      openDirectly
+        ? await openWithTheKeys(program, rollupRpcUrl, rawDeployment)
+        : await openThroughTheService(simUrl, program, rollupRpcUrl),
+    );
     await keep(deployment.programId, traders);
   }
 
@@ -186,13 +251,41 @@ export async function main(): Promise<void> {
   const startedAt = Date.now();
   const deadline = startedAt + seconds * 1_000;
 
+  // The mark is read once a second for everyone, not once per order: the
+  // run measures orders, and a read per order would be half its traffic.
+  let mark = (await program.price(chain, market.id)).price;
+  const markTimer = setInterval(() => {
+    void program
+      .price(chain, market.id)
+      .then((price) => {
+        mark = price.price;
+      })
+      .catch((error: unknown) => noteError(error));
+  }, 1_000);
+
+  const health = { samples: 0, ready: 0 };
+  const healthTimer = setInterval(() => {
+    health.samples += 1;
+    void fetch(`${simUrl}/v1/health`, { signal: AbortSignal.timeout(4_000) })
+      .then((response) => {
+        if (response.status === 200) health.ready += 1;
+      })
+      .catch(() => undefined);
+  }, 5_000);
+
+  const errors = new Map<string, number>();
+  const noteError = (error: unknown): void => {
+    const text = (error instanceof Error ? error.message : String(error)).split("\n")[0]!;
+    const kind = text.replace(/[1-9A-HJ-NP-Za-km-z]{32,}/g, "<id>").slice(0, 160);
+    errors.set(kind, (errors.get(kind) ?? 0) + 1);
+  };
+
   const runTrader = async (trader: ProgramTrader): Promise<void> => {
     while (Date.now() < deadline) {
-      const mark = (await program.price(chain, market.id)).price;
       const side = random.nextBool() ? "buy" : "sell";
       const reach = (mark / 100n / tick) * tick;
       const price = side === "buy" ? mark + reach : mark - reach;
-      const size = minNotional / price + BigInt(random.nextInt(5, 25));
+      const size = minNotional / price + BigInt(random.nextInt(1, 3));
       counters.sent += 1;
       try {
         const outcome = await trader.place(
@@ -238,19 +331,32 @@ export async function main(): Promise<void> {
         counters.latenciesMs.push(outcome.sendToResultMs);
         if (outcome.sendToResultMs > lateMs) counters.late += 1;
         if (outcome.filled > 0n) counters.filled += 1;
-      } catch {
+      } catch (error) {
         counters.failed += 1;
+        noteError(error);
       }
     }
   };
-  await Promise.all(traders.map(({ trader }) => runTrader(trader)));
+  await Promise.all(
+    traders.flatMap(({ trader }) => {
+      trader.inFlightLimit = inFlight;
+      return Array.from({ length: inFlight }, () => runTrader(trader));
+    }),
+  );
   const elapsedSeconds = (Date.now() - startedAt) / 1_000;
+  clearInterval(markTimer);
+  clearInterval(healthTimer);
   // An order whose outcome was unknown may still run until the rollup's
   // clock passes its expiry: the report waits until every one has settled.
   await Promise.allSettled(settling);
   await keep(deployment.programId, traders);
 
   const fillsOnChain = Number((await program.stats(chain)).fills - fillsBefore);
+  await new Promise((resolve) => setTimeout(resolve, TAPE_CATCH_UP_MS));
+  const chainLastFill = Number((await program.tape(chain, market.id)).lastSequence);
+  const served = (await (await fetch(`${simUrl}/v1/tape?market=${symbol}&limit=1`)).json()) as {
+    fills: { sequence: number }[];
+  };
   const sorted = [...counters.latenciesMs].sort((a, b) => a - b);
   const sortedLate = [...counters.lateExecutionsMs].sort((a, b) => a - b);
   const notOnTime = counters.late + counters.expired + counters.unknown;
@@ -262,6 +368,7 @@ export async function main(): Promise<void> {
     market: symbol,
     traderCount,
     tradersReused: reused,
+    ordersInFlightPerTrader: inFlight,
     durationSeconds: elapsedSeconds,
     ordersSent: counters.sent,
     ordersRefusedBeforeSigning: counters.invalid,
@@ -276,9 +383,14 @@ export async function main(): Promise<void> {
       medianMs: percentile(sorted, 0.5),
       p95Ms: percentile(sorted, 0.95),
       p99Ms: percentile(sorted, 0.99),
+      maxMs: sorted[sorted.length - 1] ?? 0,
     },
     lateThresholdMs: lateMs,
     ordersLate: counters.late,
+    lateShare: counters.confirmed === 0 ? 0 : counters.late / counters.confirmed,
+    errorsByKind: Object.fromEntries(errors),
+    serviceHealth: { samples: health.samples, ready: health.ready },
+    tape: { chainLastFill, serviceLastFill: served.fills[0]?.sequence ?? 0 },
     outcomeUnknown: {
       total: counters.unknown,
       settledExecutedLate: counters.unknownExecutedLate,
@@ -309,7 +421,7 @@ export async function main(): Promise<void> {
 
   console.log(JSON.stringify(report, null, 2));
   await mkdir(REPORT_DIR, { recursive: true });
-  await writeFile(join(REPORT_DIR, "latest-rollup.json"), JSON.stringify(report, null, 2));
-  console.log(`\nWrote ${join(REPORT_DIR, "latest-rollup.json")}`);
+  await writeFile(join(REPORT_DIR, `${label}.json`), JSON.stringify(report, null, 2));
+  console.log(`\nWrote ${join(REPORT_DIR, `${label}.json`)}`);
   process.exit(0);
 }

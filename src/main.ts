@@ -1,6 +1,9 @@
 import { startApp } from "./app.js";
 import { loadConfig } from "./config/config.js";
 
+/** A stop that is still waiting on something after this long exits anyway. */
+const STOP_WITHIN_MS = 20_000;
+
 const main = async (): Promise<void> => {
   const running = await startApp(loadConfig());
 
@@ -11,6 +14,7 @@ const main = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`sim-noirwire: ${signal} received, shutting down`);
+    setTimeout(() => process.exit(1), STOP_WITHIN_MS).unref();
     await running.close();
     process.exit(0);
   };

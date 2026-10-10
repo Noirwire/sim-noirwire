@@ -14,6 +14,7 @@ import {
 } from "../../src/rollup/program.js";
 import type { PublicDeployment } from "../../src/rollup/public-deployment.js";
 import { dollars } from "../helpers.js";
+import { CuttableProxy } from "./cuttable-proxy.js";
 
 const LOCALNET = process.env.ORDERBOOK_LOCALNET;
 if (!LOCALNET) throw new Error("Run this suite with `make test-rollup`.");
@@ -32,6 +33,15 @@ const localFile = (name: string): string => readFileSync(join(LOCALNET, name), "
 const deployment = JSON.parse(localFile("deployment.json")) as { programId: string };
 const program = new Program(deployment.programId);
 const chain = publicConnection(ROLLUP_RPC_URL, ROLLUP_WS_URL);
+/**
+ * The service reaches the rollup only through this proxy, so a test can cut
+ * its network. The test's own reads above go to the rollup directly.
+ */
+const PROXY_RPC_PORT = 26_699;
+const network = new CuttableProxy([
+  { listen: PROXY_RPC_PORT, target: 6699 },
+  { listen: PROXY_RPC_PORT + 1, target: 6700 },
+]);
 const prices = new FixedPriceSource();
 
 let running: RunningApp;
@@ -119,8 +129,8 @@ const startService = async (): Promise<WarmUp> => {
     NETWORK: "localnet",
     DATA_DIR,
     SOLANA_RPC_URL: "http://127.0.0.1:8899",
-    ROLLUP_RPC_URL,
-    ROLLUP_WS_URL,
+    ROLLUP_RPC_URL: `http://127.0.0.1:${PROXY_RPC_PORT}`,
+    ROLLUP_WS_URL: `ws://127.0.0.1:${PROXY_RPC_PORT + 1}`,
     DEPLOYMENT_PATH: join(LOCALNET, "deployment.json"),
     ORACLE_SECRET_KEY: localFile("localnet-oracle.json"),
     GATE_SECRET_KEY: localFile("localnet-gate.json"),
@@ -158,11 +168,14 @@ interface WarmUp {
 let firstStart: WarmUp;
 
 beforeAll(async () => {
+  await network.start();
   firstStart = await startService();
 });
 
 afterAll(async () => {
+  network.restore();
   await running?.close();
+  await network.stop();
 });
 
 describe("the service on the real program (local network)", () => {
@@ -363,5 +376,41 @@ describe("the service on the real program (local network)", () => {
       return body.orders.bot >= 5 && body;
     });
     expect(stats.latency.sampleSize).toBeGreaterThan(0);
+  });
+
+  it("says it is not healthy while its network fails and then hangs, and heals by itself when it returns", async () => {
+    const healthNow = async () => (await getJson("/v1/health")).status;
+    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const keepPricing = setInterval(() => pushPrices(REAL_SOL_PRICE, 181), 1_000);
+    try {
+      network.cut("refuse");
+      await eventually("health to turn 503 once the network refuses", async () => {
+        return (await healthNow()) === 503;
+      });
+      await pause(10_000);
+      network.cut("hang");
+      await pause(20_000);
+      expect(await healthNow()).toBe(503);
+
+      const cutUntil = Date.now();
+      const fillsBefore = (await program.tape(chain, PERP_ID)).lastSequence;
+      const priceBefore = (await program.price(chain, PERP_ID)).publishTimeSeconds;
+      network.restore();
+      await eventually("health to turn 200 again", async () => (await healthNow()) === 200, 60_000);
+      expect(Date.now() - cutUntil).toBeLessThan(30_000);
+
+      expect((await program.price(chain, PERP_ID)).publishTimeSeconds).toBeGreaterThan(priceBefore);
+      await eventually("the bots to fill again", async () => {
+        return (await program.tape(chain, PERP_ID)).lastSequence > fillsBefore;
+      });
+      const served = (await getJson(`/v1/tape?market=${PERP}&limit=1`)).body.fills[0]!;
+      await eventually("the service's tape to follow the chain again", async () => {
+        const latest = (await getJson(`/v1/tape?market=${PERP}&limit=1`)).body.fills[0]!;
+        return latest.sequence > Number(fillsBefore) || latest.sequence > served.sequence;
+      });
+    } finally {
+      clearInterval(keepPricing);
+      network.restore();
+    }
   });
 });
