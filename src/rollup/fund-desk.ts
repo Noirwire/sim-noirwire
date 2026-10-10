@@ -1,28 +1,21 @@
 import { type Keypair, PublicKey } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
-import { checkSubmitted } from "./open-request.js";
-import {
-  DAILY_SEAT_LIMIT_ERROR,
-  DepositRefused,
-  type Program,
-  ProgramRefused,
-  type Session,
-  sendDepositAndConfirm,
-} from "./program.js";
+import type { Session } from "./connections.js";
+import { DAILY_SEAT_LIMIT_ERROR, type Program } from "./program.js";
+import { checkSubmitted } from "./submitted-transaction.js";
+import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
 
 const PREPARED_FOR_MS = 45_000;
 
-export type Prepared =
-  | { ok: true; transaction: string; expiresAtMs: number }
-  | { ok: false; status: 400; reason: string };
+type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
 
-export type Funded =
-  | { ok: true; signature: string }
-  | { ok: false; status: 400 | 409 | 410 | 502 | 503; reason: string };
+export type Prepared = { ok: true; transaction: string; expiresAtMs: number } | Refusal<400>;
 
-export interface FundingDeskOptions {
+export type Funded = { ok: true; signature: string } | Refusal<400 | 409 | 410 | 502 | 503>;
+
+export interface FundDeskOptions {
   program: Program;
-  /** The faucet's signed-in connection, renewed after a failure on the wire. */
+  /** The faucet's connection, opened again after a failure on the wire. */
   session: Session;
   gate: Keypair;
   faucet: Keypair;
@@ -45,6 +38,30 @@ const publicKeyOf = (value: string): PublicKey | null => {
   }
 };
 
+const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
+
+const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
+  if (error instanceof ProgramRefused && error.code === DAILY_SEAT_LIMIT_ERROR) {
+    return {
+      ok: false,
+      status: 503,
+      reason: "daily limit reached: no more new accounts can be opened today, try again tomorrow",
+    };
+  }
+  if (error instanceof ProgramRefused) {
+    return {
+      ok: false,
+      status: 409,
+      reason: "the account was not opened: it exists already. Nothing changed",
+    };
+  }
+  return {
+    ok: false,
+    status: 502,
+    reason: error instanceof DepositRefused ? error.message : "the rollup did not confirm in time",
+  };
+};
+
 /**
  * Opens and funds a new user's account in one transaction, in two steps.
  *
@@ -54,15 +71,22 @@ const publicKeyOf = (value: string): PublicKey | null => {
  * transaction that was built, adds the gate's and the faucet's signatures
  * and sends it. The account is opened and funded together or not at all.
  */
-export class FundingDesk {
+export class FundDesk {
   private readonly prepared = new Map<string, PreparedRequest>();
 
-  constructor(private readonly options: FundingDeskOptions) {}
+  constructor(private readonly options: FundDeskOptions) {}
+
+  private forgetExpired(nowMs: number): void {
+    for (const [owner, request] of this.prepared) {
+      if (request.expiresAtMs <= nowMs) this.prepared.delete(owner);
+    }
+  }
 
   async prepare(owner: string, orderKeys: string[]): Promise<Prepared> {
+    const { program, session, gate, faucet, mint, amountAtoms, clock } = this.options;
     const ownerKey = publicKeyOf(owner);
-    const keys = orderKeys.map(publicKeyOf);
-    if (!ownerKey || keys.some((key) => key === null)) {
+    const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
+    if (!ownerKey || keys.length !== orderKeys.length) {
       return { ok: false, status: 400, reason: "not a public key" };
     }
     if (new Set([owner, ...orderKeys]).size !== orderKeys.length + 1) {
@@ -72,18 +96,16 @@ export class FundingDesk {
         reason: "the order keys must differ from each other and from the owner",
       };
     }
-    const now = this.options.clock.nowMs();
-    for (const [other, request] of this.prepared) {
-      if (request.expiresAtMs <= now) this.prepared.delete(other);
-    }
-    const transaction = await this.options.session.use((connection) =>
-      this.options.program.openAndFundTransaction(connection, {
-        gate: this.options.gate.publicKey,
-        faucet: this.options.faucet.publicKey,
+    const now = clock.nowMs();
+    this.forgetExpired(now);
+    const transaction = await session.use((connection) =>
+      program.openAndFundTransaction(connection, {
+        gate: gate.publicKey,
+        faucet: faucet.publicKey,
         owner: ownerKey,
-        orderKeys: keys as PublicKey[],
-        mint: this.options.mint,
-        amount: this.options.amountAtoms,
+        orderKeys: keys,
+        mint,
+        amount: amountAtoms,
       }),
     );
     const expiresAtMs = now + PREPARED_FOR_MS;
@@ -98,8 +120,9 @@ export class FundingDesk {
   }
 
   async submit(owner: string, transactionBase64: string): Promise<Funded> {
+    const { session, gate, faucet, clock, onError } = this.options;
     const request = this.prepared.get(owner);
-    if (!request || request.expiresAtMs <= this.options.clock.nowMs()) {
+    if (!request || request.expiresAtMs <= clock.nowMs()) {
       this.prepared.delete(owner);
       return {
         ok: false,
@@ -115,32 +138,15 @@ export class FundingDesk {
     if (!checked.ok) return { ok: false, status: 400, reason: checked.reason };
 
     this.prepared.delete(owner);
-    checked.transaction.partialSign(this.options.gate, this.options.faucet);
+    checked.transaction.partialSign(gate, faucet);
     try {
-      const signature = await this.options.session.use((connection) =>
+      const signature = await session.use((connection) =>
         sendDepositAndConfirm(connection, checked.transaction),
       );
       return { ok: true, signature };
     } catch (error) {
-      this.options.onError("opening and funding a user failed", error);
-      if (error instanceof ProgramRefused && error.code === DAILY_SEAT_LIMIT_ERROR) {
-        return {
-          ok: false,
-          status: 503,
-          reason:
-            "daily limit reached: no more new accounts can be opened today, try again tomorrow",
-        };
-      }
-      if (error instanceof ProgramRefused) {
-        return {
-          ok: false,
-          status: 409,
-          reason: "the account was not opened: it exists already. Nothing changed",
-        };
-      }
-      const reason =
-        error instanceof DepositRefused ? error.message : "the rollup did not confirm in time";
-      return { ok: false, status: 502, reason };
+      onError("opening and funding a user failed", error);
+      return refusalOf(error);
     }
   }
 }

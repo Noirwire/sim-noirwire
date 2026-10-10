@@ -1,13 +1,21 @@
 import { isBotTrader } from "../bots/bot-traders.js";
 import { mulDivScale } from "../engine/money.js";
-import type { Fill, LatencyStats, TraderKey } from "../engine/types.js";
+import type { Fill, TraderKey } from "../engine/types.js";
+import { percentile } from "./percentile.js";
 
 export type FillOrigin = "user" | "bot";
 
-export interface ActivityCounters {
+interface ActivityCounters {
   orders: number;
   fills: number;
   volume: bigint;
+}
+
+export interface LatencyStats {
+  medianMs: number;
+  p99Ms: number;
+  sampleSize: number;
+  measuredFrom: string;
 }
 
 export interface PublicStats {
@@ -24,7 +32,7 @@ export interface PublicStats {
  * each once the venue's clock had passed its expiry. None of them is counted
  * in `bot.orders` until it has settled as executed.
  */
-export interface UnknownOutcomes {
+interface UnknownOutcomes {
   total: number;
   settledExecutedLate: number;
   settledExpired: number;
@@ -33,17 +41,12 @@ export interface UnknownOutcomes {
 
 const emptyCounters = (): ActivityCounters => ({ orders: 0, fills: 0, volume: 0n });
 
-const percentile = (sortedMs: number[], p: number): number => {
-  if (sortedMs.length === 0) return 0;
-  const index = Math.min(sortedMs.length - 1, Math.floor(p * sortedMs.length));
-  return sortedMs[index]!;
-};
+const DEFAULT_LATENCY_WINDOW = 500;
 
 /**
- * Keeps bot and user activity in separate counters, per the rule that the
- * two are never merged into one number. A fill carries no trader identity,
- * so a fill is classified by its caller at the moment it is produced (see
- * `withBotTracking` and the dev trading route), never guessed afterwards.
+ * Bot and user activity in separate counters: the two are never merged into
+ * one number. A fill names no trader, so whoever records one says whose it
+ * was at the moment it is produced; it is never guessed afterwards.
  */
 export class StatsTracker {
   private readonly userTraders = new Set<TraderKey>();
@@ -59,7 +62,7 @@ export class StatsTracker {
   };
 
   constructor(
-    private readonly latencyWindowSize = 500,
+    private readonly latencyWindowSize = DEFAULT_LATENCY_WINDOW,
     private readonly latencyMeasuredFrom = "http:request",
   ) {}
 
@@ -91,16 +94,15 @@ export class StatsTracker {
     else this.unknown.settledExpired += 1;
   }
 
-  /** Every trader key that has ever placed an order, for the liquidation scan. */
+  /** Every trader that has placed an order or been funded, for the liquidation scan. */
   allTraderKeys(): TraderKey[] {
     return [...this.userTraders, ...this.botTraders];
   }
 
   recordFill(fill: Fill, origin: FillOrigin): void {
-    const notional = mulDivScale(fill.price, fill.size);
-    const bucket = origin === "bot" ? this.botCounters : this.userCounters;
-    bucket.fills += 1;
-    bucket.volume += notional;
+    const counters = origin === "bot" ? this.botCounters : this.userCounters;
+    counters.fills += 1;
+    counters.volume += mulDivScale(fill.price, fill.size);
   }
 
   recordLatency(sampleMs: number): void {

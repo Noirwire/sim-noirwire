@@ -44,16 +44,12 @@ describe("HouseMaker", () => {
     clock.advance(2_000);
     await maker.tick(venue);
 
-    const state = await venue.traderState(maker.traderKey());
+    const state = await venue.traderState(maker.trader);
     const position = state.positions[PERP]?.size ?? 0n;
     expect(position).toBeLessThanOrEqual(-dollars(1.5));
 
     const sides = new Set(state.openOrders.map((order) => order.side));
-    // Maxed out short: it may still quote asks (further reducing is fine
-    // reasoning aside, selling more would deepen the short) but must never
-    // quote a buy that would... the hard limit specifically forbids growing
-    // past it, i.e. no further sell-side growth. Here it is short past the
-    // limit, so it must not quote sell (growing the short further).
+    // Short past its limit: a sell would grow the short further.
     expect(sides.has("sell")).toBe(false);
   });
 
@@ -81,20 +77,20 @@ describe("HouseMaker", () => {
     });
     await maker.ensureOpen(venue);
     await maker.tick(venue);
-    const firstQuotes = (await venue.traderState(maker.traderKey())).openOrders;
+    const firstQuotes = (await venue.traderState(maker.trader)).openOrders;
 
     // A tiny move: below the 50bps threshold, no requote expected.
     await publish(venue, clock, PERP, 100.1);
     clock.advance(10);
     await maker.tick(venue);
-    const afterTinyMove = (await venue.traderState(maker.traderKey())).openOrders;
+    const afterTinyMove = (await venue.traderState(maker.trader)).openOrders;
     expect(afterTinyMove.map((o) => o.price)).toEqual(firstQuotes.map((o) => o.price));
 
     // A big move: past the threshold, requote expected.
     await publish(venue, clock, PERP, 110);
     clock.advance(10);
     await maker.tick(venue);
-    const afterBigMove = (await venue.traderState(maker.traderKey())).openOrders;
+    const afterBigMove = (await venue.traderState(maker.trader)).openOrders;
     expect(afterBigMove.map((o) => o.price)).not.toEqual(firstQuotes.map((o) => o.price));
   });
 
@@ -123,7 +119,7 @@ describe("HouseMaker", () => {
     });
     await maker.ensureOpen(venue);
     await maker.tick(venue);
-    const flatOrders = (await venue.traderState(maker.traderKey())).openOrders;
+    const flatOrders = (await venue.traderState(maker.trader)).openOrders;
     const flatMid =
       (flatOrders.find((o) => o.side === "buy")!.price! +
         flatOrders.find((o) => o.side === "sell")!.price!) /
@@ -140,7 +136,7 @@ describe("HouseMaker", () => {
 
     clock.advance(2_000);
     await maker.tick(venue);
-    const shortOrders = (await venue.traderState(maker.traderKey())).openOrders;
+    const shortOrders = (await venue.traderState(maker.trader)).openOrders;
     const shortMid =
       (shortOrders.find((o) => o.side === "buy")!.price! +
         shortOrders.find((o) => o.side === "sell")!.price!) /

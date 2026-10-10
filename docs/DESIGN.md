@@ -51,7 +51,6 @@ interface Venue {
   updateFunding(market: MarketId): Promise<void>;
   liquidate(liquidator: TraderKey, target: string, market: MarketId): Promise<boolean>;
   onFill(listener: (fill: Fill) => void): () => void;
-  stats(): Promise<VenueStats>;
 }
 ```
 
@@ -85,12 +84,14 @@ separately and never merged into one number.
 ## The rollup venue
 
 `src/rollup/program.ts` is the only module that imports the order book client
-(`@noirwire/orderbook`, a release file under `vendor/`). Everything else sees its plain
-types, so a new client release is an edit to that one file.
+(`@noirwire/orderbook`, a release file under `vendor/`). Everything else sees the plain
+types of `src/rollup/chain-types.ts`, so a new client release is an edit to that one file.
 
 - **Prices.** The oracle key publishes every market's price every two seconds, stamped
   with the rollup's own clock. The program refuses a price more than its move limit from
-  the last one, so a larger real move is walked there one allowed step per publish. A
+  the last one, so a larger real move is walked there one allowed step per publish. It
+  also refuses a publish time that is not after the feed's last one, so a publish is
+  skipped while the rollup's clock still shows the second of the last accepted one. A
   refused publish is logged and the next one is tried.
 - **Warming up.** A deployment starts at its set-up price, which can be far from the real
   one, and every start walks from wherever the chain's price was left. Until the chain's

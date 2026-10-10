@@ -1,29 +1,22 @@
 import { ROLE, receipt } from "@noirwire/orderbook";
 import { type Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
+import { prepareRequest, submitRequest } from "../scripts/fund-client.js";
+import { requireAllowedRpc } from "../scripts/rpc-allow-list.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { BotOrderSecrets, originOf } from "../src/rollup/bot-orders.js";
-import { type Funded, FundingDesk } from "../src/rollup/funding-desk.js";
-import { checkSubmitted } from "../src/rollup/open-request.js";
+import type { ChainFill, ChainMarket, ChainTape } from "../src/rollup/chain-types.js";
+import { Session } from "../src/rollup/connections.js";
+import { FundDesk, type Funded } from "../src/rollup/fund-desk.js";
 import { nextPublishPrice, withinOneStep } from "../src/rollup/price-walk.js";
-import {
-  type ChainFill,
-  type ChainMarket,
-  type ChainTape,
-  Program,
-  fillRoles,
-  ProgramRefused,
-  Session,
-  confirmedWithin,
-  fetchWithin,
-  firstOrderKeys,
-  within,
-} from "../src/rollup/program.js";
+import { Program, fillRoles } from "../src/rollup/program.js";
 import { publicDeployment } from "../src/rollup/public-deployment.js";
-import { requireAllowedRpc } from "../src/rollup/rpc-allow-list.js";
 import { SeatSweep } from "../src/rollup/seat-sweep.js";
 import { loadRollupSettings } from "../src/rollup/settings.js";
+import { checkSubmitted } from "../src/rollup/submitted-transaction.js";
 import { TapeTracker } from "../src/rollup/tape-tracker.js";
+import { fetchWithin, within } from "../src/rollup/timeouts.js";
+import { ProgramRefused, confirmedWithin } from "../src/rollup/transactions.js";
 import { marketUnits, toChainPrice, toChainSize, toSimPrice } from "../src/rollup/units.js";
 
 const fill = (sequence: number, over: Partial<ChainFill> = {}): ChainFill => ({
@@ -298,7 +291,7 @@ describe("the funding desk when the transaction does not go through", () => {
         value: { confirmationStatus: "confirmed", err: network.err ?? null },
       }),
     } as unknown as Connection;
-    const desk = new FundingDesk({
+    const desk = new FundDesk({
       program: new Program(Keypair.generate().publicKey.toBase58()),
       session: Session.of(connection),
       gate,
@@ -309,16 +302,10 @@ describe("the funding desk when the transaction does not go through", () => {
       onError: () => {},
     });
     const owner = Keypair.generate();
-    const address = owner.publicKey.toBase58();
-    const prepared = await desk.prepare(
-      address,
-      firstOrderKeys(owner).map((key) => key.toBase58()),
-    );
+    const request = prepareRequest(owner);
+    const prepared = await desk.prepare(request.owner, request.orderKeys);
     if (!prepared.ok) throw new Error("prepare failed");
-    const transaction = Transaction.from(Buffer.from(prepared.transaction, "base64"));
-    transaction.partialSign(owner);
-    const signed = transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
-    return desk.submit(address, signed.toString("base64"));
+    return desk.submit(request.owner, submitRequest(owner, prepared.transaction).transaction);
   };
 
   it("says the daily limit is reached when the program refuses a new seat for that reason", async () => {
@@ -408,12 +395,10 @@ describe("the public deployment description", () => {
     kind,
     tick: 100n,
     baseLot: 1_000_000n,
-    minSize: 1n,
     minNotional: 1_000_000n,
     bandBps: 400,
-    imBps: 1_000,
+    initialMarginBps: 1_000,
     maxMoveBps: 250,
-    minPublishGapSeconds: 1,
     maxPriceAgeSeconds: 10,
     fundingIntervalSeconds: 60,
     baseToken,

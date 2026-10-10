@@ -1,23 +1,25 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import type { FundingDesk } from "../../rollup/funding-desk.js";
+import type { FundDesk } from "../../rollup/fund-desk.js";
 import type { AppContext } from "../context.js";
+import { base58Address } from "../schemas.js";
 import { money } from "../serialize.js";
 
-const address = z
-  .string()
-  .min(32)
-  .max(44)
-  .regex(/^[1-9A-HJ-NP-Za-km-z]+$/, "must look like a base58 address");
+const ORDER_KEYS_PER_TRADER = 4;
+/** Well above an open-and-fund transaction in base64, well below anything worth parsing. */
+const MAX_TRANSACTION_CHARS = 4_096;
 
-const prepareSchema = z.object({ owner: address, orderKeys: z.array(address).length(4) });
+const prepareSchema = z.object({
+  owner: base58Address,
+  orderKeys: z.array(base58Address).length(ORDER_KEYS_PER_TRADER),
+});
 
 const submitSchema = z.object({
-  owner: address,
+  owner: base58Address,
   transaction: z
     .string()
     .min(1)
-    .max(4_096)
+    .max(MAX_TRANSACTION_CHARS)
     .regex(/^[A-Za-z0-9+/]+=*$/, "must be base64"),
 });
 
@@ -30,7 +32,7 @@ const submitSchema = z.object({
 export const registerRollupFundRoutes = (
   app: FastifyInstance,
   ctx: AppContext,
-  funding: FundingDesk,
+  fundDesk: FundDesk,
 ): void => {
   const refusal = (owner: string, ip: string) => {
     if (ctx.readiness && !ctx.readiness().botsFunded) {
@@ -49,7 +51,7 @@ export const registerRollupFundRoutes = (
     const refused = refusal(owner, request.ip);
     if (refused) return reply.status(refused.status).send({ error: refused.reason });
 
-    const prepared = await funding.prepare(owner, orderKeys);
+    const prepared = await fundDesk.prepare(owner, orderKeys);
     if (!prepared.ok) return reply.status(prepared.status).send({ error: prepared.reason });
     return {
       transaction: prepared.transaction,
@@ -67,7 +69,7 @@ export const registerRollupFundRoutes = (
     const refused = refusal(owner, request.ip);
     if (refused) return reply.status(refused.status).send({ error: refused.reason });
 
-    const funded = await funding.submit(owner, transaction);
+    const funded = await fundDesk.submit(owner, transaction);
     if (!funded.ok) return reply.status(funded.status).send({ error: funded.reason });
     ctx.fundLedger.record(owner, request.ip);
     ctx.stats.recordTrader(owner);

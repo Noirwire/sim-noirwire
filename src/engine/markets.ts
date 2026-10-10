@@ -56,8 +56,17 @@ export const MARKETS: readonly MarketConfig[] = [
   },
 ];
 
+export const MARKET_IDS = MARKETS.map((market) => market.id) as [MarketId, ...MarketId[]];
+
+export const PERP_MARKET_IDS = MARKETS.filter((market) => market.kind === "perp").map(
+  (market) => market.id,
+);
+
 export const marketById = (id: MarketId): MarketConfig | undefined =>
   MARKETS.find((market) => market.id === id);
 
-export const maxLeverage = (market: MarketConfig): number =>
-  market.initialMarginBps === 0 ? 0 : Math.floor(10_000 / market.initialMarginBps);
+const BPS_PER_WHOLE = 10_000;
+
+/** A market with no margin requirement has no leverage to speak of. */
+export const maxLeverageAt = (initialMarginBps: number): number =>
+  initialMarginBps === 0 ? 0 : Math.floor(BPS_PER_WHOLE / initialMarginBps);

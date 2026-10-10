@@ -1,4 +1,4 @@
-import type { MarketId, TokenBalance, TraderKey } from "./types.js";
+import type { MarketId, TokenBalance } from "./types.js";
 
 export interface Position {
   size: bigint;
@@ -6,22 +6,12 @@ export interface Position {
   fundingIndexSnapshot: bigint;
 }
 
-export const emptyPosition = (fundingIndex: bigint): Position => ({
-  size: 0n,
-  entryPrice: 0n,
-  fundingIndexSnapshot: fundingIndex,
-});
-
+/** One trader's balances per token and perpetual positions per market. */
 export class Account {
-  readonly trader: TraderKey;
   readonly balances = new Map<string, TokenBalance>();
   readonly positions = new Map<MarketId, Position>();
 
-  constructor(trader: TraderKey) {
-    this.trader = trader;
-  }
-
-  balanceOf(token: string): TokenBalance {
+  private balanceOf(token: string): TokenBalance {
     let entry = this.balances.get(token);
     if (!entry) {
       entry = { balance: 0n, locked: 0n };
@@ -58,10 +48,11 @@ export class Account {
     this.balanceOf(token).locked -= amount;
   }
 
+  /** The position in `market`, opened flat at the current funding index when there is none. */
   positionIn(market: MarketId, fundingIndex: bigint): Position {
     let position = this.positions.get(market);
     if (!position) {
-      position = emptyPosition(fundingIndex);
+      position = { size: 0n, entryPrice: 0n, fundingIndexSnapshot: fundingIndex };
       this.positions.set(market, position);
     }
     return position;

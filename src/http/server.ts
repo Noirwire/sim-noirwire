@@ -25,7 +25,7 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   registerTapeRoute(app, ctx);
   registerCandlesRoute(app, ctx);
   registerStatsRoute(app, ctx);
-  if (ctx.funding) registerRollupFundRoutes(app, ctx, ctx.funding);
+  if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
   else registerFundRoute(app, ctx);
   registerStreamRoute(app, ctx);
 

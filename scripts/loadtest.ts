@@ -1,53 +1,43 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { cpus, hostname, platform, release, totalmem } from "node:os";
-import { join } from "node:path";
+/**
+ * The load test. Against the in-memory venue by default: concurrent traders
+ * placing limit orders in-process, with no HTTP boundary. `--venue rollup`
+ * sends real orders to the program instead (see loadtest-rollup.ts).
+ *
+ *   make loadtest LOADTEST_TRADERS=20 LOADTEST_SECONDS=10
+ */
 import { SeededRandom } from "../src/bots/rng.js";
+import { percentile } from "../src/data/percentile.js";
 import { MemoryVenue } from "../src/engine/memory-venue.js";
 import { SCALE } from "../src/engine/money.js";
-import type { Side } from "../src/engine/types.js";
+import type { TraderKey } from "../src/engine/types.js";
+import { flag, machine, writeReport } from "./report.js";
 
 const MARKET = "NSOL-NUSD";
-const REPORT_DIR = "loadtest-reports";
+const MARK = 100;
+const LOT = 1_000n;
+const RANDOM_SEED = 1337;
 
 const dollars = (amount: number): bigint => BigInt(Math.round(amount * Number(SCALE)));
 
-interface LatencySample {
-  ms: number;
+interface Run {
+  venue: MemoryVenue;
+  random: SeededRandom;
+  deadlineMs: number;
+  ackMs: number[];
+  sent: number;
+  accepted: number;
 }
 
-const parseArgIntoNumber = (flag: string, fallback: number): number => {
-  const index = process.argv.indexOf(flag);
-  if (index === -1 || index === process.argv.length - 1) return fallback;
-  const parsed = Number(process.argv[index + 1]);
-  return Number.isFinite(parsed) ? parsed : fallback;
-};
-
-const percentile = (sortedMs: number[], p: number): number => {
-  if (sortedMs.length === 0) return 0;
-  const index = Math.min(sortedMs.length - 1, Math.floor(p * sortedMs.length));
-  return sortedMs[index]!;
-};
-
-const traderKey = (i: number): string => `load-trader-${i}`;
-
-async function runOneTrader(
-  venue: MemoryVenue,
-  random: SeededRandom,
-  trader: string,
-  deadlineMs: number,
-  now: () => number,
-  samples: LatencySample[],
-  counters: { sent: number; accepted: number; fills: number },
-): Promise<void> {
+const tradeUntilDeadline = async (run: Run, trader: TraderKey): Promise<void> => {
+  const { venue, random } = run;
   await venue.openTrader(trader);
   await venue.deposit(trader, "nUSD", dollars(1_000_000));
   await venue.deposit(trader, "SOL", dollars(10_000));
 
-  while (now() < deadlineMs) {
-    const side: Side = random.nextBool() ? "buy" : "sell";
-    const size = 1_000n * BigInt(random.nextInt(1, 10));
-    const price = dollars(100 + random.nextInt(-2, 2));
-
+  while (Date.now() < run.deadlineMs) {
+    const side = random.nextBool() ? "buy" : "sell";
+    const size = LOT * BigInt(random.nextInt(1, 10));
+    const price = dollars(MARK + random.nextInt(-2, 2));
     const startedAt = performance.now();
     const result = await venue.placeOrder(trader, {
       market: MARKET,
@@ -56,84 +46,64 @@ async function runOneTrader(
       price,
       size,
     });
-    samples.push({ ms: performance.now() - startedAt });
-
-    counters.sent += 1;
-    if (result.status !== "rejected") counters.accepted += 1;
-    if (result.filledSize > 0n) counters.fills += 1;
+    run.ackMs.push(performance.now() - startedAt);
+    run.sent += 1;
+    if (result.status !== "rejected") run.accepted += 1;
   }
-}
+};
 
-async function main(): Promise<void> {
-  const traderCount = parseArgIntoNumber("--traders", 20);
-  const durationSeconds = parseArgIntoNumber("--seconds", 10);
-
+const main = async (): Promise<void> => {
+  const traderCount = Number(flag("--traders", "20"));
+  const seconds = Number(flag("--seconds", "10"));
   const venue = new MemoryVenue();
-  const random = new SeededRandom(1337);
-  const samples: LatencySample[] = [];
-  const counters = { sent: 0, accepted: 0, fills: 0 };
-  let fillsSeen = 0;
+  let fillsTotal = 0;
   venue.onFill(() => {
-    fillsSeen += 1;
+    fillsTotal += 1;
   });
-
-  await venue.publishPrice(MARKET, dollars(100), Date.now());
+  await venue.publishPrice(MARKET, dollars(MARK), Date.now());
 
   const startedAt = Date.now();
-  const deadlineMs = startedAt + durationSeconds * 1_000;
-  const now = () => Date.now();
-
-  await Promise.all(
-    Array.from({ length: traderCount }, (_, i) =>
-      runOneTrader(venue, random, traderKey(i), deadlineMs, now, samples, counters),
-    ),
-  );
-
-  const elapsedSeconds = (Date.now() - startedAt) / 1_000;
-  const sortedMs = samples.map((s) => s.ms).sort((a, b) => a - b);
-  const ordersPerSecond = counters.sent / elapsedSeconds;
-
-  const machine = {
-    platform: platform(),
-    release: release(),
-    hostname: hostname(),
-    cpuCount: cpus().length,
-    cpuModel: cpus()[0]?.model ?? "unknown",
-    totalMemoryGiB: Math.round(totalmem() / 1024 / 1024 / 1024),
-    nodeVersion: process.version,
+  const run: Run = {
+    venue,
+    random: new SeededRandom(RANDOM_SEED),
+    deadlineMs: startedAt + seconds * 1_000,
+    ackMs: [],
+    sent: 0,
+    accepted: 0,
   };
+  await Promise.all(
+    Array.from({ length: traderCount }, (_, i) => tradeUntilDeadline(run, `load-trader-${i}`)),
+  );
+  const durationSeconds = (Date.now() - startedAt) / 1_000;
+  const sorted = run.ackMs.sort((a, b) => a - b);
 
   const report = {
     venueKind: "MemoryVenue",
     measuredAgainst: "MemoryVenue (in-process, no HTTP boundary)",
     traderCount,
-    durationSeconds: elapsedSeconds,
-    ordersSent: counters.sent,
-    ordersAccepted: counters.accepted,
-    fillsTotal: fillsSeen,
-    ordersPerSecond,
+    durationSeconds,
+    ordersSent: run.sent,
+    ordersAccepted: run.accepted,
+    fillsTotal,
+    ordersPerSecond: run.sent / durationSeconds,
     timeToAckMs: {
-      medianMs: percentile(sortedMs, 0.5),
-      p95Ms: percentile(sortedMs, 0.95),
-      p99Ms: percentile(sortedMs, 0.99),
+      medianMs: percentile(sorted, 0.5),
+      p95Ms: percentile(sorted, 0.95),
+      p99Ms: percentile(sorted, 0.99),
     },
-    machine,
+    machine: machine(),
     generatedAtMs: Date.now(),
   };
-
-  console.log(JSON.stringify(report, null, 2));
-
-  await mkdir(REPORT_DIR, { recursive: true });
-  const jsonPath = join(REPORT_DIR, "latest.json");
-  const markdownPath = join(REPORT_DIR, "latest.md");
-  await writeFile(jsonPath, JSON.stringify(report, null, 2));
-  await writeFile(markdownPath, toMarkdown(report));
+  const json = JSON.stringify(report, null, 2);
+  console.log(json);
+  const jsonPath = await writeReport("latest.json", json);
+  const markdownPath = await writeReport("latest.md", toMarkdown(report));
   console.log(`\nWrote ${jsonPath} and ${markdownPath}`);
-}
+};
 
-function toMarkdown(report: {
-  venueKind: string;
+const toMarkdown = (report: {
   measuredAgainst: string;
+  venueKind: string;
   traderCount: number;
   durationSeconds: number;
   ordersSent: number;
@@ -141,10 +111,9 @@ function toMarkdown(report: {
   fillsTotal: number;
   ordersPerSecond: number;
   timeToAckMs: { medianMs: number; p95Ms: number; p99Ms: number };
-  machine: Record<string, unknown>;
+  machine: unknown;
   generatedAtMs: number;
-}): string {
-  return `# sim-noirwire load test report
+}): string => `# sim-noirwire load test report
 
 Measured against: **${report.measuredAgainst}**
 
@@ -169,12 +138,8 @@ Generated: ${new Date(report.generatedAtMs).toISOString()}
 ${JSON.stringify(report.machine, null, 2)}
 \`\`\`
 `;
-}
 
-const venueFlag = process.argv.indexOf("--venue");
-const venueKind = venueFlag === -1 ? "memory" : process.argv[venueFlag + 1];
-
-if (venueKind === "rollup") {
+if (flag("--venue", "memory") === "rollup") {
   void import("./loadtest-rollup.js").then((rollup) => rollup.main());
 } else {
   void main();

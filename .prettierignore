@@ -2,6 +2,6 @@ node_modules
 dist
 coverage
 package-lock.json
-data
-data-*
+/data
+/data-*
 docs/DESIGN.md

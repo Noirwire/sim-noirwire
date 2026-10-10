@@ -1,13 +1,13 @@
-import type { ChainMarket, PublicAddresses } from "./program.js";
+import type { ChainMarket, PublicAddresses } from "./chain-types.js";
 import type { Deployment } from "./settings.js";
 
-export interface PublicToken {
+interface PublicToken {
   symbol: string;
   mint: string;
   decimals: number;
 }
 
-export interface PublicMarket {
+interface PublicMarket {
   /** The id every instruction and address of this market is built from. */
   marketId: number;
   symbol: string;

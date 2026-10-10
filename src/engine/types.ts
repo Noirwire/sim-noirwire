@@ -82,22 +82,6 @@ export interface TraderState {
   equity: bigint;
 }
 
-export interface LatencyStats {
-  medianMs: number;
-  p99Ms: number;
-  sampleSize: number;
-  measuredFrom: string;
-}
-
-export interface VenueStats {
-  ordersTotal: number;
-  fillsTotal: number;
-  volumeTotal: bigint;
-  tradersTotal: number;
-  latency: LatencyStats;
-  updatedAtMs: number;
-}
-
 export interface Venue {
   markets(): Promise<MarketInfo[]>;
   publishPrice(market: MarketId, price: bigint, publishedAtMs: number): Promise<void>;
@@ -109,5 +93,4 @@ export interface Venue {
   updateFunding(market: MarketId): Promise<void>;
   liquidate(liquidator: TraderKey, target: TraderKey, market: MarketId): Promise<boolean>;
   onFill(listener: (fill: Fill) => void): () => void;
-  stats(): Promise<VenueStats>;
 }

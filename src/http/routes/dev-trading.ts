@@ -1,18 +1,16 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { MARKETS } from "../../engine/markets.js";
-import { fromDecimalString } from "../../engine/money.js";
-import type { Fill } from "../../engine/types.js";
+import { DECIMAL_TEXT, fromDecimalString } from "../../engine/money.js";
+import { placeOrderWithItsFills } from "../../engine/venue-orders.js";
 import type { AppContext } from "../context.js";
-import { money, tagString } from "../serialize.js";
+import { marketId } from "../schemas.js";
+import { money, moneyOrNull, tagString } from "../serialize.js";
 
-const MARKET_IDS = MARKETS.map((m) => m.id) as [string, ...string[]];
-
-const decimalAmount = z.string().regex(/^\d+(\.\d+)?$/, "must be a plain decimal number");
+const decimalAmount = z.string().regex(DECIMAL_TEXT, "must be a plain decimal number");
 
 const orderBodySchema = z.object({
   address: z.string().min(1),
-  market: z.enum(MARKET_IDS),
+  market: marketId,
   side: z.enum(["buy", "sell"]),
   type: z.enum(["limit", "postOnly", "ioc", "market"]),
   price: decimalAmount.optional(),
@@ -20,19 +18,17 @@ const orderBodySchema = z.object({
   reduceOnly: z.boolean().optional(),
 });
 
-const cancelAllBodySchema = z.object({
-  address: z.string().min(1),
-  market: z.enum(MARKET_IDS),
-});
+const cancelAllBodySchema = z.object({ address: z.string().min(1), market: marketId });
 
-const traderQuerySchema = z.object({
-  address: z.string().min(1),
-});
+const traderQuerySchema = z.object({ address: z.string().min(1) });
+
+const mapValues = <In, Out>(record: Record<string, In>, map: (value: In) => Out) =>
+  Object.fromEntries(Object.entries(record).map(([key, value]) => [key, map(value)]));
 
 /**
- * Lets a browser trade against MemoryVenue before the on-chain client
- * exists. Only ever registered when VENUE=memory and DEV_TRADING=1: see the
- * guard at the call site in server.ts.
+ * Lets a browser trade against the in-memory venue directly, as a user.
+ * Security: the caller names any address it likes and no signature is asked
+ * for, so `server.ts` registers these only with VENUE=memory and DEV_TRADING=1.
  */
 export const registerDevTradingRoutes = (app: FastifyInstance, ctx: AppContext): void => {
   app.post("/v1/dev/orders", async (request, reply) => {
@@ -43,27 +39,15 @@ export const registerDevTradingRoutes = (app: FastifyInstance, ctx: AppContext):
     const { address, market, side, type, price, size, reduceOnly } = parsed.data;
     await ctx.venue.openTrader(address);
     ctx.stats.recordOrder(address);
-
-    // A fill carries no trader identity by the time any other listener sees
-    // it, so it is classified as user activity right here, while this
-    // order's own trader is still known - registering it after the call
-    // resolves would be too late, since fills fire synchronously inside it.
-    const fillsFromThisOrder: Fill[] = [];
-    const unsubscribe = ctx.venue.onFill((fill) => fillsFromThisOrder.push(fill));
-    let result;
-    try {
-      result = await ctx.venue.placeOrder(address, {
-        market,
-        side,
-        type,
-        price: price === undefined ? undefined : fromDecimalString(price),
-        size: fromDecimalString(size),
-        reduceOnly,
-      });
-    } finally {
-      unsubscribe();
-    }
-    for (const fill of fillsFromThisOrder) ctx.stats.recordFill(fill, "user");
+    const { result, fills } = await placeOrderWithItsFills(ctx.venue, address, {
+      market,
+      side,
+      type,
+      price: price === undefined ? undefined : fromDecimalString(price),
+      size: fromDecimalString(size),
+      reduceOnly,
+    });
+    for (const fill of fills) ctx.stats.recordFill(fill, "user");
     return {
       orderId: result.orderId,
       tag: tagString(result.tag),
@@ -80,8 +64,7 @@ export const registerDevTradingRoutes = (app: FastifyInstance, ctx: AppContext):
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
     const { address, market } = parsed.data;
-    const cancelled = await ctx.venue.cancelAll(address, market);
-    return { cancelled };
+    return { cancelled: await ctx.venue.cancelAll(address, market) };
   });
 
   app.get("/v1/dev/trader", async (request, reply) => {
@@ -90,26 +73,24 @@ export const registerDevTradingRoutes = (app: FastifyInstance, ctx: AppContext):
       return reply.status(400).send({ error: "invalid query", issues: parsed.error.issues });
     }
     const state = await ctx.venue.traderState(parsed.data.address);
-    const balances: Record<string, { balance: string; locked: string }> = {};
-    for (const [token, balance] of Object.entries(state.balances)) {
-      balances[token] = { balance: money(balance.balance), locked: money(balance.locked) };
-    }
-    const positions: Record<string, { size: string; entryPrice: string }> = {};
-    for (const [marketId, position] of Object.entries(state.positions)) {
-      positions[marketId] = { size: money(position.size), entryPrice: money(position.entryPrice) };
-    }
     return {
       trader: state.trader,
       equity: money(state.equity),
-      balances,
-      positions,
+      balances: mapValues(state.balances, ({ balance, locked }) => ({
+        balance: money(balance),
+        locked: money(locked),
+      })),
+      positions: mapValues(state.positions, ({ size, entryPrice }) => ({
+        size: money(size),
+        entryPrice: money(entryPrice),
+      })),
       openOrders: state.openOrders.map((order) => ({
         orderId: order.orderId,
         tag: tagString(order.tag),
         market: order.market,
         side: order.side,
         type: order.type,
-        price: order.price === null ? null : money(order.price),
+        price: moneyOrNull(order.price),
         size: money(order.size),
         remainingSize: money(order.remainingSize),
         reduceOnly: order.reduceOnly,

@@ -10,22 +10,21 @@ export interface RestingOrder {
   size: bigint;
   remaining: bigint;
   reduceOnly: boolean;
-  sequence: number;
 }
 
-export interface MatchedFill {
+interface MatchedFill {
   resting: RestingOrder;
   price: bigint;
   size: bigint;
 }
 
-export interface MatchOutcome {
+interface MatchOutcome {
   fills: MatchedFill[];
   selfCancels: RestingOrder[];
   remaining: bigint;
 }
 
-export interface PostOnlyCheck {
+interface PostOnlyCheck {
   selfCancels: RestingOrder[];
   wouldCross: boolean;
 }
@@ -35,10 +34,10 @@ const crosses = (side: Side, restingPrice: bigint, bound: bigint): boolean =>
 
 const betterThan = (side: Side, a: bigint, b: bigint): boolean => (side === "buy" ? a > b : a < b);
 
+/** One market's resting orders, each side sorted best price first and oldest first within a price. */
 export class OrderBook {
   private readonly bids: RestingOrder[] = [];
   private readonly asks: RestingOrder[] = [];
-  private readonly byId = new Map<string, RestingOrder>();
 
   private sideLevels(side: Side): RestingOrder[] {
     return side === "buy" ? this.bids : this.asks;
@@ -48,21 +47,14 @@ export class OrderBook {
     return side === "buy" ? this.asks : this.bids;
   }
 
-  bestBid(): bigint | null {
-    return this.bids.length > 0 ? this.bids[0]!.price : null;
-  }
-
-  bestAsk(): bigint | null {
-    return this.asks.length > 0 ? this.asks[0]!.price : null;
-  }
-
   mid(): bigint | null {
-    const bid = this.bestBid();
-    const ask = this.bestAsk();
-    if (bid === null || ask === null) return null;
-    return (bid + ask) / 2n;
+    const bid = this.bids[0];
+    const ask = this.asks[0];
+    if (!bid || !ask) return null;
+    return (bid.price + ask.price) / 2n;
   }
 
+  /** A taker never fills against itself: its own resting order in the way is cancelled instead. */
   match(takerSide: Side, takerTrader: TraderKey, bound: bigint, size: bigint): MatchOutcome {
     const fills: MatchedFill[] = [];
     const selfCancels: RestingOrder[] = [];
@@ -70,11 +62,10 @@ export class OrderBook {
     let remaining = size;
 
     while (remaining > 0n && opposite.length > 0) {
-      const best = opposite[0]!;
+      const best = opposite[0];
       if (!crosses(takerSide, best.price, bound)) break;
       if (best.trader === takerTrader) {
         opposite.shift();
-        this.byId.delete(best.orderId);
         selfCancels.push(best);
         continue;
       }
@@ -82,74 +73,43 @@ export class OrderBook {
       fills.push({ resting: best, price: best.price, size: matchSize });
       best.remaining -= matchSize;
       remaining -= matchSize;
-      if (best.remaining === 0n) {
-        opposite.shift();
-        this.byId.delete(best.orderId);
-      }
+      if (best.remaining === 0n) opposite.shift();
     }
 
     return { fills, selfCancels, remaining };
   }
 
   checkPostOnly(side: Side, trader: TraderKey, price: bigint): PostOnlyCheck {
-    const opposite = this.oppositeLevels(side);
     const selfCancels: RestingOrder[] = [];
-    for (const candidate of opposite) {
+    for (const candidate of this.oppositeLevels(side)) {
       if (!crosses(side, candidate.price, price)) break;
-      if (candidate.trader === trader) {
-        selfCancels.push(candidate);
-        continue;
-      }
-      return { selfCancels, wouldCross: true };
+      if (candidate.trader !== trader) return { selfCancels, wouldCross: true };
+      selfCancels.push(candidate);
     }
     return { selfCancels, wouldCross: false };
   }
 
-  removeSelfCancels(selfCancels: RestingOrder[]): void {
-    for (const order of selfCancels) {
+  remove(orders: RestingOrder[]): void {
+    for (const order of orders) {
       const levels = this.sideLevels(order.side);
-      const index = levels.findIndex((candidate) => candidate.orderId === order.orderId);
+      const index = levels.indexOf(order);
       if (index >= 0) levels.splice(index, 1);
-      this.byId.delete(order.orderId);
     }
   }
 
   insert(order: RestingOrder): void {
     const levels = this.sideLevels(order.side);
-    let index = levels.length;
-    for (let i = 0; i < levels.length; i += 1) {
-      if (betterThan(order.side, order.price, levels[i]!.price)) {
-        index = i;
-        break;
-      }
-    }
-    levels.splice(index, 0, order);
-    this.byId.set(order.orderId, order);
-  }
-
-  get(orderId: string): RestingOrder | undefined {
-    return this.byId.get(orderId);
-  }
-
-  cancel(orderId: string): RestingOrder | undefined {
-    const order = this.byId.get(orderId);
-    if (!order) return undefined;
-    const levels = this.sideLevels(order.side);
-    const index = levels.findIndex((candidate) => candidate.orderId === orderId);
-    if (index >= 0) levels.splice(index, 1);
-    this.byId.delete(orderId);
-    return order;
+    const firstWorse = levels.findIndex((resting) =>
+      betterThan(order.side, order.price, resting.price),
+    );
+    levels.splice(firstWorse === -1 ? levels.length : firstWorse, 0, order);
   }
 
   cancelAllForTrader(trader: TraderKey): RestingOrder[] {
     const cancelled: RestingOrder[] = [];
     for (const levels of [this.bids, this.asks]) {
       for (let i = levels.length - 1; i >= 0; i -= 1) {
-        if (levels[i]!.trader === trader) {
-          cancelled.push(levels[i]!);
-          this.byId.delete(levels[i]!.orderId);
-          levels.splice(i, 1);
-        }
+        if (levels[i].trader === trader) cancelled.push(...levels.splice(i, 1));
       }
     }
     return cancelled;

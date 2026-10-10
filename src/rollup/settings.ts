@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { Keypair } from "@solana/web3.js";
 import { z } from "zod";
+import type { Config } from "../config/config.js";
 
 const address = z.string().min(32).max(44);
 
@@ -25,7 +26,6 @@ const deploymentSchema = z.object({
       symbol: z.string(),
       kind: z.enum(["spot", "perp"]),
       baseDecimals: z.number().int().nonnegative(),
-      fundingTaskId: z.number().optional(),
     }),
   ),
 });
@@ -33,21 +33,20 @@ const deploymentSchema = z.object({
 /** What the order book repository's set-up prints: the addresses and markets of one deployment. */
 export type Deployment = z.infer<typeof deploymentSchema>;
 
-export interface RollupEnv {
-  SOLANA_RPC_URL?: string;
-  ROLLUP_RPC_URL?: string;
-  ROLLUP_WS_URL?: string;
-  DEPOSIT_RPC_URL?: string;
-  DEPLOYMENT_JSON?: string;
-  DEPLOYMENT_PATH?: string;
-  ORACLE_SECRET_KEY?: string;
-  GATE_SECRET_KEY?: string;
-  FAUCET_SECRET_KEY?: string;
-  ORACLE_SECRET_KEY_FILE?: string;
-  GATE_SECRET_KEY_FILE?: string;
-  FAUCET_SECRET_KEY_FILE?: string;
-  BOT_TRADER_SEEDS?: string;
-}
+const URLS = ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL"] as const;
+const ROLE_KEYS = ["ORACLE_SECRET_KEY", "GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
+type RoleKey = (typeof ROLE_KEYS)[number];
+
+export type RollupEnv = Pick<
+  Config,
+  | (typeof URLS)[number]
+  | RoleKey
+  | `${RoleKey}_FILE`
+  | "DEPOSIT_RPC_URL"
+  | "DEPLOYMENT_JSON"
+  | "DEPLOYMENT_PATH"
+  | "BOT_TRADER_SEEDS"
+>;
 
 export interface RollupSettings {
   solanaRpcUrl: string;
@@ -66,13 +65,27 @@ export interface RollupSettings {
   botOwners: Keypair[];
 }
 
-/** A secret key as the 64-byte JSON array a Solana keypair file holds. The value is never echoed. */
+/** A secret key as the 64-byte JSON array a Solana keypair file holds. Security: the value is never echoed. */
 const secretKey = (name: string, value: string): Keypair => {
   try {
     const bytes = z.array(z.number().int().min(0).max(255)).length(64).parse(JSON.parse(value));
     return Keypair.fromSecretKey(Uint8Array.from(bytes));
   } catch {
     throw new Error(`${name} must be a secret key as a JSON array of 64 bytes`);
+  }
+};
+
+/** A role's secret key: the value itself, or the keypair file `<NAME>_FILE` points at. */
+export const roleKey = (
+  env: Pick<RollupEnv, RoleKey | `${RoleKey}_FILE`>,
+  name: RoleKey,
+): Keypair => {
+  const inline = env[name];
+  if (inline) return secretKey(name, inline);
+  try {
+    return secretKey(`${name}_FILE`, readFileSync(env[`${name}_FILE`] ?? "", "utf8"));
+  } catch {
+    throw new Error(`${name}_FILE must be a readable keypair file`);
   }
 };
 
@@ -95,72 +108,70 @@ const botOwnersFrom = (value: string, needed: number): Keypair[] => {
   return seeds.slice(0, needed).map((seed) => Keypair.fromSeed(Buffer.from(seed, "hex")));
 };
 
-const deploymentFrom = (env: RollupEnv): Deployment => {
+/** The deployment description, checked to hold every market in `marketSymbols`. */
+export const loadDeployment = (
+  env: Pick<RollupEnv, "DEPLOYMENT_JSON" | "DEPLOYMENT_PATH">,
+  marketSymbols: string[],
+): Deployment => {
   const raw =
     env.DEPLOYMENT_JSON ??
     (env.DEPLOYMENT_PATH ? readFileSync(env.DEPLOYMENT_PATH, "utf8") : undefined);
   if (raw === undefined) throw new Error("set DEPLOYMENT_JSON or DEPLOYMENT_PATH");
-  return deploymentSchema.parse(JSON.parse(raw));
+  const deployment = deploymentSchema.parse(JSON.parse(raw));
+  for (const symbol of marketSymbols) deployedMarket(deployment, symbol);
+  return deployment;
 };
 
-const REQUIRED = ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL", "BOT_TRADER_SEEDS"] as const;
-const KEYS = ["ORACLE_SECRET_KEY", "GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
-
-/** A role's secret key: the value itself, or the keypair file `<NAME>_FILE` points at. */
-const keyOf = (env: RollupEnv, name: (typeof KEYS)[number]): Keypair => {
-  const file = env[`${name}_FILE`];
-  if (env[name]) return secretKey(name, env[name]);
-  try {
-    return secretKey(`${name}_FILE`, readFileSync(file!, "utf8"));
-  } catch {
-    throw new Error(`${name}_FILE must be a readable keypair file`);
-  }
+export const deployedMarket = (
+  deployment: Deployment,
+  symbol: string,
+): Deployment["markets"][number] => {
+  const market = deployment.markets.find((entry) => entry.symbol === symbol);
+  if (!market) throw new Error(`the deployment has no market ${symbol}`);
+  return market;
 };
 
 /**
  * Everything VENUE=rollup needs, checked before anything is sent: every
  * value present, every key well formed and the very key the deployment names
- * for its role. Throws with the name of what is wrong, never with a secret.
+ * for its role. Security: throws with the name of what is wrong, never with a secret.
  */
 export const loadRollupSettings = (
   env: RollupEnv,
   botCount: number,
   marketSymbols: string[],
 ): RollupSettings => {
+  const [solanaRpcUrl, rollupRpcUrl, rollupWsUrl] = URLS.map((name) => env[name] ?? "");
+  const botSeeds = env.BOT_TRADER_SEEDS ?? "";
   const missing = [
-    ...REQUIRED.filter((name) => !env[name]),
-    ...KEYS.filter((name) => !env[name] && !env[`${name}_FILE`]),
+    ...URLS.filter((name) => !env[name]),
+    ...(botSeeds ? [] : ["BOT_TRADER_SEEDS"]),
+    ...ROLE_KEYS.filter((name) => !env[name] && !env[`${name}_FILE`]),
   ];
   if (missing.length > 0) throw new Error(`VENUE=rollup needs ${missing.join(", ")}`);
-  for (const name of ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL"] as const) {
-    if (!URL.canParse(env[name]!)) throw new Error(`${name} must be a URL`);
+  for (const name of URLS) {
+    if (!URL.canParse(env[name] ?? "")) throw new Error(`${name} must be a URL`);
   }
 
-  const deployment = deploymentFrom(env);
-  for (const symbol of marketSymbols) {
-    if (!deployment.markets.some((market) => market.symbol === symbol)) {
-      throw new Error(`the deployment has no market ${symbol}`);
-    }
-  }
-
+  const deployment = loadDeployment(env, marketSymbols);
   const roles = {
-    oracle: keyOf(env, "ORACLE_SECRET_KEY"),
-    gate: keyOf(env, "GATE_SECRET_KEY"),
-    faucet: keyOf(env, "FAUCET_SECRET_KEY"),
+    oracle: roleKey(env, "ORACLE_SECRET_KEY"),
+    gate: roleKey(env, "GATE_SECRET_KEY"),
+    faucet: roleKey(env, "FAUCET_SECRET_KEY"),
   };
-  for (const [role, key] of Object.entries(roles)) {
-    if (key.publicKey.toBase58() !== deployment[role as keyof typeof roles]) {
+  for (const role of ["oracle", "gate", "faucet"] as const) {
+    if (roles[role].publicKey.toBase58() !== deployment[role]) {
       throw new Error(`the ${role} key is not the ${role} this deployment names`);
     }
   }
 
   return {
-    solanaRpcUrl: env.SOLANA_RPC_URL!,
-    rollupRpcUrl: env.ROLLUP_RPC_URL!,
-    rollupWsUrl: env.ROLLUP_WS_URL!,
+    solanaRpcUrl,
+    rollupRpcUrl,
+    rollupWsUrl,
     depositRpcUrl: env.DEPOSIT_RPC_URL || deployment.depositUrl,
     deployment,
     ...roles,
-    botOwners: botOwnersFrom(env.BOT_TRADER_SEEDS!, botCount),
+    botOwners: botOwnersFrom(botSeeds, botCount),
   };
 };

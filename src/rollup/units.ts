@@ -1,10 +1,10 @@
-import { SCALE, SCALE_DECIMALS } from "../engine/money.js";
+import { SCALE, SCALE_DECIMALS, roundDownToStep } from "../engine/money.js";
 
 /**
  * Converts between this service's numbers (a price per whole base unit and a
  * size in base units, both scaled by 1e6) and the program's (a price in
- * quote atoms per lot and a size in lots). The quote token has six decimals
- * on both sides, so quote amounts are the same number.
+ * quote atoms per lot and a size in lots). Invariant: the quote token has six
+ * decimals on both sides, so a quote amount is the same number on both.
  */
 export interface MarketUnits {
   lotsPerUnit: bigint;
@@ -36,14 +36,8 @@ export const toChainPrice = (units: MarketUnits, simPrice: bigint): bigint | nul
 export const toChainSize = (units: MarketUnits, simSize: bigint): bigint | null =>
   simSize % units.sizePerLot === 0n ? simSize / units.sizePerLot : null;
 
-export const roundDownToChainPrice = (
-  units: MarketUnits,
-  simPrice: bigint,
-  tick: bigint,
-): bigint => {
-  const price = simPrice / units.lotsPerUnit;
-  return price - (price % tick);
-};
+export const roundDownToChainPrice = (units: MarketUnits, simPrice: bigint, tick: bigint): bigint =>
+  roundDownToStep(simPrice / units.lotsPerUnit, tick);
 
 export const toSimAmount = (atoms: bigint, decimals: number): bigint =>
   decimals >= SCALE_DECIMALS

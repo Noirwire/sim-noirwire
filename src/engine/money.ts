@@ -1,7 +1,12 @@
 export const SCALE = 1_000_000n;
 export const SCALE_DECIMALS = 6;
+export const BPS_PER_WHOLE = 10_000n;
 
-export const bpsOf = (amount: bigint, bps: number): bigint => (amount * BigInt(bps)) / 10_000n;
+/** A plain decimal number as text: digits, optionally a point and more digits. */
+export const DECIMAL_TEXT = /^\d+(\.\d+)?$/;
+
+export const bpsOf = (amount: bigint, bps: number): bigint =>
+  (amount * BigInt(bps)) / BPS_PER_WHOLE;
 
 export const mulDivScale = (a: bigint, b: bigint): bigint => (a * b) / SCALE;
 
@@ -11,13 +16,15 @@ export const absBigInt = (value: bigint): bigint => (value < 0n ? -value : value
 
 export const signOf = (value: bigint): bigint => (value > 0n ? 1n : value < 0n ? -1n : 0n);
 
-export const roundUpToTick = (price: bigint, tickSize: bigint): bigint => {
-  const remainder = price % tickSize;
-  return remainder === 0n ? price : price - remainder + tickSize;
+export const minBigInt = (a: bigint, b: bigint): bigint => (a < b ? a : b);
+
+/** Rounds a price to its tick, or a size to its lot. */
+export const roundUpToStep = (value: bigint, step: bigint): bigint => {
+  const remainder = value % step;
+  return remainder === 0n ? value : value - remainder + step;
 };
 
-export const roundDownToTick = (price: bigint, tickSize: bigint): bigint =>
-  price - (price % tickSize);
+export const roundDownToStep = (value: bigint, step: bigint): bigint => value - (value % step);
 
 export const toDecimalString = (scaled: bigint): string => {
   const negative = scaled < 0n;

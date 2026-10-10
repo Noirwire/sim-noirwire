@@ -44,6 +44,10 @@ export class FundLedger {
     return filtered;
   }
 
+  get grantCount(): number {
+    return this.grantedAddresses.size;
+  }
+
   exportSnapshot(): string[] {
     return [...this.grantedAddresses];
   }

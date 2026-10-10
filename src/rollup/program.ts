@@ -1,185 +1,86 @@
 /**
- * The one module that talks to the order book program and its client package.
- * Everything else in this service sees the plain types exported here, in the
- * program's own units (prices in quote atoms per lot, sizes in lots), so a
- * new client release is an edit to this file and nothing else.
+ * The one module that imports the order book client package. Everything else
+ * in this service sees the plain types of `chain-types.ts`, so a new client
+ * release is an edit to this file and nothing else.
  */
 import { createHash, createPrivateKey, sign } from "node:crypto";
+import { type Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
-  Connection,
-  type FetchFn,
-  Keypair,
-  PublicKey,
-  Transaction,
-  type TransactionInstruction,
-} from "@solana/web3.js";
-import {
+  INSURANCE_SEAT,
   Instructions,
   LIQUIDATION_STATUS,
   MARKET_KIND,
   MarketReader,
   ORDER_TYPE,
   OrderInvalid,
-  OutcomeUnknown,
   OrderKeyManager,
+  OutcomeUnknown,
   RESULT_STATUS,
   SEATS,
   SIDE,
   TraderClient,
   TransactionFailed,
   associatedTokenAddress,
+  clockOf,
   decodeMarket,
   decodeView,
   ownFills,
-  signIn,
-  websocketUrl,
   randomSecret,
   sendAndConfirm,
-  type OrderKeyCheckpoint,
+  signIn,
+  websocketUrl,
   type OrderResult,
+  type PriceFeed,
+  type Stats,
+  type Tape,
   type TapeFill,
+  type Timing,
   type View,
 } from "@noirwire/orderbook";
+import type {
+  ChainFill,
+  ChainMarket,
+  ChainOrder,
+  ChainOrderType,
+  ChainPrice,
+  ChainSide,
+  ChainStats,
+  ChainTape,
+  DepositTarget,
+  KeyCheckpoint,
+  PlaceOutcome,
+  PlaceStatus,
+  PublicAddresses,
+  SeatView,
+  Unsubscribe,
+} from "./chain-types.js";
+import { Session, connectionTo } from "./connections.js";
+import { within } from "./timeouts.js";
+import { sendDepositAndConfirm, sendInstructionWithin } from "./transactions.js";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.5.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.5.1";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
-const ORDER_KEY_SEARCH_WINDOW = 4_096;
-
-/** Where a trader's four live order keys sit in their derivation. It holds no secret. */
-export type KeyCheckpoint = OrderKeyCheckpoint;
-export const FIRST_TRADER_SEAT = 2;
+/** The fee and insurance seats come first; traders sit from here up. */
+export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
 export const SEAT_COUNT = SEATS;
 
-const CLOCK_SYSVAR = new PublicKey("SysvarC1ock11111111111111111111111111111111");
+const ORDER_KEY_SEARCH_WINDOW = 4_096;
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const LIQUIDATE_UP_TO_LOTS = 1_000_000_000n;
-
-export type ChainSide = "buy" | "sell";
-export type ChainOrderType = "limit" | "postOnly" | "ioc" | "market";
-
-export interface ChainMarket {
-  marketId: number;
-  kind: "perp" | "spot";
-  tick: bigint;
-  baseLot: bigint;
-  minSize: bigint;
-  minNotional: bigint;
-  bandBps: number;
-  imBps: number;
-  maxMoveBps: number;
-  minPublishGapSeconds: number;
-  maxPriceAgeSeconds: number;
-  fundingIntervalSeconds: number;
-  baseToken: number;
-  quoteToken: number;
-}
-
-export interface PublicAddresses {
-  exchange: string;
-  stats: string;
-  market: string;
-  tape: string;
-  priceFeed: string;
-}
-
-export interface ChainPrice {
-  price: bigint;
-  publishTimeSeconds: number;
-}
-
-export interface ChainFill {
-  sequence: bigint;
-  price: bigint;
-  size: bigint;
-  timeSeconds: number;
-  takerSide: ChainSide;
-  makerReceipt: Uint8Array;
-  takerReceipt: Uint8Array;
-}
-
-export interface ChainTape {
-  lastSequence: bigint;
-  /** Newest first, as the tape account holds them. */
-  fills: ChainFill[];
-}
-
-export interface ChainStats {
-  orders: bigint;
-  fills: bigint;
-  volume: bigint[];
-  openInterest: bigint[];
-}
-
-export interface ChainOrder {
-  side: ChainSide;
-  type: ChainOrderType;
-  price: bigint;
-  size: bigint;
-  reduceOnly: boolean;
-  secret: Uint8Array;
-  /** Unix seconds after which a resting remainder is void; none when absent. */
-  restingExpirySeconds?: number;
-}
-
-/**
- * `invalid`: refused before signing, by the market's public settings.
- * `failed`: the transaction landed and the program refused it; nothing changed.
- * `expired`: no result showed before the order's expiry.
- */
-export type PlaceStatus =
-  "filled" | "rested" | "cancelled" | "refused" | "expired" | "invalid" | "failed" | "unknown";
-
-export interface PlaceOutcome {
-  status: PlaceStatus;
-  filled: bigint;
-  rested: bigint;
-  /** From the send to the result showing in the trader's private view, as the client timed it. */
-  sendToResultMs: number;
-  reason?: string;
-  /**
-   * Only with `unknown`: the client stopped waiting while the order could
-   * still run. Resolves, once the rollup's clock is past the order's expiry
-   * at the latest, to what became of it: executed after all, or `expired`.
-   * The trader sends nothing else until then.
-   */
-  settled?: Promise<PlaceOutcome>;
-}
-
-/**
- * `nothing` covers a seat that is not open, has no position, is healthy, or is past the worst price.
- * `refused`: the program refused the liquidator itself, as when the seat is its own.
- */
-export type LiquidationOutcome =
-  "liquidated" | "nothing" | "stalePrice" | "liquidatorMarginInsufficient" | "refused" | "noResult";
-
-export interface SeatView {
-  seat: number;
-  collateral: bigint;
-  spot: { available: bigint; locked: bigint }[];
-  perp: { base: bigint; quote: bigint }[];
-  ordersMarketId: number;
-  orders: { side: ChainSide; price: bigint; remaining: bigint; sequence: bigint }[];
-}
-
-export type DepositTarget = "collateral" | { spotToken: number };
-
-export type Unsubscribe = () => Promise<void>;
+const SIGN_IN_TIMEOUT_MS = 10_000;
+/** A price is stale on chain after ten seconds: a publish that takes longer is given up for the next. */
+const PUBLISH_WITHIN_MS = 8_000;
+const NO_RESTING_EXPIRY = 0n;
 
 const sideOf = (code: number): ChainSide => (code === SIDE.bid ? "buy" : "sell");
+const sideCode = (side: ChainSide): number => (side === "buy" ? SIDE.bid : SIDE.ask);
 
 const ORDER_TYPE_CODE: Record<ChainOrderType, number> = {
   limit: ORDER_TYPE.limit,
   postOnly: ORDER_TYPE.postOnly,
   ioc: ORDER_TYPE.immediateOrCancel,
   market: ORDER_TYPE.market,
-};
-
-const LIQUIDATION_OUTCOME: Record<number, LiquidationOutcome> = {
-  [LIQUIDATION_STATUS.liquidated]: "liquidated",
-  [LIQUIDATION_STATUS.nothingToLiquidate]: "nothing",
-  [LIQUIDATION_STATUS.stalePrice]: "stalePrice",
-  [LIQUIDATION_STATUS.liquidatorMarginInsufficient]: "liquidatorMarginInsufficient",
 };
 
 const placeStatusOf = (status: number, rested: bigint): PlaceStatus => {
@@ -189,7 +90,17 @@ const placeStatusOf = (status: number, rested: bigint): PlaceStatus => {
   return "cancelled";
 };
 
-const toChainFill = (fill: TapeFill): ChainFill => ({
+const NOTHING_PLACED = { filled: 0n, rested: 0n, sendToResultMs: 0 };
+const EXPIRED: PlaceOutcome = { status: "expired", ...NOTHING_PLACED };
+
+const placedAs = (result: OrderResult, timing: Timing): PlaceOutcome => ({
+  status: placeStatusOf(result.status, result.rested),
+  filled: result.filled,
+  rested: result.rested,
+  sendToResultMs: timing.resultAt - timing.sentAt,
+});
+
+const chainFillOf = (fill: TapeFill): ChainFill => ({
   sequence: fill.fillSeq,
   price: fill.price,
   size: fill.size,
@@ -199,7 +110,33 @@ const toChainFill = (fill: TapeFill): ChainFill => ({
   takerReceipt: fill.takerReceipt,
 });
 
-const toSeatView = (view: View): SeatView => ({
+const tapeFillOf = (fill: ChainFill): TapeFill => ({
+  fillSeq: fill.sequence,
+  price: fill.price,
+  size: fill.size,
+  time: BigInt(fill.timeSeconds),
+  makerReceipt: fill.makerReceipt,
+  takerReceipt: fill.takerReceipt,
+  takerSide: sideCode(fill.takerSide),
+});
+
+const chainTapeOf = (tape: Tape): ChainTape => ({
+  lastSequence: tape.lastFillSeq,
+  fills: tape.fills.map(chainFillOf),
+});
+
+const chainPriceOf = (feed: PriceFeed): ChainPrice => ({
+  price: feed.price,
+  publishTimeSeconds: Number(feed.publishTime),
+});
+
+const chainStatsOf = ({ orders, fills, openInterest }: Stats): ChainStats => ({
+  orders,
+  fills,
+  openInterest,
+});
+
+const seatViewOf = (view: View): SeatView => ({
   seat: view.seat,
   collateral: view.snapshot.seat.collateral,
   spot: view.snapshot.seat.spot.map((balance) => ({ ...balance })),
@@ -222,45 +159,6 @@ const signerOf = (key: Keypair) => {
   return async (message: Uint8Array) => new Uint8Array(sign(null, message, privateKey));
 };
 
-export const REQUEST_TIMEOUT_MS = 8_000;
-const SIGN_IN_TIMEOUT_MS = 10_000;
-
-type Fetch = typeof fetch;
-
-/**
- * A request that is never answered is given up after `timeoutMs`. Without
- * this one silent connection would hold a loop's turn forever: every request
- * this service makes to a network goes out through it.
- */
-export const fetchWithin =
-  (timeoutMs: number, transport: Fetch = fetch): Fetch =>
-  (input, init) =>
-    transport(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-
-/** Rejects when `work` has not settled after `timeoutMs`. */
-export const within = <T>(work: Promise<T>, timeoutMs: number, what: string): Promise<T> =>
-  new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${what} got no answer in ${timeoutMs} ms`)),
-      timeoutMs,
-    );
-    work.then(resolve, reject).finally(() => clearTimeout(timer));
-  });
-
-const connectionTo = (rpcUrl: string, wsUrl?: string): Connection =>
-  new Connection(rpcUrl, {
-    commitment: "confirmed",
-    wsEndpoint: wsUrl,
-    fetch: fetchWithin(REQUEST_TIMEOUT_MS) as FetchFn,
-  });
-
-/** A connection for public accounts only: the tape, the price feeds, the stats, the markets. */
-export const publicConnection = (rpcUrl: string, wsUrl: string): Connection =>
-  connectionTo(rpcUrl, wsUrl);
-
-/** The rollup's own port, which takes any transaction without a sign-in. Reachable on a local network only. */
-export const directConnection = (rpcUrl: string): Connection => connectionTo(rpcUrl);
-
 /** Signs `key` in to the private endpoint. The query filter accepts sends only from a signed-in caller. */
 export const signedInConnection = async (rpcUrl: string, key: Keypair): Promise<Connection> => {
   const token = await within(
@@ -271,146 +169,13 @@ export const signedInConnection = async (rpcUrl: string, key: Keypair): Promise<
   return connectionTo(`${rpcUrl}?token=${token}`, `${websocketUrl(rpcUrl)}?token=${token}`);
 };
 
-/**
- * A key's signed-in connection, made again after anything went wrong with
- * it: a token can expire and a connection can die, and neither says so.
- */
-export class Session {
-  private current: Promise<Connection> | null = null;
-
-  constructor(private readonly open: () => Promise<Connection>) {}
-
-  static signedIn(rpcUrl: string, key: Keypair): Session {
-    return new Session(() => signedInConnection(rpcUrl, key));
-  }
-
-  static of(connection: Connection): Session {
-    return new Session(async () => connection);
-  }
-
-  connection(): Promise<Connection> {
-    this.current ??= this.open().catch((error: unknown) => {
-      this.current = null;
-      throw error;
-    });
-    return this.current;
-  }
-
-  /** The next caller signs in afresh. */
-  renew(): void {
-    this.current = null;
-  }
-
-  /** Runs `work` on the connection, and renews it unless the program itself gave the answer. */
-  async use<T>(work: (connection: Connection) => Promise<T>): Promise<T> {
-    try {
-      return await work(await this.connection());
-    } catch (error) {
-      if (!(error instanceof ProgramRefused)) this.renew();
-      throw error;
-    }
-  }
-}
-
-const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
-
-/** This service moves test tokens only. It stops before sending anything if Solana is mainnet. */
-export const refuseMainnet = async (solanaRpcUrl: string): Promise<void> => {
-  const genesis = await connectionTo(solanaRpcUrl).getGenesisHash();
-  if (genesis === MAINNET_GENESIS) {
-    throw new Error("SOLANA_RPC_URL is mainnet. This service never runs there.");
-  }
-};
-
-const CONFIRM_TIMEOUT_MS = 30_000;
-/** A price is stale on chain after ten seconds: a publish that takes longer is given up for the next. */
-const PUBLISH_WITHIN_MS = 8_000;
-const CONFIRM_POLL_MS = 100;
-
-/** The endpoint did not take a transaction that moves tokens: the HTTP status and body it answered with. */
-export class DepositRefused extends Error {
-  constructor(endpoint: string, cause: unknown) {
-    const answer = cause instanceof Error ? cause.message.split("\n")[0] : String(cause);
-    super(`${new URL(endpoint).origin} refused the deposit transaction: ${answer}`);
-    this.name = "DepositRefused";
-  }
-}
-
-/** The transaction executed and the program refused it, with the program's error number when it gave one. */
-export class ProgramRefused extends Error {
-  readonly code: number | null;
-
-  constructor(err: unknown) {
-    super(`the transaction failed: ${JSON.stringify(err)}`);
-    this.name = "ProgramRefused";
-    const detail = (err as { InstructionError?: [number, { Custom?: number }] })
-      ?.InstructionError?.[1];
-    this.code = typeof detail?.Custom === "number" ? detail.Custom : null;
-  }
-}
-
-/**
- * Sends a fully signed transaction that carries a deposit and waits until the
- * rollup reports it executed. A refusal at the door is a `DepositRefused`, a
- * refusal by the program a `ProgramRefused`.
- */
-export const sendDepositAndConfirm = async (
-  connection: Connection,
-  transaction: Transaction,
-): Promise<string> => {
-  const signature = await connection
-    .sendRawTransaction(transaction.serialize(), { skipPreflight: true })
-    .catch((error: unknown) => {
-      throw new DepositRefused(connection.rpcEndpoint, error);
-    });
-  return confirmedWithin(connection, signature, CONFIRM_TIMEOUT_MS);
-};
-
-/** Waits until the rollup reports `signature` executed, for `timeoutMs` at most. */
-export const confirmedWithin = async (
-  connection: Connection,
-  signature: string,
-  timeoutMs: number,
-): Promise<string> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const { value } = await connection.getSignatureStatus(signature);
-    if (value && value.confirmationStatus !== "processed") {
-      if (value.err) throw new ProgramRefused(value.err);
-      return signature;
-    }
-    await new Promise((resolve) => setTimeout(resolve, CONFIRM_POLL_MS));
-  }
-  throw new Error(`transaction ${signature} was not confirmed in ${timeoutMs} ms`);
-};
-
-/** Signs, sends and confirms one short-lived instruction, all inside `timeoutMs`. */
-const sendWithin = (
-  connection: Connection,
-  instruction: TransactionInstruction,
-  payer: Keypair,
-  timeoutMs: number,
-): Promise<string> =>
-  within(
-    (async () => {
-      const latest = await connection.getLatestBlockhash("confirmed");
-      const transaction = new Transaction({ feePayer: payer.publicKey, ...latest }).add(
-        instruction,
-      );
-      transaction.sign(payer);
-      const signature = await connection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: true,
-      });
-      return confirmedWithin(connection, signature, timeoutMs);
-    })(),
-    timeoutMs,
-    "the transaction",
-  );
+export const signedInSession = (rpcUrl: string, key: Keypair): Session =>
+  new Session(() => signedInConnection(rpcUrl, key));
 
 export const newOrderSecret = (): Uint8Array => randomSecret();
 
 /** A trader's order keys all follow from this seed, which follows from its owner key alone. */
-export const orderKeySeedOf = (owner: Keypair): Uint8Array =>
+const orderKeySeedOf = (owner: Keypair): Uint8Array =>
   new Uint8Array(
     createHash("sha256")
       .update("noirwire-sim/order-key-seed/v1")
@@ -418,26 +183,30 @@ export const orderKeySeedOf = (owner: Keypair): Uint8Array =>
       .digest(),
   );
 
+/** The four public order keys a new trader's view is opened with. */
+export const firstOrderKeys = (owner: Keypair): PublicKey[] =>
+  OrderKeyManager.fresh(orderKeySeedOf(owner)).publicKeys;
+
 /** Which side of `fill`, if any, was an order placed with one of `secrets`. */
 export const fillRoles = (
   fill: ChainFill,
   secrets: Uint8Array[],
 ): { maker: boolean; taker: boolean } => {
-  const asTapeFill: TapeFill = {
-    fillSeq: fill.sequence,
-    price: fill.price,
-    size: fill.size,
-    time: BigInt(fill.timeSeconds),
-    makerReceipt: fill.makerReceipt,
-    takerReceipt: fill.takerReceipt,
-    takerSide: fill.takerSide === "buy" ? SIDE.bid : SIDE.ask,
-  };
-  const own = ownFills([asTapeFill], secrets);
+  const own = ownFills([tapeFillOf(fill)], secrets);
   return {
     maker: own.some((entry) => entry.role === "maker"),
     taker: own.some((entry) => entry.role === "taker"),
   };
 };
+
+export interface OpenAndFundRequest {
+  gate: PublicKey;
+  faucet: PublicKey;
+  owner: PublicKey;
+  orderKeys: PublicKey[];
+  mint: string;
+  amount: bigint;
+}
 
 export class Program {
   readonly programId: PublicKey;
@@ -452,10 +221,9 @@ export class Program {
     return new MarketReader(connection, this.programId);
   }
 
-  async clockSeconds(connection: Connection): Promise<number> {
-    const clock = await connection.getAccountInfo(CLOCK_SYSVAR);
-    if (!clock) throw new Error("the rollup serves no clock");
-    return Number(new DataView(clock.data.buffer, clock.data.byteOffset).getBigInt64(32, true));
+  /** The rollup's own clock, in unix seconds. */
+  clockSeconds(connection: Connection): Promise<number> {
+    return clockOf(connection);
   }
 
   /** The public addresses the program derives: the exchange, the stats and one market's accounts. */
@@ -479,12 +247,10 @@ export class Program {
       kind: params.kind === MARKET_KIND.perp ? "perp" : "spot",
       tick: params.tick,
       baseLot: params.baseLot,
-      minSize: params.minSize,
       minNotional: params.minNotional,
       bandBps: params.bandBps,
-      imBps: params.imBps,
+      initialMarginBps: params.imBps,
       maxMoveBps: params.maxMoveBps,
-      minPublishGapSeconds: params.minPublishGap,
       maxPriceAgeSeconds: Number(params.maxPriceAge),
       fundingIntervalSeconds: Number(params.fundingInterval),
       baseToken: params.baseToken,
@@ -493,18 +259,15 @@ export class Program {
   }
 
   async price(connection: Connection, marketId: number): Promise<ChainPrice> {
-    const feed = await this.reader(connection).priceFeed(marketId);
-    return { price: feed.price, publishTimeSeconds: Number(feed.publishTime) };
+    return chainPriceOf(await this.reader(connection).priceFeed(marketId));
   }
 
   async tape(connection: Connection, marketId: number): Promise<ChainTape> {
-    const tape = await this.reader(connection).tape(marketId);
-    return { lastSequence: tape.lastFillSeq, fills: tape.fills.map(toChainFill) };
+    return chainTapeOf(await this.reader(connection).tape(marketId));
   }
 
   async stats(connection: Connection): Promise<ChainStats> {
-    const { orders, fills, volume, openInterest } = await this.reader(connection).stats();
-    return { orders, fills, volume, openInterest };
+    return chainStatsOf(await this.reader(connection).stats());
   }
 
   subscribeTape(
@@ -512,9 +275,7 @@ export class Program {
     marketId: number,
     onChange: (tape: ChainTape) => void,
   ): Unsubscribe {
-    return this.reader(connection).subscribeTape(marketId, (tape) =>
-      onChange({ lastSequence: tape.lastFillSeq, fills: tape.fills.map(toChainFill) }),
-    );
+    return this.reader(connection).subscribeTape(marketId, (tape) => onChange(chainTapeOf(tape)));
   }
 
   subscribePrice(
@@ -523,34 +284,35 @@ export class Program {
     onChange: (price: ChainPrice) => void,
   ): Unsubscribe {
     return this.reader(connection).subscribePriceFeed(marketId, (feed) =>
-      onChange({ price: feed.price, publishTimeSeconds: Number(feed.publishTime) }),
+      onChange(chainPriceOf(feed)),
     );
   }
 
   subscribeStats(connection: Connection, onChange: (stats: ChainStats) => void): Unsubscribe {
-    return this.reader(connection).subscribeStats(({ orders, fills, volume, openInterest }) =>
-      onChange({ orders, fills, volume, openInterest }),
-    );
+    return this.reader(connection).subscribeStats((stats) => onChange(chainStatsOf(stats)));
   }
 
-  /** The publish time is the rollup's own clock: the program refuses one ahead of it. */
+  /**
+   * `publishTimeSeconds` is the rollup's own clock: the program refuses a
+   * time ahead of it, and one that is not after the feed's last.
+   */
   async publishPrice(
     connection: Connection,
     oracle: Keypair,
     marketId: number,
     price: bigint,
+    publishTimeSeconds: number,
   ): Promise<void> {
-    const publishTime = BigInt(await this.clockSeconds(connection));
-    await sendWithin(
+    await sendInstructionWithin(
       connection,
-      this.instructions.publishPrice(oracle.publicKey, marketId, price, publishTime),
+      this.instructions.publishPrice(oracle.publicKey, marketId, price, BigInt(publishTimeSeconds)),
       oracle,
       PUBLISH_WITHIN_MS,
     );
   }
 
   async updateFunding(connection: Connection, payer: Keypair, marketId: number): Promise<void> {
-    await sendWithin(
+    await sendInstructionWithin(
       connection,
       this.instructions.updateFunding(marketId),
       payer,
@@ -599,25 +361,13 @@ export class Program {
    */
   async openAndFundTransaction(
     connection: Connection,
-    request: {
-      gate: PublicKey;
-      faucet: PublicKey;
-      owner: PublicKey;
-      orderKeys: PublicKey[];
-      mint: string;
-      amount: bigint;
-    },
+    request: OpenAndFundRequest,
   ): Promise<Transaction> {
+    const { gate, faucet, owner, orderKeys, mint, amount } = request;
     const latest = await connection.getLatestBlockhash("confirmed");
-    return new Transaction({ feePayer: request.gate, ...latest }).add(
-      this.instructions.openTrader(request.gate, request.owner, request.orderKeys),
-      this.depositInstruction(
-        request.faucet,
-        request.mint,
-        request.owner,
-        "collateral",
-        request.amount,
-      ),
+    return new Transaction({ feePayer: gate, ...latest }).add(
+      this.instructions.openTrader(gate, owner, orderKeys),
+      this.depositInstruction(faucet, mint, owner, "collateral", amount),
     );
   }
 
@@ -638,15 +388,7 @@ export class Program {
     );
     if (!account) return null;
     const seed = orderKeySeedOf(owner);
-    let keys: OrderKeyManager | null = null;
-    if (checkpoint) {
-      try {
-        const view = decodeView(account.data);
-        keys = OrderKeyManager.restore(seed, view, checkpoint, ORDER_KEY_SEARCH_WINDOW);
-      } catch {
-        keys = null;
-      }
-    }
+    let keys = checkpoint ? restoredKeys(seed, account.data, checkpoint) : null;
     if (!keys) {
       keys = OrderKeyManager.fresh(seed);
       await sendAndConfirm(
@@ -668,15 +410,13 @@ export class Program {
   ): Promise<ProgramTrader> {
     const existing = await this.ownTrader(rpcUrl, owner, checkpoint);
     if (existing) return existing;
-    const keys = OrderKeyManager.fresh(orderKeySeedOf(owner));
     await sendAndConfirm(
       gateConnection,
-      [this.instructions.openTrader(gate.publicKey, owner.publicKey, keys.publicKeys)],
+      [this.instructions.openTrader(gate.publicKey, owner.publicKey, firstOrderKeys(owner))],
       gate,
       [owner],
     );
-    const connection = await signedInConnection(rpcUrl, owner);
-    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
+    return this.newTrader(rpcUrl, owner);
   }
 
   /** A trader just opened with `firstOrderKeys(owner)`, before it sent anything. */
@@ -687,9 +427,18 @@ export class Program {
   }
 }
 
-/** The four public order keys a new trader's view is opened with. */
-export const firstOrderKeys = (owner: Keypair): PublicKey[] =>
-  OrderKeyManager.fresh(orderKeySeedOf(owner)).publicKeys;
+/** Null when the view's keys are not where the checkpoint says, nor within reach of it. */
+const restoredKeys = (
+  seed: Uint8Array,
+  viewData: Buffer,
+  checkpoint: KeyCheckpoint,
+): OrderKeyManager | null => {
+  try {
+    return OrderKeyManager.restore(seed, decodeView(viewData), checkpoint, ORDER_KEY_SEARCH_WINDOW);
+  } catch {
+    return null;
+  }
+};
 
 /** One trader: signs in as its owner, trades with one-time order keys, reads its own view. */
 export class ProgramTrader {
@@ -698,6 +447,14 @@ export class ProgramTrader {
   private queue: Promise<unknown> = Promise.resolve();
   private unsettled: Promise<unknown> = Promise.resolve();
 
+  /**
+   * How many instructions the caller keeps in flight at once: one unless
+   * set, four at most, since a view has four order key slots. With more than
+   * one, an unknown outcome holds back only its own slot, which the client
+   * keeps out of use until it settles.
+   */
+  inFlightLimit = 1;
+
   constructor(
     private readonly rpcUrl: string,
     private readonly owner: Keypair,
@@ -705,11 +462,18 @@ export class ProgramTrader {
     private readonly programId: PublicKey,
     connection: Connection,
   ) {
-    this.client = new TraderClient(connection, connection, owner.publicKey, keys, programId);
+    this.client = this.clientOn(connection);
   }
 
-  /** How many instructions the caller keeps in flight at once: one unless set, four at most. */
-  inFlightLimit = 1;
+  private clientOn(connection: Connection): TraderClient {
+    return new TraderClient(
+      connection,
+      connection,
+      this.owner.publicKey,
+      this.keys,
+      this.programId,
+    );
+  }
 
   /** Lets go of the websocket and the timer the client holds once it has made a call. */
   close(): void {
@@ -725,122 +489,103 @@ export class ProgramTrader {
   }
 
   /**
-   * A call whose outcome the client could not tell in time. The instruction
-   * may still run until the rollup's clock passes its expiry, so nothing else
-   * of this trader is sent until `settled` says what became of it.
-   */
-  private async afterUnknown<T>(unknown: OutcomeUnknown): Promise<T | null> {
-    if (unknown.cause !== undefined) this.signInAgain = true;
-    return (await unknown.settled) as T | null;
-  }
-
-  /**
    * One instruction at a time per trader, and none while an earlier one's
-   * outcome is still unknown; a failure on the wire signs in again before the next.
+   * outcome is still unknown: the instruction may run until the rollup's
+   * clock passes its expiry.
    */
-  private async run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
-    if (this.inFlightLimit > 1) return this.runOne(operation, false);
-    const next = this.queue.then(() => this.runOne(operation, true));
+  private run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
+    if (this.inFlightLimit > 1) return this.runOne(operation);
+    const next = this.queue.then(() => this.unsettled).then(() => this.runOne(operation));
     this.queue = next.catch(() => undefined);
     return next;
   }
 
-  /**
-   * With several instructions in flight (a view has four order key slots, so
-   * up to four), an unknown outcome holds back only its own slot, which the
-   * client keeps out of use until it settles.
-   */
-  private async runOne<T>(
-    operation: (client: TraderClient) => Promise<T>,
-    waitForUnknown: boolean,
-  ): Promise<T> {
-    {
-      if (waitForUnknown) await this.unsettled;
-      if (this.signInAgain) {
-        const connection = await signedInConnection(this.rpcUrl, this.owner);
-        // The old client holds a websocket on the old token: results are pushed over it.
-        this.client.close();
-        this.client = new TraderClient(
-          connection,
-          connection,
-          this.owner.publicKey,
-          this.keys,
-          this.programId,
-        );
-        this.signInAgain = false;
-      }
-      try {
-        return await operation(this.client);
-      } catch (error) {
-        const answered =
-          error instanceof TransactionFailed ||
-          error instanceof OrderInvalid ||
-          error instanceof OutcomeUnknown;
-        if (!answered) this.signInAgain = true;
-        throw error;
-      }
+  /** A failure on the wire signs in again before the next instruction. */
+  private async runOne<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
+    if (this.signInAgain) {
+      const connection = await signedInConnection(this.rpcUrl, this.owner);
+      // The old client holds a websocket on the old token: results are pushed over it.
+      this.client.close();
+      this.client = this.clientOn(connection);
+      this.signInAgain = false;
+    }
+    try {
+      return await operation(this.client);
+    } catch (error) {
+      const answered =
+        error instanceof TransactionFailed ||
+        error instanceof OrderInvalid ||
+        error instanceof OutcomeUnknown;
+      if (!answered) this.signInAgain = true;
+      throw error;
     }
   }
 
-  view(): Promise<SeatView> {
-    return this.run(async (client) => toSeatView(await client.view()));
+  /**
+   * The result of a call other than an order, or null when the instruction
+   * never ran. A call whose outcome the client could not tell in time is
+   * waited for until it settles.
+   */
+  private async resultOf(call: Promise<OrderResult>): Promise<OrderResult | null> {
+    try {
+      return await call;
+    } catch (error) {
+      if (!(error instanceof OutcomeUnknown)) throw error;
+      if (error.cause !== undefined) this.signInAgain = true;
+      return error.settled;
+    }
   }
 
-  place(
-    marketId: number,
-    order: ChainOrder,
-    riskMarkets: number[],
-    expirySeconds?: number,
-  ): Promise<PlaceOutcome> {
-    const nothing = { filled: 0n, rested: 0n, sendToResultMs: 0 };
-    const placedAs = (result: OrderResult, timing: { sentAt: number; resultAt: number }) => ({
-      status: placeStatusOf(result.status, result.rested),
-      filled: result.filled,
-      rested: result.rested,
-      sendToResultMs: timing.resultAt - timing.sentAt,
-    });
-    const unknownUntil = (settled: Promise<PlaceOutcome>): PlaceOutcome => {
-      this.unsettled = settled.catch(() => undefined);
-      return { status: "unknown", ...nothing, settled };
-    };
+  private unknownUntil(settled: Promise<PlaceOutcome>): PlaceOutcome {
+    this.unsettled = settled.catch(() => undefined);
+    return { status: "unknown", ...NOTHING_PLACED, settled };
+  }
+
+  view(): Promise<SeatView> {
+    return this.run(async (client) => seatViewOf(await client.view()));
+  }
+
+  place(marketId: number, order: ChainOrder, riskMarkets: number[]): Promise<PlaceOutcome> {
     return this.run(async (client): Promise<PlaceOutcome> => {
       const placed = await client.placeOrder(
         marketId,
         {
-          side: order.side === "buy" ? SIDE.bid : SIDE.ask,
+          side: sideCode(order.side),
           orderType: ORDER_TYPE_CODE[order.type],
           price: order.price,
           size: order.size,
           reduceOnly: order.reduceOnly,
           secret: order.secret,
           expiry:
-            order.restingExpirySeconds === undefined ? 0n : BigInt(order.restingExpirySeconds),
+            order.restingExpirySeconds === undefined
+              ? NO_RESTING_EXPIRY
+              : BigInt(order.restingExpirySeconds),
         },
-        { riskMarkets, expirySeconds },
+        { riskMarkets },
       );
-      if (placed.outcome === "expired") return { status: "expired", ...nothing };
+      if (placed.outcome === "expired") return EXPIRED;
       if (placed.outcome === "placed") return placedAs(placed.result, placed);
-      return unknownUntil(
+      return this.unknownUntil(
         placed.settled.then((settled) =>
-          settled.outcome === "placed"
-            ? placedAs(settled.result, settled)
-            : { status: "expired", ...nothing },
+          settled.outcome === "placed" ? placedAs(settled.result, settled) : EXPIRED,
         ),
       );
     }).catch((error: unknown): PlaceOutcome => {
       if (error instanceof OutcomeUnknown) {
         if (error.cause !== undefined) this.signInAgain = true;
-        return unknownUntil(
-          error.settled.then((result) =>
-            result ? placedAs(result, result) : { status: "expired", ...nothing },
-          ),
+        return this.unknownUntil(
+          error.settled.then((result) => (result ? placedAs(result, result) : EXPIRED)),
         );
       }
       if (error instanceof OrderInvalid) {
-        return { status: "invalid", ...nothing, reason: error.reason };
+        return { status: "invalid", ...NOTHING_PLACED, reason: error.reason };
       }
       if (error instanceof TransactionFailed) {
-        return { status: "failed", ...nothing, reason: `program error ${error.code ?? "unknown"}` };
+        return {
+          status: "failed",
+          ...NOTHING_PLACED,
+          reason: `program error ${error.code ?? "unknown"}`,
+        };
       }
       throw error;
     });
@@ -851,48 +596,35 @@ export class ProgramTrader {
    * never ran. Throws when the program refused the transaction.
    */
   cancelAll(marketId: number): Promise<bigint | null> {
-    return this.run(async (client) => {
-      const result = await client.cancelAll(marketId).catch((error: unknown) => {
-        if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
-        throw error;
-      });
-      return result?.cancelled ?? null;
-    });
+    return this.run(
+      async (client) => (await this.resultOf(client.cancelAll(marketId)))?.cancelled ?? null,
+    );
   }
 
   /** Brings the view's seat copy up to date. False when the instruction never ran. */
   sync(marketId: number): Promise<boolean> {
-    return this.run(async (client) => {
-      const result = await client.syncView(marketId).catch((error: unknown) => {
-        if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
-        throw error;
-      });
-      return result !== null;
-    });
+    return this.run(async (client) => (await this.resultOf(client.syncView(marketId))) !== null);
   }
 
   /**
-   * Tried blind against a seat number. `worstPrice` set to the mark accepts a
-   * liquidation in either direction: below the mark from a long, above it
-   * from a short.
+   * Whether seat `seat` was liquidated. Nobody can read another seat, so
+   * this is tried blind: a seat that is empty, healthy or without a position
+   * all answer the same. `worstPrice` set to the mark accepts a liquidation
+   * in either direction: below the mark from a long, above it from a short.
    */
   liquidate(
     marketId: number,
     seat: number,
     worstPrice: bigint,
     riskMarkets: number[],
-  ): Promise<LiquidationOutcome> {
+  ): Promise<boolean> {
     return this.run(async (client) => {
-      const result = await client
-        .liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice, riskMarkets)
-        .catch((error: unknown) => {
-          if (error instanceof OutcomeUnknown) return this.afterUnknown<OrderResult>(error);
-          throw error;
-        });
-      if (!result) return "noResult" as const;
-      return LIQUIDATION_OUTCOME[result.status] ?? ("noResult" as const);
-    }).catch((error: unknown): LiquidationOutcome => {
-      if (error instanceof TransactionFailed) return "refused";
+      const result = await this.resultOf(
+        client.liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice, riskMarkets),
+      );
+      return result?.status === LIQUIDATION_STATUS.liquidated;
+    }).catch((error: unknown) => {
+      if (error instanceof TransactionFailed) return false;
       throw error;
     });
   }

@@ -1,4 +1,4 @@
-import type { ChainFill, ChainTape } from "./program.js";
+import type { ChainFill, ChainTape } from "./chain-types.js";
 
 export interface TapeUpdate {
   /** Fills not seen before, oldest first. */
@@ -15,11 +15,7 @@ export interface TapeUpdate {
  * holds. A reading older than one already taken is ignored.
  */
 export class TapeTracker {
-  constructor(private lastSequence: bigint = 0n) {}
-
-  get cursor(): bigint {
-    return this.lastSequence;
-  }
+  private lastSequence = 0n;
 
   take(tape: ChainTape): TapeUpdate {
     // A plain read and a notification race: the older picture can arrive last.

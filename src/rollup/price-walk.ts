@@ -1,16 +1,11 @@
+import { BPS_PER_WHOLE, roundDownToStep, roundUpToStep } from "../engine/money.js";
+
 export interface PriceStep {
   current: bigint;
   target: bigint;
   maxMoveBps: number;
   tick: bigint;
 }
-
-const roundDownToTick = (price: bigint, tick: bigint): bigint => price - (price % tick);
-
-const roundUpToTick = (price: bigint, tick: bigint): bigint => {
-  const remainder = price % tick;
-  return remainder === 0n ? price : price - remainder + tick;
-};
 
 /**
  * The next price to publish on the way from `current` to `target`. The
@@ -19,16 +14,16 @@ const roundUpToTick = (price: bigint, tick: bigint): bigint => {
  * that has no price yet takes the target at once.
  */
 export const nextPublishPrice = ({ current, target, maxMoveBps, tick }: PriceStep): bigint => {
-  const wanted = roundDownToTick(target, tick);
+  const wanted = roundDownToStep(target, tick);
   if (wanted <= 0n) return current;
   if (current === 0n) return wanted;
-  const allowed = (current * BigInt(maxMoveBps)) / 10_000n;
+  const allowed = (current * BigInt(maxMoveBps)) / BPS_PER_WHOLE;
   if (wanted > current + allowed) {
-    const stepped = roundDownToTick(current + allowed, tick);
+    const stepped = roundDownToStep(current + allowed, tick);
     return stepped > current ? stepped : current;
   }
   if (wanted < current - allowed) {
-    const stepped = roundUpToTick(current - allowed, tick);
+    const stepped = roundUpToStep(current - allowed, tick);
     return stepped < current ? stepped : current;
   }
   return wanted;
@@ -40,6 +35,14 @@ export const nextPublishPrice = ({ current, target, maxMoveBps, tick }: PriceSte
  */
 export const withinOneStep = (step: PriceStep): boolean => {
   if (step.current === 0n) return false;
-  const wanted = roundDownToTick(step.target, step.tick);
+  const wanted = roundDownToStep(step.target, step.tick);
   return wanted > 0n && nextPublishPrice(step) === wanted;
 };
+
+/**
+ * Whether a publish stamped `clockSeconds` can be accepted. The program
+ * refuses a publish time that is not after the feed's last one, so two
+ * publishes of one market never share a second of the rollup's clock.
+ */
+export const publishTimeIsNew = (clockSeconds: number, lastAcceptedSeconds: number): boolean =>
+  clockSeconds > lastAcceptedSeconds;

@@ -1,5 +1,7 @@
 import type { Connection } from "@solana/web3.js";
-import type { ChainPrice, ChainStats, Program, Unsubscribe } from "./program.js";
+import { type Repeating, every } from "../scheduling/repeating.js";
+import type { ChainPrice, ChainStats, Unsubscribe } from "./chain-types.js";
+import type { Program } from "./program.js";
 import { TapeTracker, type TapeUpdate } from "./tape-tracker.js";
 
 export interface ChainFeedHandlers {
@@ -22,14 +24,13 @@ const FIRST_READ_RETRY_MS = 2_000;
 export class ChainFeed {
   private readonly trackers = new Map<number, TapeTracker>();
   private readonly unsubscribes: Unsubscribe[] = [];
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private rereading = false;
+  private rereading: Repeating | null = null;
   private lastReadAtMs = 0;
 
   constructor(
     private readonly program: Program,
     private readonly connection: Connection,
-    private readonly marketIds: number[],
+    marketIds: number[],
     private readonly handlers: ChainFeedHandlers,
   ) {
     for (const marketId of marketIds) this.trackers.set(marketId, new TapeTracker());
@@ -54,49 +55,38 @@ export class ChainFeed {
   }
 
   async start(): Promise<void> {
+    const { program, connection, handlers } = this;
     await this.firstRead();
-    for (const marketId of this.marketIds) {
+    for (const [marketId, tracker] of this.trackers) {
       this.unsubscribes.push(
-        this.program.subscribePrice(this.connection, marketId, (price) =>
-          this.handlers.onPrice(marketId, price),
-        ),
-        this.program.subscribeTape(this.connection, marketId, (tape) =>
-          this.handlers.onTape(marketId, this.trackers.get(marketId)!.take(tape), Date.now()),
+        program.subscribePrice(connection, marketId, (price) => handlers.onPrice(marketId, price)),
+        program.subscribeTape(connection, marketId, (tape) =>
+          handlers.onTape(marketId, tracker.take(tape), Date.now()),
         ),
       );
     }
-    this.unsubscribes.push(
-      this.program.subscribeStats(this.connection, (stats) => this.handlers.onStats(stats)),
+    this.unsubscribes.push(program.subscribeStats(connection, (stats) => handlers.onStats(stats)));
+    this.rereading = every(
+      REREAD_INTERVAL_MS,
+      () => this.readEverything(),
+      (error) => handlers.onError("reading the public accounts", error),
     );
-    this.timer = setInterval(() => void this.reread(), REREAD_INTERVAL_MS);
-  }
-
-  private async reread(): Promise<void> {
-    if (this.rereading) return;
-    this.rereading = true;
-    try {
-      await this.readEverything();
-    } catch (error) {
-      this.handlers.onError("reading the public accounts", error);
-    } finally {
-      this.rereading = false;
-    }
   }
 
   private async readEverything(): Promise<void> {
-    for (const marketId of this.marketIds) {
-      this.handlers.onPrice(marketId, await this.program.price(this.connection, marketId));
+    const { program, connection, handlers } = this;
+    for (const [marketId, tracker] of this.trackers) {
+      handlers.onPrice(marketId, await program.price(connection, marketId));
       const readAtMs = Date.now();
-      const tape = await this.program.tape(this.connection, marketId);
-      this.handlers.onTape(marketId, this.trackers.get(marketId)!.take(tape), readAtMs);
+      handlers.onTape(marketId, tracker.take(await program.tape(connection, marketId)), readAtMs);
     }
-    this.handlers.onStats(await this.program.stats(this.connection));
+    handlers.onStats(await program.stats(connection));
     this.lastReadAtMs = Date.now();
   }
 
   async stop(): Promise<void> {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
+    this.rereading?.stop();
+    this.rereading = null;
     await Promise.allSettled(this.unsubscribes.map((unsubscribe) => unsubscribe()));
   }
 }

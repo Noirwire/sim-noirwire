@@ -145,7 +145,8 @@ grows by one a minute. Railway waits up to five minutes for the first 200.
 - Public accounts are read anonymously: the tape, the price feeds, the stats, the markets.
   Nothing reads a transaction back, a token account or custody.
 - A price is stale after 10 seconds: each market is published every 2 seconds; a publish
-  still on its way is never doubled, so a slow one costs a turn and builds no backlog.
+  still on its way is never doubled, so a slow one costs a turn and builds no backlog, and
+  none is sent while the rollup's clock still shows the second of the last accepted one.
 - Funding: the rollup's scheduler stops for good after one failed call, and
   `update_funding` fails on a stale price. So this service calls `update_funding` for each
   perpetual once per funding interval, right after a successful publish, whatever the

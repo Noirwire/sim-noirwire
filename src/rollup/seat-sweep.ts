@@ -29,8 +29,9 @@ export class SeatSweep {
   }
 }
 
-export const SEAT_PREFIX = "seat:";
+const SEAT_PREFIX = "seat:";
 
+/** A seat number as a liquidation target, where the in-memory venue names a trader. */
 export const seatTarget = (seat: number): string => `${SEAT_PREFIX}${seat}`;
 
 export const seatOfTarget = (target: string): number | null => {

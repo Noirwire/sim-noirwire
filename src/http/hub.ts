@@ -1,56 +1,25 @@
 import type { Candle, CandleInterval } from "../data/candles.js";
 import type { PublicStats } from "../data/stats.js";
 import type { Fill, MarketId } from "../engine/types.js";
-import { money, tagString } from "./serialize.js";
+import { money, serializeCandle, serializeFill } from "./serialize.js";
 
 interface Subscriber {
   market: MarketId;
   send: (payload: string) => void;
 }
 
-export type StreamMessage =
+type StreamMessage =
   | { type: "price"; market: MarketId; price: string; publishedAtMs: number }
+  | ({ type: "fill" } & ReturnType<typeof serializeFill>)
   | {
-      type: "fill";
+      type: "candle";
       market: MarketId;
-      price: string;
-      size: string;
-      takerSide: Fill["takerSide"];
-      takerTag: string;
-      makerTag: string;
-      timestampMs: number;
-      sequence: number;
+      interval: CandleInterval;
+      candle: ReturnType<typeof serializeCandle>;
     }
-  | { type: "candle"; market: MarketId; interval: CandleInterval; candle: SerializedCandle }
-  | { type: "stats"; stats: SerializedStats };
+  | { type: "stats"; stats: ReturnType<typeof serializeStats> };
 
-interface SerializedCandle {
-  startMs: number;
-  open: string;
-  high: string;
-  low: string;
-  close: string;
-  volume: string;
-}
-
-interface SerializedStats {
-  user: { orders: number; fills: number; volume: string };
-  bot: { orders: number; fills: number; volume: string };
-  tradersTotal: number;
-  latency: PublicStats["latency"];
-  updatedAtMs: number;
-}
-
-const serializeCandle = (candle: Candle): SerializedCandle => ({
-  startMs: candle.startMs,
-  open: money(candle.open),
-  high: money(candle.high),
-  low: money(candle.low),
-  close: money(candle.close),
-  volume: money(candle.volume),
-});
-
-const serializeStats = (stats: PublicStats): SerializedStats => ({
+const serializeStats = (stats: PublicStats) => ({
   user: { orders: stats.user.orders, fills: stats.user.fills, volume: money(stats.user.volume) },
   bot: { orders: stats.bot.orders, fills: stats.bot.fills, volume: money(stats.bot.volume) },
   tradersTotal: stats.tradersTotal,
@@ -68,45 +37,27 @@ export class Hub {
     return () => this.subscribers.delete(subscriber);
   }
 
-  private sendToMarket(market: MarketId, message: StreamMessage): void {
+  private send(message: StreamMessage, market?: MarketId): void {
     const payload = JSON.stringify(message);
     for (const subscriber of this.subscribers) {
-      if (subscriber.market === market) subscriber.send(payload);
+      if (market === undefined || subscriber.market === market) subscriber.send(payload);
     }
   }
 
   broadcastPrice(market: MarketId, price: bigint, publishedAtMs: number): void {
-    this.sendToMarket(market, { type: "price", market, price: money(price), publishedAtMs });
+    this.send({ type: "price", market, price: money(price), publishedAtMs }, market);
   }
 
   broadcastFill(fill: Fill): void {
-    this.sendToMarket(fill.market, {
-      type: "fill",
-      market: fill.market,
-      price: money(fill.price),
-      size: money(fill.size),
-      takerSide: fill.takerSide,
-      takerTag: tagString(fill.takerTag),
-      makerTag: tagString(fill.makerTag),
-      timestampMs: fill.timestampMs,
-      sequence: fill.sequence,
-    });
+    this.send({ type: "fill", ...serializeFill(fill) }, fill.market);
   }
 
   broadcastCandle(market: MarketId, interval: CandleInterval, candle: Candle): void {
-    this.sendToMarket(market, {
-      type: "candle",
-      market,
-      interval,
-      candle: serializeCandle(candle),
-    });
+    this.send({ type: "candle", market, interval, candle: serializeCandle(candle) }, market);
   }
 
+  /** Stats go to every subscriber, whatever its market. */
   broadcastStats(stats: PublicStats): void {
-    const payload = JSON.stringify({
-      type: "stats",
-      stats: serializeStats(stats),
-    } satisfies StreamMessage);
-    for (const subscriber of this.subscribers) subscriber.send(payload);
+    this.send({ type: "stats", stats: serializeStats(stats) });
   }
 }

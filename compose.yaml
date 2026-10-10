@@ -118,6 +118,7 @@ services:
       ROLLUP_URL: http://network:7799
       PRIVATE_URL: http://network:6699
       DEPOSIT_URL: http://network:7799
+      CUSTODY: sealed
       VALIDATOR: mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
       EXCHANGE_FLOAT_LAMPORTS: "200000000"
     volumes:

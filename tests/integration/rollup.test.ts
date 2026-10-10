@@ -1,20 +1,18 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { NVDAX_MINT, type RunningApp, SOL_MINT, startApp } from "../../src/app.js";
+import { prepareRequest, submitRequest } from "../../scripts/fund-client.js";
+import { type RunningApp, startApp } from "../../src/app.js";
 import { loadConfig } from "../../src/config/config.js";
-import { FixedPriceSource } from "../../src/prices/fixed-price-source.js";
-import {
-  Program,
-  type ProgramTrader,
-  firstOrderKeys,
-  publicConnection,
-} from "../../src/rollup/program.js";
+import { NVDAX_MINT, SOL_MINT } from "../../src/prices/mints.js";
+import { connectionTo } from "../../src/rollup/connections.js";
+import { Program, type ProgramTrader } from "../../src/rollup/program.js";
 import type { PublicDeployment } from "../../src/rollup/public-deployment.js";
 import { dollars } from "../helpers.js";
 import { CuttableProxy } from "./cuttable-proxy.js";
+import { FixedPriceSource } from "./fixed-price-source.js";
 
 const LOCALNET = process.env.ORDERBOOK_LOCALNET;
 if (!LOCALNET) throw new Error("Run this suite with `make test-rollup`.");
@@ -32,7 +30,7 @@ const REAL_SOL_PRICE = 139;
 const localFile = (name: string): string => readFileSync(join(LOCALNET, name), "utf8");
 const deployment = JSON.parse(localFile("deployment.json")) as { programId: string };
 const program = new Program(deployment.programId);
-const chain = publicConnection(ROLLUP_RPC_URL, ROLLUP_WS_URL);
+const chain = connectionTo(ROLLUP_RPC_URL, ROLLUP_WS_URL);
 /**
  * The service reaches the rollup only through this proxy, so a test can cut
  * its network. The test's own reads above go to the rollup directly.
@@ -102,24 +100,13 @@ interface User {
 
 const newUser = (): User => ({ owner: Keypair.generate() });
 
-const prepare = (user: User) =>
-  postJson("/v1/fund/prepare", {
-    owner: user.owner.publicKey.toBase58(),
-    orderKeys: firstOrderKeys(user.owner).map((key) => key.toBase58()),
-  });
+const prepare = (user: User) => postJson("/v1/fund/prepare", prepareRequest(user.owner));
 
-const signAndSubmit = (user: User, preparedTransaction: string) => {
-  const transaction = Transaction.from(Buffer.from(preparedTransaction, "base64"));
-  transaction.partialSign(user.owner);
-  return postJson("/v1/fund/submit", {
-    owner: user.owner.publicKey.toBase58(),
-    transaction: transaction
-      .serialize({ requireAllSignatures: false, verifySignatures: false })
-      .toString("base64"),
-  });
-};
+const signAndSubmit = (user: User, preparedTransaction: string) =>
+  postJson("/v1/fund/submit", submitRequest(user.owner, preparedTransaction));
 
-const DATA_DIR = join("data", `test-rollup-${Date.now()}`);
+/** A folder of its own, outside `data/`, so a run never touches a service's real snapshot. */
+const DATA_DIR = join("data-test", `rollup-${Date.now()}`);
 const botSeeds = Array.from({ length: 16 }, () => randomBytes(32).toString("hex")).join(",");
 
 const startService = async (): Promise<WarmUp> => {
@@ -176,6 +163,7 @@ afterAll(async () => {
   network.restore();
   await running?.close();
   await network.stop();
+  rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
 describe("the service on the real program (local network)", () => {
@@ -351,13 +339,9 @@ describe("the service on the real program (local network)", () => {
     const other = newUser();
     const prepared = await prepare(user);
     const forOther = await prepare(other);
-    const swapped = Transaction.from(Buffer.from(forOther.body.transaction, "base64"));
-    swapped.partialSign(other.owner);
     const refused = await postJson("/v1/fund/submit", {
+      ...submitRequest(other.owner, forOther.body.transaction),
       owner: user.owner.publicKey.toBase58(),
-      transaction: swapped
-        .serialize({ requireAllSignatures: false, verifySignatures: false })
-        .toString("base64"),
     });
     expect(refused.status).toBe(400);
     expect((await signAndSubmit(user, prepared.body.transaction)).status).toBe(200);

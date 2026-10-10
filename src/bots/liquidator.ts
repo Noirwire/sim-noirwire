@@ -3,14 +3,12 @@ import { liquidatorTraderKey } from "./bot-traders.js";
 
 export interface LiquidatorOptions {
   markets: MarketId[];
-  startingBalanceQuote: bigint;
+  startingQuoteBalance: bigint;
 }
 
 /**
- * Walks every known perpetual trader on every perp market and asks the
- * venue to liquidate anyone who qualifies. The venue itself is the only
- * place that decides eligibility (equity vs. maintenance margin) and the
- * execution price; this bot is just the scan loop that calls it.
+ * Asks the venue to liquidate each target on each perpetual market. The
+ * venue alone decides who qualifies and at what price; this is the scan loop.
  */
 export class Liquidator {
   private readonly trader = liquidatorTraderKey;
@@ -18,21 +16,17 @@ export class Liquidator {
 
   constructor(private readonly options: LiquidatorOptions) {}
 
-  async tick(venue: Venue, knownTraders: Iterable<TraderKey>): Promise<number> {
+  async tick(venue: Venue, targets: Iterable<TraderKey>): Promise<void> {
     if (!this.opened) {
       await venue.openTrader(this.trader);
-      await venue.deposit(this.trader, "nUSD", this.options.startingBalanceQuote);
+      await venue.deposit(this.trader, "nUSD", this.options.startingQuoteBalance);
       this.opened = true;
     }
 
-    let liquidations = 0;
     for (const market of this.options.markets) {
-      for (const target of knownTraders) {
-        if (target === this.trader) continue;
-        const liquidated = await venue.liquidate(this.trader, target, market);
-        if (liquidated) liquidations += 1;
+      for (const target of targets) {
+        if (target !== this.trader) await venue.liquidate(this.trader, target, market);
       }
     }
-    return liquidations;
   }
 }
