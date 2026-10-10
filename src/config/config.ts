@@ -93,7 +93,7 @@ const envSchema = z.object({
   SERVICE_LOCATION: z.string().default("unnamed machine"),
   PRICE_PUBLISH_INTERVAL_MS: positiveInt(2_000),
   ROLLUP_QUOTE_EXPIRY_SECONDS: positiveInt(30),
-  ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("25"),
+  ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("400"),
   ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),
   ROLLUP_TAKER_MAX_NUSD: decimalAmount("50"),
   LIQUIDATOR_SEATS_PER_TICK: positiveInt(4),
