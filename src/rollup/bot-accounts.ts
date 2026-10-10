@@ -37,6 +37,7 @@ export class BotAccounts {
   private readonly traders = new Map<TraderKey, ProgramTrader>();
   private readonly opening = new Map<TraderKey, Promise<ProgramTrader>>();
   private readonly funded = new Set<TraderKey>();
+  private closed = false;
 
   constructor(private readonly options: BotAccountsOptions) {}
 
@@ -74,6 +75,7 @@ export class BotAccounts {
     }
     const opened = await opening;
     this.traders.set(key, opened);
+    if (this.closed) opened.close();
     return opened;
   }
 
@@ -130,6 +132,7 @@ export class BotAccounts {
   }
 
   close(): void {
+    this.closed = true;
     for (const trader of this.traders.values()) trader.close();
   }
 }

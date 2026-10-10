@@ -444,6 +444,7 @@ const restoredKeys = (
 export class ProgramTrader {
   private client: TraderClient;
   private signInAgain = false;
+  private closed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private unsettled: Promise<unknown> = Promise.resolve();
 
@@ -475,8 +476,13 @@ export class ProgramTrader {
     );
   }
 
-  /** Lets go of the websocket and the timer the client holds once it has made a call. */
+  /**
+   * Lets go of the websocket and the timer the client holds once it has made
+   * a call, for good: the client starts both again on its next call, so a
+   * closed trader refuses every later one.
+   */
   close(): void {
+    this.closed = true;
     this.client.close();
   }
 
@@ -509,6 +515,7 @@ export class ProgramTrader {
       this.client = this.clientOn(connection);
       this.signInAgain = false;
     }
+    if (this.closed) throw new Error("this trader was closed");
     try {
       return await operation(this.client);
     } catch (error) {

@@ -35,3 +35,16 @@ export const every = (
     idle: () => running ?? Promise.resolve(),
   };
 };
+
+/**
+ * Resolves once every loop's run in flight has ended, or after `withinMs`,
+ * whichever is first: a run that is still going by then is abandoned.
+ */
+export const idleWithin = (loops: Repeating[], withinMs: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, withinMs);
+    void Promise.allSettled(loops.map((loop) => loop.idle())).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });

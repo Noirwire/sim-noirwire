@@ -185,7 +185,7 @@ export class RollupVenue implements Venue {
   async stop(): Promise<void> {
     this.publisher.stop();
     this.bots.close();
-    await this.feed.stop();
+    this.feed.stop();
   }
 
   private market(id: MarketId): RollupMarket {

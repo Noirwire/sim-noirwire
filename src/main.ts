@@ -2,7 +2,7 @@ import { startApp } from "./app.js";
 import { loadConfig } from "./config/config.js";
 
 /** A stop that is still waiting on something after this long exits anyway. */
-const STOP_WITHIN_MS = 20_000;
+const STOP_WITHIN_MS = 10_000;
 
 const main = async (): Promise<void> => {
   const running = await startApp(loadConfig());

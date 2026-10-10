@@ -10,6 +10,38 @@ export const connectionTo = (rpcUrl: string, wsUrl?: string): Connection =>
     fetch: fetchWithin(REQUEST_TIMEOUT_MS) as FetchFn,
   });
 
+/** The parts of a connection's websocket that web3.js 1.99.0 keeps to itself and offers no way to end. */
+interface WebsocketInternals {
+  _updateSubscriptions(): Promise<void>;
+  _rpcWebSocketHeartbeat: ReturnType<typeof setInterval> | null;
+  _rpcWebSocket: {
+    reconnect_timer_id?: ReturnType<typeof setTimeout>;
+    setAutoReconnect(reconnect: boolean): void;
+    close(): void;
+  };
+}
+
+/**
+ * Ends a connection's websocket for good: its subscriptions are dropped where
+ * they stand, the socket is closed and nothing opens another. The connection
+ * still answers requests.
+ *
+ * Invariant: the listeners are never removed one by one on the way out.
+ * `removeAccountChangeListener` on a socket that is closing but has not said
+ * so yet retries its unsubscribe request without ever yielding, which holds
+ * the event loop until the process runs out of memory.
+ */
+export const hangUp = (connection: Connection): void => {
+  const internals = connection as unknown as WebsocketInternals;
+  internals._updateSubscriptions = async () => {};
+  if (internals._rpcWebSocketHeartbeat) clearInterval(internals._rpcWebSocketHeartbeat);
+  internals._rpcWebSocketHeartbeat = null;
+  const socket = internals._rpcWebSocket;
+  socket.setAutoReconnect(false);
+  clearTimeout(socket.reconnect_timer_id);
+  socket.close();
+};
+
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
 /** This service moves test tokens only. It stops before sending anything if Solana is mainnet. */

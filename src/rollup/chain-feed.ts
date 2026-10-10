@@ -1,6 +1,7 @@
 import type { Connection } from "@solana/web3.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
-import type { ChainPrice, ChainStats, Unsubscribe } from "./chain-types.js";
+import type { ChainPrice, ChainStats } from "./chain-types.js";
+import { hangUp } from "./connections.js";
 import type { Program } from "./program.js";
 import { TapeTracker, type TapeUpdate } from "./tape-tracker.js";
 
@@ -23,8 +24,8 @@ const FIRST_READ_RETRY_MS = 2_000;
  */
 export class ChainFeed {
   private readonly trackers = new Map<number, TapeTracker>();
-  private readonly unsubscribes: Unsubscribe[] = [];
   private rereading: Repeating | null = null;
+  private stopped = false;
   private lastReadAtMs = 0;
 
   constructor(
@@ -57,15 +58,14 @@ export class ChainFeed {
   async start(): Promise<void> {
     const { program, connection, handlers } = this;
     await this.firstRead();
+    if (this.stopped) return;
     for (const [marketId, tracker] of this.trackers) {
-      this.unsubscribes.push(
-        program.subscribePrice(connection, marketId, (price) => handlers.onPrice(marketId, price)),
-        program.subscribeTape(connection, marketId, (tape) =>
-          handlers.onTape(marketId, tracker.take(tape), Date.now()),
-        ),
+      program.subscribePrice(connection, marketId, (price) => handlers.onPrice(marketId, price));
+      program.subscribeTape(connection, marketId, (tape) =>
+        handlers.onTape(marketId, tracker.take(tape), Date.now()),
       );
     }
-    this.unsubscribes.push(program.subscribeStats(connection, (stats) => handlers.onStats(stats)));
+    program.subscribeStats(connection, (stats) => handlers.onStats(stats));
     this.rereading = every(
       REREAD_INTERVAL_MS,
       () => this.readEverything(),
@@ -84,9 +84,10 @@ export class ChainFeed {
     this.lastReadAtMs = Date.now();
   }
 
-  async stop(): Promise<void> {
+  stop(): void {
+    this.stopped = true;
     this.rereading?.stop();
     this.rereading = null;
-    await Promise.allSettled(this.unsubscribes.map((unsubscribe) => unsubscribe()));
+    hangUp(this.connection);
   }
 }

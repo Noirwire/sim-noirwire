@@ -11,13 +11,13 @@ import { buildServer } from "./http/server.js";
 import { JupiterPriceSource } from "./prices/jupiter-price-source.js";
 import { MARKETS_PRICED_BY, NVDAX_MINT, SOL_MINT } from "./prices/mints.js";
 import type { PriceSource } from "./prices/price-source.js";
-import { type Repeating, every } from "./scheduling/repeating.js";
+import { type Repeating, every, idleWithin } from "./scheduling/repeating.js";
 import { startBots } from "./wiring/bots.js";
 import { memoryWiring } from "./wiring/memory-wiring.js";
 import { rollupWiring } from "./wiring/rollup-wiring.js";
 
 const STATS_BROADCAST_INTERVAL_MS = 2_000;
-const WAIT_FOR_LOOPS_ON_CLOSE_MS = 10_000;
+const WAIT_FOR_LOOPS_ON_CLOSE_MS = 2_000;
 
 export interface RunningApp {
   server: FastifyInstance;
@@ -123,6 +123,7 @@ export const startApp = async (
   const stopLoops = (): void => loops.forEach((loop) => loop.stop());
 
   let closed = false;
+  let closing: Promise<void> | null = null;
   const botsStarted = startBots(config, wiring, logError).then((botLoops) => {
     loops.push(...botLoops);
     if (closed) stopLoops();
@@ -133,20 +134,21 @@ export const startApp = async (
     server,
     port,
     botsStarted,
-    close: async () => {
-      closed = true;
-      stopLoops();
-      priceSource.stop();
-      // Invariant: a bot's order still on its way moves its order keys on, so
-      // the snapshot is taken once every loop has finished and the checkpoints
-      // are final. The wait is bounded: a stop must not depend on the network.
-      await Promise.race([
-        Promise.allSettled(loops.map((loop) => loop.idle())),
-        new Promise((resolve) => setTimeout(resolve, WAIT_FOR_LOOPS_ON_CLOSE_MS)),
-      ]);
-      await wiring.stop();
-      await saveSnapshot();
-      await server.close();
+    close: () => {
+      closing ??= (async () => {
+        closed = true;
+        stopLoops();
+        priceSource.stop();
+        // A bot's order still on its way moves its order keys on, so the loops
+        // get a moment to finish before the checkpoints are saved. A stop must
+        // not depend on the network: a run still going after that is abandoned,
+        // and a restart finds keys that moved past their checkpoint by search.
+        await idleWithin(loops, WAIT_FOR_LOOPS_ON_CLOSE_MS);
+        await wiring.stop();
+        await saveSnapshot();
+        await server.close();
+      })();
+      return closing;
     },
   };
 };
