@@ -111,8 +111,11 @@ types, so a new client release is an edit to that one file.
   keys. An order the client refuses before signing, or the program refuses after, comes
   back to the bot as a rejected order at once. Bots are topped up from the faucet to their starting
   balance, never above it, so a restart does not pay them twice. Every resting quote
-  carries a 30 second expiry of its own. Funding is advanced by the rollup's scheduler;
-  `updateFunding` sends the instruction only for a market that has none scheduled.
+  carries a 30 second expiry of its own.
+- **Funding.** This service advances it: `update_funding` for each perpetual once per
+  funding interval, sent right after a successful price publish. No rollup scheduler is
+  relied on, because the instruction fails on a stale price and a scheduled task that
+  met one failure is never called again. `/v1/health` counts the updates per market.
 - **Liquidation.** Nobody can read the ledger, so the liquidator tries a few seat numbers
   per tick, blind. An attempt on an empty seat reads the same as one on a healthy trader,
   so the sweep cannot see where the occupied seats end. It walks as many seats as this

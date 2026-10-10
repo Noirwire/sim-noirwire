@@ -225,7 +225,7 @@ const rollupWiring = async (
     },
     cancelAll: (trader, market) => venue.cancelAll(trader, market),
     traderState: (trader) => venue.traderState(trader),
-    updateFunding: (market) => venue.updateFunding(market),
+    updateFunding: () => venue.updateFunding(),
     liquidate: (liquidator, target, market) => venue.liquidate(liquidator, target, market),
     onFill: (listener) => venue.onFill(listener),
     stats: () => venue.stats(),
@@ -320,7 +320,13 @@ export const startApp = async (
 
   const wiring =
     config.VENUE === "rollup"
-      ? await rollupWiring(config, data, existingSnapshot, () => fundLedger.exportSnapshot().length)
+      ? await rollupWiring(
+          config,
+          data,
+          existingSnapshot,
+          // Seats opened by anything else (a set-up's own test traders) sit among ours.
+          () => fundLedger.exportSnapshot().length + config.LIQUIDATOR_EXTRA_SEATS,
+        )
       : memoryWiring(config, data);
   const { venue, botVenue } = wiring;
 

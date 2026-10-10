@@ -75,6 +75,9 @@ const envSchema = z.object({
   DEPOSIT_RPC_URL: z.string().optional(),
   DEPLOYMENT_JSON: z.string().optional(),
   DEPLOYMENT_PATH: z.string().optional(),
+  ORACLE_SECRET_KEY_FILE: z.string().optional(),
+  GATE_SECRET_KEY_FILE: z.string().optional(),
+  FAUCET_SECRET_KEY_FILE: z.string().optional(),
   ORACLE_SECRET_KEY: z.string().optional(),
   GATE_SECRET_KEY: z.string().optional(),
   FAUCET_SECRET_KEY: z.string().optional(),
@@ -89,6 +92,7 @@ const envSchema = z.object({
   ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),
   ROLLUP_TAKER_MAX_NUSD: decimalAmount("50"),
   LIQUIDATOR_SEATS_PER_TICK: intString(4),
+  LIQUIDATOR_EXTRA_SEATS: intString(8),
 });
 
 export type Config = z.infer<typeof envSchema>;

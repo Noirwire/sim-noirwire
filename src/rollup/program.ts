@@ -33,7 +33,7 @@ import {
   type View,
 } from "@noirwire/orderbook";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.3.1";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.4.0";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
@@ -62,6 +62,7 @@ export interface ChainMarket {
   maxMoveBps: number;
   minPublishGapSeconds: number;
   maxPriceAgeSeconds: number;
+  fundingIntervalSeconds: number;
   baseToken: number;
   quoteToken: number;
 }
@@ -364,6 +365,7 @@ export class Program {
       maxMoveBps: params.maxMoveBps,
       minPublishGapSeconds: params.minPublishGap,
       maxPriceAgeSeconds: Number(params.maxPriceAge),
+      fundingIntervalSeconds: Number(params.fundingInterval),
       baseToken: params.baseToken,
       quoteToken: params.quoteToken,
     };

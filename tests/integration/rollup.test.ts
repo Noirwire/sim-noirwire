@@ -278,9 +278,10 @@ describe("the service on the real program (local network)", () => {
     });
 
     it("is counted apart from the bots: user fills and bot fills each in their own bucket", async () => {
-      const stats = await eventually("a user fill and a bot fill in /v1/stats", async () => {
+      // The user order count follows the chain's public counter, which trails the bots' own by a moment.
+      const stats = await eventually("a user's fill and order beside the bots'", async () => {
         const { body } = await getJson("/v1/stats");
-        return body.fills.user >= 1 && body.fills.bot >= 1 && body;
+        return body.fills.user >= 1 && body.fills.bot >= 1 && body.orders.user >= 1 && body;
       });
       expect(Number(stats.volume.user)).toBeGreaterThan(0);
       expect(stats.orders.user).toBeGreaterThanOrEqual(1);

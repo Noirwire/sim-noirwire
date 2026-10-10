@@ -152,10 +152,11 @@ describe("following the tape by sequence number", () => {
     expect(late.lost).toBe(4n);
   });
 
-  it("starts over when the network was reset under it", () => {
+  it("ignores an older reading that arrives after a newer one, and repeats nothing after it", () => {
     const tracker = new TapeTracker();
     tracker.take(tapeOf(1, 2, 3, 4, 5));
-    expect(sequences(tracker.take(tapeOf(1, 2)).fills)).toEqual([1, 2]);
+    expect(tracker.take(tapeOf(1, 2, 3))).toEqual({ fills: [], lost: 0n });
+    expect(sequences(tracker.take(tapeOf(1, 2, 3, 4, 5, 6)).fills)).toEqual([6]);
   });
 });
 
@@ -349,6 +350,7 @@ describe("the public deployment description", () => {
     maxMoveBps: 250,
     minPublishGapSeconds: 1,
     maxPriceAgeSeconds: 10,
+    fundingIntervalSeconds: 60,
     baseToken,
     quoteToken: 0,
   });

@@ -108,13 +108,16 @@ export interface Readiness {
   connected: boolean;
   pricesFresh: boolean;
   botsFunded: boolean;
+  /** Per perpetual, how often this process has advanced its funding since it started. */
+  fundingUpdates: Record<MarketId, number>;
 }
 
 interface MarketState {
   config: MarketConfig;
   chain: ChainMarket;
   units: MarketUnits;
-  scheduledFunding: boolean;
+  fundingTriedAtMs: number;
+  fundingUpdates: number;
   price: ChainPrice | null;
   target: bigint | null;
   publishedAtMs: number;
@@ -220,7 +223,8 @@ export class RollupVenue implements Venue {
         config,
         chain,
         units: marketUnits(chain.baseLot, deployed[at]!.baseDecimals),
-        scheduledFunding: deployed[at]!.fundingTaskId !== undefined,
+        fundingTriedAtMs: 0,
+        fundingUpdates: 0,
         price: null,
         target: null,
         publishedAtMs: 0,
@@ -268,6 +272,8 @@ export class RollupVenue implements Venue {
 
   private acceptPrice(marketId: number, price: ChainPrice): void {
     const state = this.stateOfChainMarket(marketId);
+    // A plain read and a notification race: the older picture can arrive last.
+    if (state.price && price.publishTimeSeconds < state.price.publishTimeSeconds) return;
     const changed =
       !state.price ||
       state.price.price !== price.price ||
@@ -296,7 +302,8 @@ export class RollupVenue implements Venue {
 
   private acceptTape(marketId: number, update: TapeUpdate, readAtMs: number): void {
     const state = this.stateOfChainMarket(marketId);
-    if (update.lost > 0n) {
+    const firstReading = state.tapeCursor === 0;
+    if (update.lost > 0n && !firstReading) {
       this.options.handlers.onError(
         `${state.config.id}: ${update.lost} fills left the tape before they were read`,
         null,
@@ -331,6 +338,8 @@ export class RollupVenue implements Venue {
   }
 
   private acceptStats(stats: ChainStats): void {
+    // The counters only grow, so a smaller one is an older picture arriving late.
+    if (this.chainStats && stats.orders < this.chainStats.orders) return;
     this.chainStats = stats;
     this.options.handlers.onChainStats(stats);
   }
@@ -353,11 +362,43 @@ export class RollupVenue implements Venue {
         price,
       );
       state.publishedAtMs = Date.now();
+      void this.advanceFunding(state);
     } catch (error) {
       this.options.handlers.onError(`publishing the ${state.config.id} price`, error);
     } finally {
       state.publishing = false;
     }
+  }
+
+  /**
+   * Funding is advanced here, once per interval, right after a price was
+   * published: the instruction fails on a stale price, and a rollup scheduler
+   * that met one failure stops calling for good, so none is relied on.
+   */
+  private async advanceFunding(state: MarketState): Promise<void> {
+    const intervalMs = state.chain.fundingIntervalSeconds * 1000;
+    if (state.chain.kind !== "perp" || Date.now() - state.fundingTriedAtMs < intervalMs) return;
+    state.fundingTriedAtMs = Date.now();
+    try {
+      await this.options.program.updateFunding(
+        this.oracleConnection,
+        this.options.settings.oracle,
+        state.chain.marketId,
+      );
+      state.fundingUpdates += 1;
+    } catch (error) {
+      state.fundingTriedAtMs = 0;
+      this.options.handlers.onError(`advancing ${state.config.id} funding`, error);
+    }
+  }
+
+  /** How often this process has advanced each perpetual's funding. */
+  fundingUpdates(): Record<MarketId, number> {
+    const counts: Record<MarketId, number> = {};
+    for (const [market, state] of this.states) {
+      if (state.chain.kind === "perp") counts[market] = state.fundingUpdates;
+    }
+    return counts;
   }
 
   /** When this process saw the chain itself accept fills: the start of what the counters cover. */
@@ -400,6 +441,7 @@ export class RollupVenue implements Venue {
         );
       }),
       botsFunded: this.options.bots.every((bot) => this.funded.has(bot.key)),
+      fundingUpdates: this.fundingUpdates(),
     };
   }
 
@@ -676,16 +718,8 @@ export class RollupVenue implements Venue {
     return { trader, balances, positions, openOrders, equity };
   }
 
-  /** The rollup's own scheduler advances funding. Only a market without one is called here. */
-  async updateFunding(market: MarketId): Promise<void> {
-    const state = this.state(market);
-    if (state.scheduledFunding || state.chain.kind !== "perp") return;
-    await this.options.program.updateFunding(
-      this.oracleConnection,
-      this.options.settings.oracle,
-      state.chain.marketId,
-    );
-  }
+  /** Nothing to do on request: the publish loop advances funding right after a fresh price. */
+  async updateFunding(): Promise<void> {}
 
   /** The seats the liquidator tries next, as targets `liquidate` accepts. */
   nextLiquidationTargets(count: number): TraderKey[] {

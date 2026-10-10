@@ -20,6 +20,9 @@
 #                       machine), set up by a one-shot container, then the service
 #   make docker-down-all  stop and remove all of it
 #   make docker-test-all  docker-up-all, wait for health, smoke check, docker-down-all
+#   make devnet-start   run the built service against Solana devnet in the background, from
+#                       .env.devnet.local (docs/deploy.md); log and pid under data/devnet/
+#   make devnet-stop    stop it
 #   make clean          remove build and local-data leftovers
 #
 # ORDERBOOK_REPO is the order book repository beside this one. Its Makefile
@@ -35,7 +38,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 ORDERBOOK_REPO ?= ../orderbook-noirwire
-SDK_VERSION ?= 0.3.1
+SDK_VERSION ?= 0.4.0
 SDK_FILE := noirwire-orderbook-$(SDK_VERSION).tgz
 
 VENUE ?= memory
@@ -57,7 +60,7 @@ NETWORK_PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/n
 
 .PHONY: help install dev build start test test-rollup check format loadtest sdk-update \
 	network-up network-down docker-up docker-down docker-logs docker-test \
-	orderbook-outputs docker-up-all docker-down-all docker-test-all clean
+	orderbook-outputs docker-up-all docker-down-all docker-test-all devnet-start devnet-stop clean
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^ORDERBOOK_REPO is/,$$d'
@@ -149,6 +152,22 @@ docker-test-all: orderbook-outputs
 	trap '$(COMPOSE_ALL) --profile terminal down --volumes' EXIT; \
 	{ $(COMPOSE_ALL) up --build --detach --wait || { $(COMPOSE_ALL) logs --tail 40; exit 1; }; } && \
 	npx tsx scripts/smoke.ts --url http://127.0.0.1:$(ALL_SIM_HOST_PORT)
+
+# Its data folder holds the bots' order key checkpoints and the fund grants:
+# `make clean` would remove it, and the bots would then replace their keys.
+DEVNET_DIR := data/devnet
+DEVNET_PID := $(DEVNET_DIR)/sim.pid
+
+devnet-start: build
+	@[ -f .env.devnet.local ] || { echo ".env.devnet.local is missing: see docs/deploy.md, 'Run against devnet from this machine'." >&2; exit 1; }
+	@mkdir -p $(DEVNET_DIR)
+	@! { [ -f $(DEVNET_PID) ] && kill -0 $$(cat $(DEVNET_PID)) 2>/dev/null; } || { echo "Already running, pid $$(cat $(DEVNET_PID))." >&2; exit 1; }
+	nohup node --env-file .env.devnet.local dist/main.js >> $(DEVNET_DIR)/sim.log 2>&1 & echo $$! > $(DEVNET_PID)
+	@echo "Started, pid $$(cat $(DEVNET_PID)). Log: $(DEVNET_DIR)/sim.log"
+
+devnet-stop:
+	@[ -f $(DEVNET_PID) ] && kill $$(cat $(DEVNET_PID)) 2>/dev/null && echo "Stopped." || echo "Not running."
+	@rm -f $(DEVNET_PID)
 
 clean:
 	rm -rf dist coverage data loadtest-reports

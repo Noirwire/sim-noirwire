@@ -10,6 +10,8 @@ export interface ChainFeedHandlers {
 }
 
 const REREAD_INTERVAL_MS = 5_000;
+const FIRST_READ_ATTEMPTS = 5;
+const FIRST_READ_RETRY_MS = 2_000;
 
 /**
  * The public accounts of every market, followed over the rollup's websocket:
@@ -38,8 +40,21 @@ export class ChainFeed {
     return this.lastReadAtMs;
   }
 
+  /** One dropped request over the public internet must not decide whether the service starts. */
+  private async firstRead(): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.readEverything();
+      } catch (error) {
+        if (attempt === FIRST_READ_ATTEMPTS) throw error;
+        this.handlers.onError("the first read of the public accounts, trying again", error);
+        await new Promise((resolve) => setTimeout(resolve, FIRST_READ_RETRY_MS));
+      }
+    }
+  }
+
   async start(): Promise<void> {
-    await this.readEverything();
+    await this.firstRead();
     for (const marketId of this.marketIds) {
       this.unsubscribes.push(
         this.program.subscribePrice(this.connection, marketId, (price) =>

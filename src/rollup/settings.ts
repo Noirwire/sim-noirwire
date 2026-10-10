@@ -43,6 +43,9 @@ export interface RollupEnv {
   ORACLE_SECRET_KEY?: string;
   GATE_SECRET_KEY?: string;
   FAUCET_SECRET_KEY?: string;
+  ORACLE_SECRET_KEY_FILE?: string;
+  GATE_SECRET_KEY_FILE?: string;
+  FAUCET_SECRET_KEY_FILE?: string;
   BOT_TRADER_SEEDS?: string;
 }
 
@@ -100,15 +103,19 @@ const deploymentFrom = (env: RollupEnv): Deployment => {
   return deploymentSchema.parse(JSON.parse(raw));
 };
 
-const REQUIRED = [
-  "SOLANA_RPC_URL",
-  "ROLLUP_RPC_URL",
-  "ROLLUP_WS_URL",
-  "ORACLE_SECRET_KEY",
-  "GATE_SECRET_KEY",
-  "FAUCET_SECRET_KEY",
-  "BOT_TRADER_SEEDS",
-] as const;
+const REQUIRED = ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL", "BOT_TRADER_SEEDS"] as const;
+const KEYS = ["ORACLE_SECRET_KEY", "GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
+
+/** A role's secret key: the value itself, or the keypair file `<NAME>_FILE` points at. */
+const keyOf = (env: RollupEnv, name: (typeof KEYS)[number]): Keypair => {
+  const file = env[`${name}_FILE`];
+  if (env[name]) return secretKey(name, env[name]);
+  try {
+    return secretKey(`${name}_FILE`, readFileSync(file!, "utf8"));
+  } catch {
+    throw new Error(`${name}_FILE must be a readable keypair file`);
+  }
+};
 
 /**
  * Everything VENUE=rollup needs, checked before anything is sent: every
@@ -120,7 +127,10 @@ export const loadRollupSettings = (
   botCount: number,
   marketSymbols: string[],
 ): RollupSettings => {
-  const missing = REQUIRED.filter((name) => !env[name]);
+  const missing = [
+    ...REQUIRED.filter((name) => !env[name]),
+    ...KEYS.filter((name) => !env[name] && !env[`${name}_FILE`]),
+  ];
   if (missing.length > 0) throw new Error(`VENUE=rollup needs ${missing.join(", ")}`);
   for (const name of ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL"] as const) {
     if (!URL.canParse(env[name]!)) throw new Error(`${name} must be a URL`);
@@ -134,9 +144,9 @@ export const loadRollupSettings = (
   }
 
   const roles = {
-    oracle: secretKey("ORACLE_SECRET_KEY", env.ORACLE_SECRET_KEY!),
-    gate: secretKey("GATE_SECRET_KEY", env.GATE_SECRET_KEY!),
-    faucet: secretKey("FAUCET_SECRET_KEY", env.FAUCET_SECRET_KEY!),
+    oracle: keyOf(env, "ORACLE_SECRET_KEY"),
+    gate: keyOf(env, "GATE_SECRET_KEY"),
+    faucet: keyOf(env, "FAUCET_SECRET_KEY"),
   };
   for (const [role, key] of Object.entries(roles)) {
     if (key.publicKey.toBase58() !== deployment[role as keyof typeof roles]) {
