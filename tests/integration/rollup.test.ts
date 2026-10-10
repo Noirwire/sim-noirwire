@@ -241,6 +241,8 @@ describe("the service on the real program (local network)", () => {
     const user = newUser();
     let trader: ProgramTrader;
 
+    afterAll(() => trader?.close());
+
     it("ends with the 5,000 nUSD grant as collateral in their own private view", async () => {
       const prepared = await prepare(user);
       expect(prepared.status).toBe(200);

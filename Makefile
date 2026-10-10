@@ -38,7 +38,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 ORDERBOOK_REPO ?= ../orderbook-noirwire
-SDK_VERSION ?= 0.4.0
+SDK_VERSION ?= 0.5.0
 SDK_FILE := noirwire-orderbook-$(SDK_VERSION).tgz
 
 VENUE ?= memory

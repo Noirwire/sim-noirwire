@@ -350,6 +350,7 @@ export async function main(): Promise<void> {
   // clock passes its expiry: the report waits until every one has settled.
   await Promise.allSettled(settling);
   await keep(deployment.programId, traders);
+  for (const { trader } of traders) trader.close();
 
   const fillsOnChain = Number((await program.stats(chain)).fills - fillsBefore);
   await new Promise((resolve) => setTimeout(resolve, TAPE_CATCH_UP_MS));

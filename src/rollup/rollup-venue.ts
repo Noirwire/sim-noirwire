@@ -245,6 +245,7 @@ export class RollupVenue implements Venue {
   async stop(): Promise<void> {
     if (this.publishTimer) clearInterval(this.publishTimer);
     this.publishTimer = null;
+    for (const trader of this.traders.values()) trader.close();
     await this.feed.stop();
   }
 

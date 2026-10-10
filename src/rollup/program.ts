@@ -41,7 +41,7 @@ import {
   type View,
 } from "@noirwire/orderbook";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.4.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.5.0";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
@@ -711,6 +711,11 @@ export class ProgramTrader {
   /** How many instructions the caller keeps in flight at once: one unless set, four at most. */
   inFlightLimit = 1;
 
+  /** Lets go of the websocket and the timer the client holds once it has made a call. */
+  close(): void {
+    this.client.close();
+  }
+
   get address(): string {
     return this.owner.publicKey.toBase58();
   }
@@ -753,6 +758,8 @@ export class ProgramTrader {
       if (waitForUnknown) await this.unsettled;
       if (this.signInAgain) {
         const connection = await signedInConnection(this.rpcUrl, this.owner);
+        // The old client holds a websocket on the old token: results are pushed over it.
+        this.client.close();
         this.client = new TraderClient(
           connection,
           connection,
