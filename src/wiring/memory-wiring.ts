@@ -7,6 +7,7 @@ const MAKER_LEVEL_LOTS = 5n;
 const TAKER_MIN_LOTS = 1n;
 const TAKER_MAX_LOTS = 20n;
 
+/** Nothing here leaves the process, so there is nothing to rest: it is always awake. */
 export const memoryWiring = (config: Config, data: PublicData): VenueWiring => {
   const venue = new MemoryVenue({
     insuranceSeedBalance: config.INSURANCE_SEED_NUSD,
@@ -17,6 +18,9 @@ export const memoryWiring = (config: Config, data: PublicData): VenueWiring => {
     venue,
     botVenue: withBotTracking(venue, data.stats),
     rollupRoutes: {},
+    prepare: async () => {},
+    resume: async () => {},
+    rest: async () => {},
     botSizes: async (market) => ({
       makerLevel: market.lotSize * MAKER_LEVEL_LOTS,
       takerMin: market.lotSize * TAKER_MIN_LOTS,

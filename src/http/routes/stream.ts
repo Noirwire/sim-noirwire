@@ -7,7 +7,10 @@ const POLICY_VIOLATION = 1008;
 
 const querySchema = z.object({ market: marketId });
 
-/** `WS /v1/stream?market=<id>`: price, fill, candle and stats messages for one market. */
+/**
+ * `WS /v1/stream?market=<id>`: price, fill, candle and stats messages for one
+ * market. The service stays awake while any of these sockets is open.
+ */
 export const registerStreamRoute = (app: FastifyInstance, ctx: AppContext): void => {
   app.get("/v1/stream", { websocket: true }, (socket, request) => {
     const parsed = querySchema.safeParse(request.query);
@@ -18,6 +21,10 @@ export const registerStreamRoute = (app: FastifyInstance, ctx: AppContext): void
     const unsubscribe = ctx.hub.subscribe(parsed.data.market, (payload) => {
       if (socket.readyState === socket.OPEN) socket.send(payload);
     });
-    socket.on("close", unsubscribe);
+    const released = ctx.activity.socketOpened();
+    socket.on("close", () => {
+      unsubscribe();
+      released();
+    });
   });
 };

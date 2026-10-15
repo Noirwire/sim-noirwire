@@ -1,14 +1,72 @@
 import { Connection, type FetchFn } from "@solana/web3.js";
+import { ROLLUP_BACKOFF, backoffDelayMs } from "../scheduling/backoff.js";
+import type { Generation } from "./generation.js";
 import { REQUEST_TIMEOUT_MS, fetchWithin } from "./timeouts.js";
 import { ProgramRefused } from "./transactions.js";
 
-/** A connection whose every request is given up after `REQUEST_TIMEOUT_MS`. */
-export const connectionTo = (rpcUrl: string, wsUrl?: string): Connection =>
-  new Connection(rpcUrl, {
+/** The reconnecting websocket web3.js 1.99.0 keeps to itself: only what the backoff needs of it. */
+interface ReconnectingSocket {
+  on(event: "open" | "close" | "error", listener: () => void): unknown;
+  setReconnectInterval(intervalMs: number): void;
+}
+
+/**
+ * Makes a connection's websocket wait longer after each failed reconnect.
+ * web3.js retries every second for ever, which against an endpoint that
+ * refuses us is a request a second; this makes it 5 s, 10 s, 20 s and so on
+ * up to 5 minutes, and back to 5 s once a socket has opened.
+ *
+ * Invariant: the retry timer reads the interval when it is set, which is
+ * before the socket's `close` or `error` event reaches these listeners, so
+ * the interval set here is the one the retry after the next failure waits.
+ * A socket that never opened reports an `error` and no `close`; one that
+ * opened reports a `close`, so each failure is counted once.
+ */
+export const backOffReconnects = (connection: Connection): void => {
+  const socket = (connection as unknown as { _rpcWebSocket: ReconnectingSocket })._rpcWebSocket;
+  let failures = 0;
+  let open = false;
+  const failed = (): void => {
+    failures += 1;
+    socket.setReconnectInterval(backoffDelayMs(failures + 1));
+  };
+  socket.setReconnectInterval(ROLLUP_BACKOFF.baseMs);
+  socket.on("open", () => {
+    open = true;
+    failures = 0;
+    socket.setReconnectInterval(ROLLUP_BACKOFF.baseMs);
+  });
+  socket.on("error", () => {
+    if (!open) failed();
+  });
+  socket.on("close", () => {
+    open = false;
+    failed();
+  });
+};
+
+/**
+ * A connection whose every request is given up after `REQUEST_TIMEOUT_MS` and
+ * whose websocket, if it opens one, backs off when the endpoint refuses it.
+ * It belongs to `life`: once that generation ends, a request in flight is
+ * aborted and a later one is refused without being sent (or, with
+ * `hangWhenEnded`, never answered), so whatever polls on the connection, a
+ * confirmation or an order's result, stops sending whatever code runs it.
+ */
+export const connectionTo = (
+  rpcUrl: string,
+  wsUrl?: string,
+  life?: Generation,
+  hangWhenEnded = false,
+): Connection => {
+  const connection = new Connection(rpcUrl, {
     commitment: "confirmed",
     wsEndpoint: wsUrl,
-    fetch: fetchWithin(REQUEST_TIMEOUT_MS) as FetchFn,
+    fetch: fetchWithin(REQUEST_TIMEOUT_MS, undefined, life, hangWhenEnded) as FetchFn,
   });
+  backOffReconnects(connection);
+  return connection;
+};
 
 /** The parts of a connection's websocket that web3.js 1.99.0 keeps to itself and offers no way to end. */
 interface WebsocketInternals {
@@ -44,12 +102,18 @@ export const hangUp = (connection: Connection): void => {
 
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
+/** Solana is mainnet. No wait cures it: the service does not start. */
+export class MainnetRefused extends Error {
+  constructor() {
+    super("SOLANA_RPC_URL is mainnet. This service never runs there.");
+    this.name = "MainnetRefused";
+  }
+}
+
 /** This service moves test tokens only. It stops before sending anything if Solana is mainnet. */
 export const refuseMainnet = async (solanaRpcUrl: string): Promise<void> => {
   const genesis = await connectionTo(solanaRpcUrl).getGenesisHash();
-  if (genesis === MAINNET_GENESIS) {
-    throw new Error("SOLANA_RPC_URL is mainnet. This service never runs there.");
-  }
+  if (genesis === MAINNET_GENESIS) throw new MainnetRefused();
 };
 
 /**
@@ -71,6 +135,11 @@ export class Session {
       throw error;
     });
     return this.current;
+  }
+
+  /** Opens a new connection on the next use: a sign-in token may have run out while nothing used it. */
+  renew(): void {
+    this.current = null;
   }
 
   /** Runs `work` on the connection, and opens a new one next time unless the program itself gave the answer. */

@@ -13,11 +13,25 @@ import { registerStatsRoute } from "./routes/stats.js";
 import { registerStreamRoute } from "./routes/stream.js";
 import { registerTapeRoute } from "./routes/tape.js";
 
+declare module "fastify" {
+  interface FastifyContextConfig {
+    /** False on a route whose requests are no reason for the service to be busy. */
+    wakes?: boolean;
+  }
+}
+
 export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => {
   const app = Fastify({ logger: false });
 
   await app.register(cors, { origin: ctx.config.ALLOWED_ORIGINS });
   await app.register(websocket);
+
+  // Any request that reaches a route of the public API wakes the service. A
+  // path that matches none (a scanner's probe) and the health route do not.
+  app.addHook("onRequest", async (request) => {
+    if (request.is404 || request.routeOptions.config.wakes === false) return;
+    ctx.activity.touch();
+  });
 
   registerHealthRoute(app, ctx);
   if (ctx.deployment) registerDeploymentRoute(app, ctx.deployment);

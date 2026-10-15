@@ -28,6 +28,15 @@ export interface VenueWiring {
   /** The venue as the bots use it, with their orders counted as bot activity. */
   botVenue: Venue;
   rollupRoutes: Partial<RollupRoutes>;
+  /**
+   * Reaches the network and starts following it, before anything else. Safe
+   * to repeat after a failure, and the caller does repeat it, with a growing wait.
+   */
+  prepare(): Promise<void>;
+  /** Starts what sends to the network and listens to it: the price publisher, the feed. Safe to repeat. */
+  resume(sourceNotBeforeMs: number): Promise<void>;
+  /** Stops all of that. Sends nothing more, and resolves once what was in flight has ended (or a moment later). */
+  rest(): Promise<void>;
   botSizes(market: MarketConfig): Promise<BotSizes>;
   liquidationTargets(): TraderKey[];
   /** Runs once every maker is open and funded, before the first bot tick. */

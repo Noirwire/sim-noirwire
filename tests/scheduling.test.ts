@@ -28,7 +28,7 @@ describe("a repeating task", () => {
     loop.stop();
   });
 
-  it("hands a failed run to its failure handler and runs again on the next turn", async () => {
+  it("hands a failed run to its failure handler and runs again after the pause", async () => {
     const failures: unknown[] = [];
     let runs = 0;
     const loop = every(
@@ -40,8 +40,10 @@ describe("a repeating task", () => {
       (error) => failures.push(error),
     );
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(failures).toHaveLength(1);
+    expect(runs).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(runs).toBe(2);
     loop.stop();
   });

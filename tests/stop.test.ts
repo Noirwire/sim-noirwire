@@ -1,12 +1,12 @@
 import type { Connection } from "@solana/web3.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChainFeed } from "../src/rollup/chain-feed.js";
+import { ChainFeed, REREAD_INTERVAL_MS } from "../src/rollup/chain-feed.js";
 import type { Program } from "../src/rollup/program.js";
 import { every, idleWithin } from "../src/scheduling/repeating.js";
 
 const RECONNECT_MS = 1_000;
 const HEARTBEAT_MS = 5_000;
-const REREAD_MS = 5_000;
+const REREAD_MS = REREAD_INTERVAL_MS;
 const A_LONG_TIME_MS = 120_000;
 
 /**
@@ -95,13 +95,14 @@ const fakeProgram = (connection: FakeConnection) => {
 const startedFeed = async () => {
   const connection = new FakeConnection();
   const { program, reads, hang } = fakeProgram(connection);
-  const feed = new ChainFeed(program, connection.asConnection, [0, 1], {
+  const feed = new ChainFeed(program, () => connection.asConnection, [0, 1], {
     onPrice: () => {},
     onTape: () => {},
     onStats: () => {},
     onError: () => {},
+    onRecovered: () => {},
   });
-  await feed.start();
+  await feed.follow();
   return { connection, feed, reads, hang };
 };
 
@@ -172,18 +173,66 @@ describe("stopping", () => {
     const connection = new FakeConnection();
     const { program, reads, hang } = fakeProgram(connection);
     hang();
-    const feed = new ChainFeed(program, connection.asConnection, [0], {
+    const feed = new ChainFeed(program, () => connection.asConnection, [0], {
       onPrice: () => {},
       onTape: () => {},
       onStats: () => {},
       onError: () => {},
+      onRecovered: () => {},
     });
-    void feed.start();
+    void feed.follow();
 
     feed.stop();
 
     expect(connection.subscriptions).toBe(0);
     await expectNothingLeftRunning(connection, reads);
+  });
+
+  it("subscribes to nothing and holds no socket after a first read the rollup refuses, and follows once a retry works", async () => {
+    const connections: FakeConnection[] = [];
+    let refuse = true;
+    const program = {
+      price: async () => {
+        if (refuse) throw new Error("403 Forbidden");
+        return NO_PRICE;
+      },
+      tape: async () => NO_TAPE,
+      stats: async () => NO_STATS,
+      subscribePrice: () => () => {},
+      subscribeTape: () => () => {},
+      subscribeStats: () => () => {},
+    } as unknown as Program;
+    const feed = new ChainFeed(
+      program,
+      () => {
+        const connection = new FakeConnection();
+        connections.push(connection);
+        return connection.asConnection;
+      },
+      [0],
+      {
+        onPrice: () => {},
+        onTape: () => {},
+        onStats: () => {},
+        onError: () => {},
+        onRecovered: () => {},
+      },
+    );
+
+    await expect(feed.follow()).rejects.toThrow("403 Forbidden");
+    expect(connections[0]?.closes).toBe(1);
+    expect(connections[0]?.open).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    refuse = false;
+    await feed.follow();
+    expect(connections).toHaveLength(2);
+    expect(connections[1]?.open).toBe(true);
+
+    feed.pause();
+    expect(connections[1]?.open).toBe(false);
+    await vi.advanceTimersByTimeAsync(A_LONG_TIME_MS);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("gives the loops' runs in flight a bounded time and then abandons them", async () => {

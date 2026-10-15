@@ -1,4 +1,5 @@
 import type { Connection } from "@solana/web3.js";
+import { InFlight } from "../scheduling/in-flight.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import type { ChainPrice, ChainStats } from "./chain-types.js";
 import { hangUp } from "./connections.js";
@@ -10,27 +11,34 @@ export interface ChainFeedHandlers {
   onTape(marketId: number, update: TapeUpdate, readAtMs: number): void;
   onStats(stats: ChainStats): void;
   onError(what: string, error: unknown): void;
+  onRecovered(what: string): void;
 }
 
-const REREAD_INTERVAL_MS = 5_000;
-const FIRST_READ_ATTEMPTS = 5;
-const FIRST_READ_RETRY_MS = 2_000;
+/** How often every account is read in full, as the safety net under the websocket. */
+export const REREAD_INTERVAL_MS = 60_000;
+const REREAD_FAILING = "reading the public accounts";
 
 /**
  * The public accounts of every market, followed over the rollup's websocket:
  * the tape, the price feed and the stats. A websocket drops notifications
  * while it reconnects, so every account is also read in full on an interval;
  * the tape tracker turns either source into each fill exactly once.
+ *
+ * Following can be paused and resumed: pausing ends the websocket for good
+ * and stops every read, so a paused feed sends nothing, and resuming opens a
+ * new connection and reads everything again.
  */
 export class ChainFeed {
   private readonly trackers = new Map<number, TapeTracker>();
+  private connection: Connection | null = null;
+  private readonly reads = new InFlight();
   private rereading: Repeating | null = null;
   private stopped = false;
   private lastReadAtMs = 0;
 
   constructor(
     private readonly program: Program,
-    private readonly connection: Connection,
+    private readonly connect: () => Connection,
     marketIds: number[],
     private readonly handlers: ChainFeedHandlers,
   ) {
@@ -42,23 +50,24 @@ export class ChainFeed {
     return this.lastReadAtMs;
   }
 
-  /** One dropped request over the public internet must not decide whether the service starts. */
-  private async firstRead(): Promise<void> {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        return await this.readEverything();
-      } catch (error) {
-        if (attempt === FIRST_READ_ATTEMPTS) throw error;
-        this.handlers.onError("the first read of the public accounts, trying again", error);
-        await new Promise((resolve) => setTimeout(resolve, FIRST_READ_RETRY_MS));
-      }
+  /**
+   * Reads everything once, then subscribes and starts the safety-net reads.
+   * Throws, having subscribed to nothing, when the first read fails: the
+   * caller decides when to try again. Does nothing while already following.
+   */
+  async follow(): Promise<void> {
+    if (this.connection || this.stopped) return;
+    const { program, handlers } = this;
+    const connection = this.connect();
+    this.connection = connection;
+    try {
+      await this.read(connection);
+    } catch (error) {
+      if (this.connection === connection) this.pause();
+      throw error;
     }
-  }
-
-  async start(): Promise<void> {
-    const { program, connection, handlers } = this;
-    await this.firstRead();
-    if (this.stopped) return;
+    // Paused or stopped while the first read was under way: that already ended the connection.
+    if (this.connection !== connection) return;
     for (const [marketId, tracker] of this.trackers) {
       program.subscribePrice(connection, marketId, (price) => handlers.onPrice(marketId, price));
       program.subscribeTape(connection, marketId, (tape) =>
@@ -68,26 +77,53 @@ export class ChainFeed {
     program.subscribeStats(connection, (stats) => handlers.onStats(stats));
     this.rereading = every(
       REREAD_INTERVAL_MS,
-      () => this.readEverything(),
-      (error) => handlers.onError("reading the public accounts", error),
+      () => this.read(connection),
+      (error) => handlers.onError(REREAD_FAILING, error),
+      () => handlers.onRecovered(REREAD_FAILING),
     );
   }
 
-  private async readEverything(): Promise<void> {
-    const { program, connection, handlers } = this;
+  private read(connection: Connection): Promise<void> {
+    return this.reads.track(this.readEverything(connection));
+  }
+
+  /** A read stops asking for more as soon as its connection was ended. */
+  private async readEverything(connection: Connection): Promise<void> {
+    const { program, handlers } = this;
+    const live = (): boolean => this.connection === connection;
     for (const [marketId, tracker] of this.trackers) {
-      handlers.onPrice(marketId, await program.price(connection, marketId));
+      const price = await program.price(connection, marketId);
+      if (!live()) return;
+      handlers.onPrice(marketId, price);
       const readAtMs = Date.now();
-      handlers.onTape(marketId, tracker.take(await program.tape(connection, marketId)), readAtMs);
+      const tape = await program.tape(connection, marketId);
+      if (!live()) return;
+      handlers.onTape(marketId, tracker.take(tape), readAtMs);
     }
-    handlers.onStats(await program.stats(connection));
+    const stats = await program.stats(connection);
+    if (!live()) return;
+    handlers.onStats(stats);
     this.lastReadAtMs = Date.now();
+  }
+
+  /** Resolves once every read in flight has ended. */
+  idle(): Promise<void> {
+    return this.reads.idle();
+  }
+
+  /**
+   * Ends the websocket and every read until `follow` is called again. A read
+   * in flight asks for nothing more; `idle` tells when it has ended.
+   */
+  pause(): void {
+    this.rereading?.stop();
+    this.rereading = null;
+    if (this.connection) hangUp(this.connection);
+    this.connection = null;
   }
 
   stop(): void {
     this.stopped = true;
-    this.rereading?.stop();
-    this.rereading = null;
-    hangUp(this.connection);
+    this.pause();
   }
 }

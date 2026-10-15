@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { Activity, type Lifecycle } from "./activity/activity.js";
 import type { Config } from "./config/config.js";
 import { CandleAggregator } from "./data/candles.js";
 import { FundLedger } from "./data/fund-ledger.js";
@@ -8,21 +9,34 @@ import { TapeStore } from "./data/tape-store.js";
 import { systemClock } from "./engine/clock.js";
 import { Hub } from "./http/hub.js";
 import { buildServer } from "./http/server.js";
+import { firstLine } from "./logging/first-line.js";
+import { ProblemLog } from "./logging/problem-log.js";
 import { JupiterPriceSource } from "./prices/jupiter-price-source.js";
 import { MARKETS_PRICED_BY, NVDAX_MINT, SOL_MINT } from "./prices/mints.js";
 import type { PriceSource } from "./prices/price-source.js";
+import { MainnetRefused } from "./rollup/connections.js";
+import { waitFor } from "./scheduling/backoff.js";
 import { type Repeating, every, idleWithin } from "./scheduling/repeating.js";
-import { startBots } from "./wiring/bots.js";
+import { StartUp } from "./scheduling/start-up.js";
+import { openBots } from "./wiring/bots.js";
 import { memoryWiring } from "./wiring/memory-wiring.js";
 import { rollupWiring } from "./wiring/rollup-wiring.js";
 
 const STATS_BROADCAST_INTERVAL_MS = 2_000;
 const WAIT_FOR_LOOPS_ON_CLOSE_MS = 2_000;
+/** Jupiter is not the rollup, but there is no reason to ask it for prices nobody is using. */
+const ASLEEP_PRICE_POLL_INTERVAL_MS = 60_000;
+/** A wake waits this long for the price source's answer before it publishes. */
+const WAIT_FOR_FRESH_PRICE_MS = 6_000;
 
 export interface RunningApp {
   server: FastifyInstance;
   port: number;
-  /** Resolves once the bots are open and funded and their loops run. */
+  /**
+   * Resolves once the start-up work is done: the bots are open and funded.
+   * Rejects only for a failure no wait will cure. A rollup that refuses or
+   * is away is not one: the start-up work is retried, and the API answers meanwhile.
+   */
   botsStarted: Promise<void>;
   close(): Promise<void>;
 }
@@ -31,17 +45,19 @@ interface AppOverrides {
   priceSource?: PriceSource;
 }
 
-const logError = (what: string, error: unknown): void => {
-  const detail = error instanceof Error ? error.message.split("\n")[0] : (error ?? "");
-  console.error(`sim-noirwire: ${what}`, detail);
-};
-
 const latencyLabel = (config: Config): string | undefined =>
   config.VENUE === "rollup"
     ? `a bot's order, from its send to the result in its private view, measured from ${config.SERVICE_LOCATION}`
     : undefined;
 
-/** Wires the venue, the bots, the price source and the HTTP server, and starts them all. */
+/**
+ * Wires the venue, the bots, the price source and the HTTP server, and starts them all.
+ *
+ * With VENUE=rollup the service is busy only while somebody wants it to be:
+ * after its one-time start-up work it sleeps, sending nothing to the rollup,
+ * until a request or a stream socket wakes it (see `Activity`). With
+ * VENUE=memory nothing leaves the process, so it never sleeps.
+ */
 export const startApp = async (
   config: Config,
   overrides: AppOverrides = {},
@@ -66,29 +82,23 @@ export const startApp = async (
     console.log(`sim-noirwire: loaded snapshot from ${new Date(snapshot.savedAtMs).toISOString()}`);
   }
 
+  const problems = new ProblemLog((line) => console.error(line));
+  const logError = (what: string, error: unknown): void => problems.failed(what, error);
+  const logRecovered = (what: string): void => problems.recovered(what);
+
   const wiring =
     config.VENUE === "rollup"
-      ? await rollupWiring({
+      ? rollupWiring({
           config,
           data,
           snapshot,
           // Seats opened by anything else (a set-up's own test traders) sit among ours.
           usersEverOpened: () => fundLedger.grantCount + config.LIQUIDATOR_EXTRA_SEATS,
           onError: logError,
+          onRecovered: logRecovered,
+          onUnreachable: () => activity.unreachable(),
         })
       : memoryWiring(config, data);
-
-  const server = await buildServer({
-    config,
-    venue: wiring.venue,
-    ...data,
-    fundLedger,
-    ...wiring.rollupRoutes,
-  });
-  await server.listen({ port: config.PORT, host: config.HOST });
-  const address = server.server.address();
-  const port = typeof address === "object" && address ? address.port : config.PORT;
-  console.log(`sim-noirwire: listening on http://${config.HOST}:${port} (venue=${config.VENUE})`);
 
   const priceSource =
     overrides.priceSource ??
@@ -96,13 +106,10 @@ export const startApp = async (
       ids: [SOL_MINT, NVDAX_MINT],
       baseUrl: config.JUPITER_BASE_URL,
       pollIntervalMs: config.JUPITER_POLL_INTERVAL_MS,
-      onError: (error) => logError("price poll failed", error),
+      slowPollIntervalMs: ASLEEP_PRICE_POLL_INTERVAL_MS,
+      onError: (error) => logError("polling Jupiter prices", error),
+      onRecovered: () => logRecovered("polling Jupiter prices"),
     });
-  priceSource.start((point) => {
-    for (const market of MARKETS_PRICED_BY[point.id] ?? []) {
-      wiring.acceptPricePoint(market, point.price, point.atMs);
-    }
-  });
 
   const saveSnapshot = (): Promise<void> =>
     snapshotStore.save({
@@ -112,23 +119,124 @@ export const startApp = async (
       ...wiring.snapshotExtras(),
     });
 
+  /** Run for as long as the service lives, asleep or not: they send nothing to the rollup. */
   const loops: Repeating[] = [
     every(
       STATS_BROADCAST_INTERVAL_MS,
       () => data.hub.broadcastStats(data.stats.snapshot(Date.now())),
-      (error) => logError("stats broadcast failed", error),
+      (error) => logError("broadcasting stats", error),
+      () => logRecovered("broadcasting stats"),
     ),
-    every(config.SNAPSHOT_INTERVAL_MS, saveSnapshot, (error) => logError("snapshot failed", error)),
+    every(
+      config.SNAPSHOT_INTERVAL_MS,
+      saveSnapshot,
+      (error) => logError("saving the snapshot", error),
+      () => logRecovered("saving the snapshot"),
+    ),
   ];
-  const stopLoops = (): void => loops.forEach((loop) => loop.stop());
+  /** The bots' loops: run only while the service is awake. */
+  let awakeLoops: Repeating[] = [];
+  const stopAwakeLoops = async (): Promise<void> => {
+    const running = awakeLoops;
+    awakeLoops = [];
+    for (const loop of running) loop.stop();
+    // A bot's order still on its way moves its order keys on, so the loops get a moment to finish.
+    await idleWithin(running, WAIT_FOR_LOOPS_ON_CLOSE_MS);
+  };
 
   let closed = false;
   let closing: Promise<void> | null = null;
-  const botsStarted = startBots(config, wiring, logError).then((botLoops) => {
-    loops.push(...botLoops);
-    if (closed) stopLoops();
+  let startBotLoops: (() => Repeating[]) | null = null;
+
+  const startUp = new StartUp({
+    work: async () => {
+      await wiring.prepare();
+      startBotLoops = await openBots(config, wiring, {
+        onError: logError,
+        onRecovered: logRecovered,
+      });
+    },
+    wanted: () => activity.wanted(),
+    cleanup: () => wiring.rest(),
+    isFatal: (error) => error instanceof MainnetRefused,
+    onFailure: (error, failures, retryInMs) =>
+      console.error(
+        `sim-noirwire: start-up failed (try ${failures}), trying again in ${Math.round(retryInMs / 1_000)} s: ${firstLine(error)}`,
+      ),
   });
+
+  const lifecycle: Lifecycle = {
+    wake: async () => {
+      await startUp.attemptEnded();
+      if (!startUp.ready || closed || !startBotLoops) {
+        throw new Error(startUp.problem ?? "the service has not finished starting");
+      }
+      try {
+        const wakeStartedAtMs = Date.now();
+        priceSource.setPace("fast");
+        // The first publish needs a price the source delivered during this wake, not one cached before it.
+        const delivered = await Promise.race([
+          priceSource.pollNow(),
+          waitFor(WAIT_FOR_FRESH_PRICE_MS).then(() => false),
+        ]);
+        if (!delivered) throw new Error("the price source did not deliver prices");
+        await wiring.resume(wakeStartedAtMs);
+      } catch (error) {
+        // A wake that failed must not leave a feed or a publisher running while it waits to try again.
+        await wiring.rest();
+        throw error;
+      }
+      if (!closed && awakeLoops.length === 0) awakeLoops = startBotLoops();
+      console.log("sim-noirwire: awake");
+    },
+    sleep: async () => {
+      await stopAwakeLoops();
+      priceSource.setPace("slow");
+      await wiring.rest();
+      console.log(
+        "sim-noirwire: asleep, sending nothing to the rollup until a request or a stream socket wakes it",
+      );
+    },
+  };
+  const activity = new Activity({
+    lifecycle,
+    idleAfterMs: config.IDLE_AFTER_MS,
+    onError: logError,
+    onDemand: () => startUp.demand(),
+  });
+
+  // The start-up work runs while the API is already answering.
+  startUp.start();
+  const botsStarted = startUp.finished;
   botsStarted.catch((error) => logError("the bots did not start", error));
+  botsStarted.then(
+    () => {
+      if (config.VENUE === "rollup") activity.settle();
+    },
+    () => {},
+  );
+  if (config.VENUE === "memory") activity.holdAwake();
+
+  const server = await buildServer({
+    config,
+    venue: wiring.venue,
+    ...data,
+    fundLedger,
+    ...wiring.rollupRoutes,
+    activity,
+    startUp: config.VENUE === "rollup" ? startUp : undefined,
+  });
+  await server.listen({ port: config.PORT, host: config.HOST });
+  const address = server.server.address();
+  const port = typeof address === "object" && address ? address.port : config.PORT;
+  console.log(`sim-noirwire: listening on http://${config.HOST}:${port} (venue=${config.VENUE})`);
+
+  if (config.VENUE === "rollup") priceSource.setPace("slow");
+  priceSource.start((point) => {
+    for (const market of MARKETS_PRICED_BY[point.id] ?? []) {
+      wiring.acceptPricePoint(market, point.price, point.atMs);
+    }
+  });
 
   return {
     server,
@@ -137,13 +245,14 @@ export const startApp = async (
     close: () => {
       closing ??= (async () => {
         closed = true;
-        stopLoops();
+        startUp.stop();
+        activity.close();
+        for (const loop of loops) loop.stop();
         priceSource.stop();
-        // A bot's order still on its way moves its order keys on, so the loops
-        // get a moment to finish before the checkpoints are saved. A stop must
-        // not depend on the network: a run still going after that is abandoned,
-        // and a restart finds keys that moved past their checkpoint by search.
-        await idleWithin(loops, WAIT_FOR_LOOPS_ON_CLOSE_MS);
+        // A stop must not depend on the network: a run still going after a
+        // moment is abandoned, and a restart finds keys that moved past their
+        // checkpoint by search.
+        await Promise.all([idleWithin(loops, WAIT_FOR_LOOPS_ON_CLOSE_MS), stopAwakeLoops()]);
         await wiring.stop();
         await saveSnapshot();
         await server.close();

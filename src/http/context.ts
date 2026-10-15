@@ -1,10 +1,12 @@
+import type { Activity } from "../activity/activity.js";
 import type { Config } from "../config/config.js";
 import type { CandleAggregator } from "../data/candles.js";
 import type { FundLedger } from "../data/fund-ledger.js";
 import type { StatsTracker } from "../data/stats.js";
 import type { TapeStore } from "../data/tape-store.js";
 import type { Venue } from "../engine/types.js";
-import type { FundDesk } from "../rollup/fund-desk.js";
+import type { StartUp } from "../scheduling/start-up.js";
+import type { FundRequests } from "../rollup/fund-desk.js";
 import type { PublicDeployment } from "../rollup/public-deployment.js";
 import type { Readiness } from "../rollup/rollup-venue.js";
 import type { Hub } from "./hub.js";
@@ -12,11 +14,11 @@ import type { Hub } from "./hub.js";
 /** VENUE=rollup only: what the routes need of the on-chain venue. */
 export interface RollupRoutes {
   /** Opens and funds a user's account on chain. */
-  fundDesk: FundDesk;
+  fundDesk: FundRequests;
   /** Whether the service is connected, pricing and funded. */
   readiness: () => Readiness;
-  /** What a browser needs to trade on the program directly. */
-  deployment: PublicDeployment;
+  /** What a browser needs to trade on the program directly, or null until the service has connected. */
+  deployment: () => PublicDeployment | null;
 }
 
 export interface AppContext extends Partial<RollupRoutes> {
@@ -27,4 +29,8 @@ export interface AppContext extends Partial<RollupRoutes> {
   stats: StatsTracker;
   fundLedger: FundLedger;
   hub: Hub;
+  /** Whether anybody wants the service to be busy. */
+  activity: Activity;
+  /** VENUE=rollup only: the one-time work that has to finish before the service is useful. */
+  startUp?: Pick<StartUp, "ready" | "problem">;
 }

@@ -9,9 +9,15 @@ const PREPARED_FOR_MS = 45_000;
 
 type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
 
-export type Prepared = { ok: true; transaction: string; expiresAtMs: number } | Refusal<400>;
+export type Prepared = { ok: true; transaction: string; expiresAtMs: number } | Refusal<400 | 503>;
 
 export type Funded = { ok: true; signature: string } | Refusal<400 | 409 | 410 | 502 | 503>;
+
+/** What the routes ask of a fund desk. */
+export interface FundRequests {
+  prepare(owner: string, orderKeys: string[]): Promise<Prepared>;
+  submit(owner: string, transactionBase64: string): Promise<Funded>;
+}
 
 export interface FundDeskOptions {
   program: Program;
@@ -71,7 +77,7 @@ const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
  * transaction that was built, adds the gate's and the faucet's signatures
  * and sends it. The account is opened and funded together or not at all.
  */
-export class FundDesk {
+export class FundDesk implements FundRequests {
   private readonly prepared = new Map<string, PreparedRequest>();
 
   constructor(private readonly options: FundDeskOptions) {}
