@@ -273,6 +273,7 @@ describe("asking for activity", () => {
     const activity = new Activity({
       lifecycle: { wake: async () => {}, sleep: async () => {} },
       idleAfterMs: 600_000,
+      idleAfterLastSocketMs: 15_000,
       onError: () => {},
       onDemand: demands,
     });

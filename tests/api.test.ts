@@ -42,6 +42,7 @@ const buildCtx = (
   const activity = new Activity({
     lifecycle: { wake: async () => {}, sleep: async () => {} },
     idleAfterMs: 60_000,
+    idleAfterLastSocketMs: 15_000,
     onError: () => {},
   });
   return { ctx: { config, venue, tape, candles, stats, fundLedger, hub, activity }, clock };

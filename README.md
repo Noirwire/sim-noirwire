@@ -119,7 +119,8 @@ start when a required one is missing or a key is not the one the deployment name
 | `BOT_TRADER_SEEDS`                                                         | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
 | `SERVICE_LOCATION`                                                         | no       | Where the service runs; labels the latency figure                                        |
 | `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`                 | no       | Publish cadence (5 s) and how long a resting bot quote stays valid by itself (180 s)     |
-| `IDLE_AFTER_MS`                                                            | no       | How long the service keeps trading after the last request or stream socket (10 minutes)  |
+| `IDLE_AFTER_MS`                                                            | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                                | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`               | no       | Bot order sizes as notional                                                              |
 | `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                      | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
 
@@ -136,7 +137,8 @@ minute. Snapshots keep being saved.
   The request that wakes it does not wait: `/v1/markets` reports every market as `warmingUp`
   until a fresh price is on chain and the loops run.
 - **Stays awake** while any stream socket is open, and for `IDLE_AFTER_MS` (10 minutes) after
-  the last request or the last socket closing.
+  the last request. When the last socket closes (the page was closed) it sleeps after
+  `IDLE_AFTER_LAST_SOCKET_MS` (15 seconds, enough for a reload), whatever requests came before.
 - **Starts asleep**, unless a request arrives while it starts.
 - `VENUE=memory` sends nothing outside the process, so it never sleeps.
 
@@ -187,7 +189,7 @@ ones:
 | `DATA_DIR`                                      | `./data`                | Where candles and fund grants are snapshotted                                        |
 | `FUND_AMOUNT_NUSD`                              | `5000`                  | One-time grant size                                                                  |
 | `FUND_IP_RATE_LIMIT` / `FUND_IP_RATE_WINDOW_MS` | `20` / `3600000`        | Per-IP cap on fund grants                                                            |
-| `JUPITER_POLL_INTERVAL_MS`                      | `2000`                  | How often every market's price is fetched, in one request                            |
+| `JUPITER_POLL_INTERVAL_MS`                      | `4000`                  | How often every market's price is fetched, in one request                            |
 | `HOUSE_MAKER_*`                                 | see file                | Ladder depth, spread, requote thresholds, position limit, skew                       |
 | `NOISE_TAKER_*`                                 | see file                | How many bot traders, how often, how big                                             |
 | `LIQUIDATOR_INTERVAL_MS`, `FUNDING_INTERVAL_MS` | `60000`, `60000`        | Scan/update cadence                                                                  |

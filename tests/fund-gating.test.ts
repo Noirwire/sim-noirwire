@@ -49,6 +49,7 @@ const deskServiceOn = async (desk: FundRequests, perIpLimit = 20) => {
       sleep: async () => {},
     },
     idleAfterMs: 600_000,
+    idleAfterLastSocketMs: 15_000,
     onError: () => {},
   });
   app = await buildServer({

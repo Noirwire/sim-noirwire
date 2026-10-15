@@ -17,8 +17,10 @@ export interface Lifecycle {
 
 export interface ActivityOptions {
   lifecycle: Lifecycle;
-  /** How long after the last request, or the last socket closing, the service stays awake. */
+  /** How long after the last request the service stays awake when no socket was open. */
   idleAfterMs: number;
+  /** How long after the last socket closes the service stays awake: long enough for a page reload. */
+  idleAfterLastSocketMs: number;
   onError(what: string, error: unknown): void;
   /** Called on every request or socket that asks for activity, awake or not. */
   onDemand?(): void;
@@ -26,16 +28,18 @@ export interface ActivityOptions {
 
 /**
  * Whether anybody wants the service to be busy. A request to the public API
- * (not the health probe) or an open stream socket makes it wake; it sleeps
+ * (not the health probe) or an open stream socket makes it wake. It sleeps
  * again once no socket is open and `idleAfterMs` has passed since the last
- * request or the last socket closing. Waking is not waited for by whatever
+ * request. When the last socket closes, the page that held it is gone, so
+ * only `idleAfterLastSocketMs` is left from then, whatever requests came
+ * before; a request after that counts in full again. Waking is not waited for by whatever
  * woke it: `phase` reads "waking" until the lifecycle has finished. A wake
  * that fails is tried again with a growing wait for as long as it is wanted.
  */
 export class Activity {
   private current: ActivityPhase = "asleep";
   private openSockets = 0;
-  private lastWantedAtMs = 0;
+  private wantedUntilMs = 0;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private failure: string | null = null;
   private closed = false;
@@ -71,7 +75,7 @@ export class Activity {
   /** A request that is a reason to be awake. */
   touch(): void {
     if (this.closed) return;
-    this.lastWantedAtMs = this.now();
+    this.wantedUntilMs = Math.max(this.wantedUntilMs, this.now() + this.options.idleAfterMs);
     this.options.onDemand?.();
     if (this.current === "asleep") this.startWaking();
     else this.armIdleTimer();
@@ -86,7 +90,8 @@ export class Activity {
       if (released) return;
       released = true;
       this.openSockets -= 1;
-      this.lastWantedAtMs = this.now();
+      if (this.openSockets === 0)
+        this.wantedUntilMs = this.now() + this.options.idleAfterLastSocketMs;
       this.armIdleTimer();
     };
   }
@@ -119,10 +124,10 @@ export class Activity {
     this.idleTimer = null;
   }
 
-  /** Whether a socket is open or a request came within the idle time. */
+  /** Whether a socket is open or the idle time has not run out. */
   wanted(): boolean {
     if (this.closed) return false;
-    return this.openSockets > 0 || this.now() - this.lastWantedAtMs < this.options.idleAfterMs;
+    return this.openSockets > 0 || this.now() < this.wantedUntilMs;
   }
 
   private enqueue(step: () => Promise<void>): void {
@@ -171,7 +176,7 @@ export class Activity {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
     if (this.closed || this.current !== "awake" || this.openSockets > 0) return;
-    const remainingMs = this.lastWantedAtMs + this.options.idleAfterMs - this.now();
+    const remainingMs = this.wantedUntilMs - this.now();
     this.idleTimer = setTimeout(() => this.idleTimerFired(), Math.max(0, remainingMs));
     this.idleTimer.unref();
   }
@@ -183,6 +188,16 @@ export class Activity {
       this.armIdleTimer();
       return;
     }
-    this.enqueue(() => this.runSleep());
+    this.enqueue(() => this.sleepIfStillIdle());
+  }
+
+  /** A socket or request may have come in between the idle timer firing and its sleep's turn. */
+  private async sleepIfStillIdle(): Promise<void> {
+    if (this.current !== "awake") return;
+    if (this.wanted()) {
+      this.armIdleTimer();
+      return;
+    }
+    await this.runSleep();
   }
 }

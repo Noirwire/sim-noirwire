@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Activity } from "../src/activity/activity.js";
 import { loadConfig } from "../src/config/config.js";
 import { CandleAggregator } from "../src/data/candles.js";
@@ -33,6 +33,9 @@ interface Setup {
 
 let app: FastifyInstance | null = null;
 
+/** ws 8 can pause a socket, which stops it answering pings; the installed ws types predate it. */
+const stopReading = (socket: unknown): void => (socket as { pause(): void }).pause();
+
 afterEach(async () => {
   await app?.close();
   app = null;
@@ -56,6 +59,7 @@ const serviceOn = async (
       sleep: async () => {},
     },
     idleAfterMs: 600_000,
+    idleAfterLastSocketMs: 15_000,
     onError: () => {},
   });
   const setup: Setup = {
@@ -147,6 +151,29 @@ describe("what wakes the service", () => {
     socket?.terminate();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(activity.awake).toBe(true);
+  });
+
+  it("drops a socket whose browser stopped answering pings, so it cannot keep the service awake", async () => {
+    await serviceOn(false);
+    await app?.ready();
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const socket = await app?.injectWS("/v1/stream?market=NSOL-PERP");
+      const server = app?.websocketServer;
+      expect(server?.clients.size).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(server?.clients.size).toBe(1);
+
+      stopReading(socket);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(server?.clients.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
