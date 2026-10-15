@@ -4,13 +4,14 @@ import {
   Transaction,
   type TransactionInstruction,
 } from "@solana/web3.js";
+import { firstLine } from "../logging/first-line.js";
+import { waitFor } from "../scheduling/backoff.js";
 import { within } from "./timeouts.js";
 
 const DEPOSIT_CONFIRM_TIMEOUT_MS = 30_000;
 const CONFIRM_POLL_MS = 100;
-
-const firstLine = (error: unknown): string =>
-  error instanceof Error ? error.message.split("\n")[0] : String(error);
+/** A transaction is rarely executed the moment it is sent: the first look waits this long. */
+const CONFIRM_FIRST_LOOK_AFTER_MS = 150;
 
 /** The endpoint did not take a transaction that moves tokens: the HTTP status and body it answered with. */
 export class DepositRefused extends Error {
@@ -41,13 +42,14 @@ export const confirmedWithin = async (
   timeoutMs: number,
 ): Promise<string> => {
   const deadline = Date.now() + timeoutMs;
+  await waitFor(CONFIRM_FIRST_LOOK_AFTER_MS);
   while (Date.now() < deadline) {
     const { value } = await connection.getSignatureStatus(signature);
     if (value && value.confirmationStatus !== "processed") {
       if (value.err) throw new ProgramRefused(value.err);
       return signature;
     }
-    await new Promise((resolve) => setTimeout(resolve, CONFIRM_POLL_MS));
+    await waitFor(CONFIRM_POLL_MS);
   }
   throw new Error(`transaction ${signature} was not confirmed in ${timeoutMs} ms`);
 };
@@ -69,25 +71,47 @@ export const sendDepositAndConfirm = async (
   return confirmedWithin(connection, signature, DEPOSIT_CONFIRM_TIMEOUT_MS);
 };
 
-/** Signs, sends and confirms one instruction paid by `payer`, all inside `timeoutMs`. */
-export const sendInstructionWithin = (
+/** A rollup blockhash stays valid for about a minute: one is reused for this long. */
+const BLOCKHASH_REUSED_FOR_MS = 20_000;
+
+type Blockhash = Awaited<ReturnType<Connection["getLatestBlockhash"]>>;
+const blockhashes = new WeakMap<Connection, { latest: Blockhash; at: number }>();
+
+/**
+ * The connection's latest blockhash. With `reuse`, the one held is used again
+ * until it is a while old: only for a transaction that differs from every
+ * other sent with it, as a price publish does by its time.
+ */
+const blockhashFor = async (connection: Connection, reuse: boolean): Promise<Blockhash> => {
+  const held = blockhashes.get(connection);
+  if (reuse && held && Date.now() - held.at < BLOCKHASH_REUSED_FOR_MS) return held.latest;
+  const latest = await connection.getLatestBlockhash("confirmed");
+  blockhashes.set(connection, { latest, at: Date.now() });
+  return latest;
+};
+
+/** Signs, sends and confirms instructions paid by `payer` in one transaction, all inside `timeoutMs`. */
+export const sendInstructionsWithin = (
   connection: Connection,
-  instruction: TransactionInstruction,
+  instructions: TransactionInstruction[],
   payer: Keypair,
   timeoutMs: number,
+  reuseBlockhash = false,
 ): Promise<string> =>
   within(
     (async () => {
-      const latest = await connection.getLatestBlockhash("confirmed");
+      // The confirmation loop ends when the transaction is given up, not a send later.
+      const deadline = Date.now() + timeoutMs;
+      const latest = await blockhashFor(connection, reuseBlockhash);
       const transaction = new Transaction({ feePayer: payer.publicKey, ...latest }).add(
-        instruction,
+        ...instructions,
       );
       transaction.sign(payer);
       // The private endpoint refuses to simulate what it would refuse to send.
       const signature = await connection.sendRawTransaction(transaction.serialize(), {
         skipPreflight: true,
       });
-      return confirmedWithin(connection, signature, timeoutMs);
+      return confirmedWithin(connection, signature, deadline - Date.now());
     })(),
     timeoutMs,
     "the transaction",

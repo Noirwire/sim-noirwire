@@ -22,6 +22,7 @@ export class RollupMarket {
   tapeCursor = 0;
   private chainPrice: ChainPrice | null = null;
   private target: bigint | null = null;
+  private targetAtMs: number | null = null;
   private warmedUp = false;
   private readonly volume = new DayVolume();
   private readonly priceHistory = new PriceHistory(DAY_MS);
@@ -68,14 +69,23 @@ export class RollupMarket {
     if (!this.warmedUp && step) this.warmedUp = withinOneStep(step);
   }
 
-  /** Where the mark should be, as this service prices it. */
-  setTarget(price: bigint): void {
+  /** Where the mark should be, as this service prices it, and when its source said so. */
+  setTarget(price: bigint, sourceAtMs: number): void {
     this.target = price;
+    this.targetAtMs = sourceAtMs;
     this.noteWarmUp();
   }
 
-  /** The price to publish next on the way to the target, or null when there is nothing to publish. */
-  nextPublishPrice(): bigint | null {
+  /**
+   * The price to publish next on the way to the target, or null when there is
+   * nothing to publish: no target, no price on chain to walk from, or a
+   * target whose source spoke more than `maxSourceAgeMs` ago, or before
+   * `sourceNotBeforeMs`. A publish is stamped with the rollup's clock, so it
+   * would pass an old price off as new.
+   */
+  nextPublishPrice(nowMs: number, maxSourceAgeMs: number, sourceNotBeforeMs = 0): bigint | null {
+    if (this.targetAtMs === null || nowMs - this.targetAtMs > maxSourceAgeMs) return null;
+    if (this.targetAtMs < sourceNotBeforeMs) return null;
     const step = this.step();
     const price = step ? nextPublishPrice(step) : 0n;
     return price === 0n ? null : price;

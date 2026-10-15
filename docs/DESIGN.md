@@ -60,7 +60,7 @@ Prices and sizes cross this boundary as integers (`bigint`), never floats.
 
 | Route | Returns |
 | --- | --- |
-| `GET /health` | `{ ok, venue, network }`; with `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold |
+| `GET /health` | `{ ok, venue, network, awake }`; with `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, `fundingUpdates`, a `reason` while something is missing, and 503 until the start-up work is done, the bots are funded and, while awake, the other two hold. Never wakes the service |
 | `GET /deployment` | `VENUE=rollup` only, public, cacheable for five minutes. What a browser needs to trade on the program directly: `network`, `programId`, `solanaRpcUrl`, `rollupRpcUrl`, `rollupWsUrl` (the URLs a browser should use), `exchange`, `stats`, and per market `marketId` (the on-chain id), `symbol`, `kind`, `market`, `tape`, `priceFeed`, `baseToken` and `quoteToken` (`symbol`, `mint`, `decimals`; `baseToken` is null on a perpetual), `baseDecimals`, `quoteDecimals`, `lotSize` (base atoms per lot) and `tick` (quote atoms per lot), both as decimal text. No key and no role address |
 | `GET /markets` | per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, `warmingUp` (true with `VENUE=rollup` until the chain's price has first reached the real one) |
 | `GET /tape?market=&limit=` | latest fills: price, size, taker side, time, sequence, `makerTag`, `takerTag`. With `VENUE=rollup` each tag is that side's 8-byte receipt from the chain's tape, read as a big-endian unsigned integer and written as decimal text; the websocket's `fill` message carries the same two fields |
@@ -87,7 +87,7 @@ separately and never merged into one number.
 (`@noirwire/orderbook`, a release file under `vendor/`). Everything else sees the plain
 types of `src/rollup/chain-types.ts`, so a new client release is an edit to that one file.
 
-- **Prices.** The oracle key publishes every market's price every two seconds, stamped
+- **Prices.** The oracle key publishes every market's price every five seconds, stamped
   with the rollup's own clock. The program refuses a price more than its move limit from
   the last one, so a larger real move is walked there one allowed step per publish. It
   also refuses a publish time that is not after the feed's last one, so a publish is
@@ -121,7 +121,7 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
   keys. An order the client refuses before signing, or the program refuses after, comes
   back to the bot as a rejected order at once. Bots are topped up from the faucet to their starting
   balance, never above it, so a restart does not pay them twice. Every resting quote
-  carries a 30 second expiry of its own.
+  carries an expiry of its own (`ROLLUP_QUOTE_EXPIRY_SECONDS`, 180).
 - **Funding.** This service advances it: `update_funding` for each perpetual once per
   funding interval, sent right after a successful price publish. No rollup scheduler is
   relied on, because the instruction fails on a stale price and a scheduled task that
@@ -133,7 +133,7 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
   number) and starts over. Seats opened with the gate key by anything else lie outside it.
   A liquidation adds nothing to the public order, fill or volume counters.
 - **Public data.** The tape, the price feeds and the stats are read from the chain over
-  the rollup's websocket, anonymously, and re-read in full every five seconds. Fills are
+  the rollup's websocket, anonymously, and re-read in full every minute. Fills are
   followed by sequence number, so a dropped notification is filled in from the tape
   account and nothing is recorded twice. `/v1/markets`, `/v1/tape`, `/v1/candles` and the
   outgoing websocket are fed from that and from nothing this process remembers sending.
@@ -146,9 +146,77 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
 - **Deposits** go to the deployment's `depositUrl`: the rollup's own port on the local
   stack, the private endpoint on a hosted one. `DEPOSIT_RPC_URL` overrides it. An endpoint
   that refuses a deposit at the door is reported with its HTTP status and body.
-- **Health.** `/v1/health` answers 200 only when the public accounts were read in the
-  last 15 seconds, every market's price on chain is fresh and was published by this
-  process, and every bot is open and funded.
+- **Health.** `/v1/health` answers 200 only when the start-up work is done and every bot
+  is open and funded and, while the service is awake, the public accounts were read in the
+  last 45 seconds and every market's price on chain is fresh and was published by this
+  process. An asleep service publishes nothing, so stale prices do not count against it;
+  the answer carries `awake`, and `reason` while start-up or a wake keeps failing. The
+  route never wakes the service.
+- **Awake and asleep.** A hosted endpoint blocks a client that never stops asking, so the
+  service sends to the rollup only while somebody wants it to. `src/activity/activity.ts`
+  is the state machine: `asleep`, `waking`, `awake`. A request to any route but
+  `/v1/health` (an `onRequest` hook in `src/http/server.ts`; a path that matches no route
+  is not one) and an open `/v1/stream` socket ask for activity. The first one moves it
+  from asleep to waking and the request goes on without waiting. Waking is the lifecycle
+  in `src/app.ts`: wait for the start-up work, speed Jupiter up, then
+  `RollupVenue.resume()` (read every public account, subscribe, publish every market's
+  price at once, start the publisher) and start the bots' loops. A wake that fails is
+  retried after 5 s, 10 s, ... up to 5 minutes while it is still wanted. While it runs,
+  `/v1/markets` shows every market as `warmingUp`. The service stays awake while a socket
+  is open and `IDLE_AFTER_MS` (10 minutes) after the last request or the last socket
+  closing; then it sleeps: the bots' loops stop, the publisher stops, the chain feed's
+  websocket is ended and its reads stop, each bot's client lets go of its websocket and
+  timer, each key's connection is opened afresh at the next use (a token may have run
+  out), and Jupiter is polled once a minute. Snapshots keep being saved. The service
+  starts asleep once its start-up work is done. `VENUE=memory` sends nothing outside the
+  process and holds itself awake.
+- **Cost while awake.** Measured on the local stack through a counting proxy with a
+  random-walk price source: about 2 requests a second to the rollup's query filter, down
+  from about 6.8. All markets are published in one transaction every 5 s (one read of the
+  rollup's clock, one blockhash reused for 20 s, one send, one status check); the makers
+  requote a market every 90 s or when its mark moves 12 bps, with quotes valid for 180
+  s; two of the six takers trade; the liquidator tries 2 seats a minute; the chain feed
+  re-reads every account once a minute under the websocket. The bots' view subscriptions
+  share one backoff (`bot-socket.ts`). A wake needs a price delivered by the source
+  during that wake and fails, to be tried again with a wait, unless it published every
+  market.
+- **Generations.** Each wake is a generation (`generation.ts`) that ends when the service
+  goes to sleep, after the publishes and reads in flight have had two seconds to end.
+  Every connection of the oracle, the gate, the faucet, the chain feed and the bots is
+  made for one generation: once it ends a request in flight is aborted and a later one
+  is not sent, so a confirmation loop or an order's result poll stops whatever code runs
+  it. A bot's connection does not even answer a later request, which ends the order
+  client's own retry loop instead of leaving it to spin on refusals. The bots are let go
+  of, not paused: the next call opens a new trader for the new generation from the order
+  key checkpoint of the old one, so nothing waits behind an old order's unsettled
+  promise, and a sign-in that finishes after the sleep installs nothing. The venue's
+  calls for a bot are refused while it rests and rejected the moment their generation
+  ends.
+- **Publishing.** A price is published only while its source is at most 10 s old
+  (`MAX_SOURCE_AGE_MS`, the ten seconds the program calls a price fresh); a market whose source is older is left out and goes stale
+  on chain, which health shows. A round is given up after the interval less a second (4
+  s) and the next starts on time, so two accepted rounds are at most 9 s apart in normal
+  latency (a round that fails outright leaves a gap of two intervals plus a timeout, and
+  the price goes stale honestly). When the program refuses the bundle each market is
+  sent alone in the same round; one it keeps refusing is left out for 10 s, 20 s, up to
+  30 s, on its own.
+- **The fund desk.** One call at a time; a throw, or an answer that the rollup refused
+  or could not be reached, stops the desk being asked for 5 s. A submit for a transaction
+  `prepare` made is not turned away by the per-IP limit that `prepare` paid.
+- **A rollup that refuses.** The HTTP API starts before the rollup is reached. The
+  start-up work (mainnet check, reading the markets, the first read of the public
+  accounts, opening and funding the bots) is retried after 5 s, doubling to 5 minutes;
+  every step of it is safe to repeat. Until it is done `/v1/markets`, `/v1/deployment` and
+  the fund routes answer 503 and `/v1/health` answers 503 with the reason; tape, candles
+  and stats come from the snapshot. Only a mainnet `SOLANA_RPC_URL` ends the process. The
+  rollup websocket waits 5 s before its first reconnect and twice as long after each
+  refusal, up to 5 minutes (`backOffReconnects`), and a loop that fails repeatedly skips
+  turns, at most 30 s apart. A failing thing is logged when it starts failing, as a
+  summary a minute while it goes on, and when it works again (`ProblemLog`).
+  A rollup that starts refusing an awake service is caught by the price publisher: two
+  rounds in a row that fail for any reason but the program refusing a market make the
+  service rest and wake again, so the wake's retry (5 s doubling to 5 minutes, only while
+  wanted) sends one probe at a time instead of every loop backing off alone.
 
 ### Funding a user
 

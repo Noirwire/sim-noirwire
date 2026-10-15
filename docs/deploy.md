@@ -49,7 +49,7 @@ Worth setting:
 | `HOUSE_MAKER_POSITION_LIMIT_NUSD`                                        | `50000`                        | a maker is funded with four times this                                           |
 | `NOISE_TAKER_STARTING_NUSD`, `NOISE_TAKER_STARTING_BASE`                 | `100000`, `1000`               | each of six takers; the spot maker holds ten times the base                      |
 | `LIQUIDATOR_STARTING_NUSD`                                               | `1000000`                      | the liquidator's collateral                                                      |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | `4`, `8`                       | seats tried per market per tick; seats on the exchange this service did not open |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | `2`, `8`                       | seats tried per market per tick; seats on the exchange this service did not open |
 | `FUND_AMOUNT_NUSD`, `FUND_IP_RATE_LIMIT`                                 | `5000`, `20` an hour           | the grant and its per-IP limit                                                   |
 
 With the defaults the bots take about 3,000,000 nUSD and 16,000 nSOL from the faucet at
@@ -71,9 +71,11 @@ and their balances. New seeds cost ten new seats and strand the old balances.
    `DATA_DIR=./data/devnet`, `PORT=4100`, and your ten `BOT_TRADER_SEEDS`.
 3. `make devnet-start`. It builds, starts the service in the background and writes its
    log to `data/devnet/sim.log` and its pid to `data/devnet/sim.pid`.
-4. `curl -s localhost:4100/v1/health` answers 503 with what is missing, then 200. A first
-   start takes a minute or two: ten bots sign in, open their seats and are funded, and the
-   price is walked from wherever it was left.
+4. `curl -s localhost:4100/v1/health` answers 503 with what is missing (a `reason` when the
+   rollup refuses; the start-up work is retried by itself), then 200. A first start takes a
+   minute or two: ten bots sign in, open their seats and are funded. The service then
+   sleeps, sending nothing to the rollup, until a request or a stream socket wakes it; the
+   price is walked from wherever it was left once it is awake.
 5. `make devnet-stop` stops it.
 
 `data/devnet/` holds the bots' order key checkpoints, the fund grants and the candles.
@@ -122,14 +124,14 @@ published and is not guessed here. Measure it: deploy to one region, read
 `latency.medianMs` in `/v1/stats` after a few minutes (the bots' own send-to-result time,
 labelled with the region), move the service to another region in its settings, and
 compare. Keep the lowest. The price stays valid on chain for 10 seconds and is published
-every 2, so every region works; the region only changes how quick the bots and the fund
+every 5, so every region works; the region only changes how quick the bots and the fund
 flow are.
 
 ## Check it
 
 ```bash
-curl -s https://<domain>/v1/health      # 200 {"ok":true,"connected":true,"pricesFresh":true,"botsFunded":true,"fundingUpdates":{...}}
-curl -s https://<domain>/v1/markets     # three markets, each with a markPrice and warmingUp false
+curl -s https://<domain>/v1/health      # 200 {"ok":true,"awake":false,...} when idle, awake:true with "connected":true,"pricesFresh":true after a request below
+curl -s https://<domain>/v1/markets     # wakes the service; three markets, each with a markPrice, warmingUp true for a few seconds
 curl -s https://<domain>/v1/stats       # bot orders and fills growing; latency names the region
 curl -s https://<domain>/v1/deployment  # what a browser needs to trade on chain
 npx tsx scripts/smoke.ts --url https://<domain>   # also opens and funds one fresh key: one seat
@@ -144,7 +146,7 @@ grows by one a minute. Railway waits up to five minutes for the first 200.
   signs in first, and signs in again after a failure on the wire.
 - Public accounts are read anonymously: the tape, the price feeds, the stats, the markets.
   Nothing reads a transaction back, a token account or custody.
-- A price is stale after 10 seconds: each market is published every 2 seconds; a publish
+- A price is stale after 10 seconds: each market is published every 5 seconds while the service is awake; a publish
   still on its way is never doubled, so a slow one costs a turn and builds no backlog, and
   none is sent while the rollup's clock still shows the second of the last accepted one.
 - Funding: the rollup's scheduler stops for good after one failed call, and

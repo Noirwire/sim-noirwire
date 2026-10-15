@@ -24,10 +24,10 @@ import {
   clockOf,
   decodeMarket,
   decodeView,
+  globalSocket,
   ownFills,
   randomSecret,
   sendAndConfirm,
-  signIn,
   websocketUrl,
   type OrderResult,
   type PriceFeed,
@@ -54,9 +54,11 @@ import type {
   SeatView,
   Unsubscribe,
 } from "./chain-types.js";
+import { backedOffSockets } from "./bot-socket.js";
 import { Session, connectionTo } from "./connections.js";
-import { within } from "./timeouts.js";
-import { sendDepositAndConfirm, sendInstructionWithin } from "./transactions.js";
+import type { Generation } from "./generation.js";
+import { fetchWithin } from "./timeouts.js";
+import { sendDepositAndConfirm, sendInstructionsWithin } from "./transactions.js";
 
 export const CLIENT_RELEASE = "@noirwire/orderbook 0.5.1";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
@@ -159,18 +161,71 @@ const signerOf = (key: Keypair) => {
   return async (message: Uint8Array) => new Uint8Array(sign(null, message, privateKey));
 };
 
-/** Signs `key` in to the private endpoint. The query filter accepts sends only from a signed-in caller. */
-export const signedInConnection = async (rpcUrl: string, key: Keypair): Promise<Connection> => {
-  const token = await within(
-    signIn(rpcUrl, key.publicKey, signerOf(key)),
-    SIGN_IN_TIMEOUT_MS,
-    "signing in",
-  );
-  return connectionTo(`${rpcUrl}?token=${token}`, `${websocketUrl(rpcUrl)}?token=${token}`);
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+const base58Of = (bytes: Uint8Array): string => {
+  let number = 0n;
+  for (const byte of bytes) number = number * 256n + BigInt(byte);
+  let text = "";
+  for (; number > 0n; number /= 58n) text = BASE58[Number(number % 58n)] + text;
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    text = `1${text}`;
+  }
+  return text;
 };
 
-export const signedInSession = (rpcUrl: string, key: Keypair): Session =>
-  new Session(() => signedInConnection(rpcUrl, key));
+/**
+ * The endpoint's sign-in: a challenge, signed by the key, exchanged for a
+ * token. It is the order book client's own sign-in written out so that its
+ * two requests go through a fetch the generation can abort: a sign-in under
+ * way when the service goes to sleep sends nothing more.
+ */
+const signInTo = async (rpcUrl: string, key: Keypair, life?: Generation): Promise<string> => {
+  const send = fetchWithin(SIGN_IN_TIMEOUT_MS, undefined, life);
+  const pubkey = key.publicKey.toString();
+  const challengeResponse = await send(
+    `${rpcUrl}/auth/challenge?${new URLSearchParams({ pubkey })}`,
+  );
+  const { challenge } = (await challengeResponse.json()) as { challenge?: unknown };
+  if (typeof challenge !== "string" || challenge.length === 0) {
+    throw new Error("sign-in: no challenge received");
+  }
+  const signature = await signerOf(key)(new Uint8Array(Buffer.from(challenge, "utf-8")));
+  const loginResponse = await send(`${rpcUrl}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pubkey, challenge, signature: base58Of(signature) }),
+  });
+  const { token } = (await loginResponse.json()) as { token?: unknown };
+  if (loginResponse.status !== 200 || typeof token !== "string" || token.length === 0) {
+    throw new Error("sign-in: the endpoint did not accept the signature");
+  }
+  return token;
+};
+
+/** Signs `key` in to the private endpoint. The query filter accepts sends only from a signed-in caller. */
+export const signedInConnection = async (
+  rpcUrl: string,
+  key: Keypair,
+  life?: Generation,
+  hangWhenEnded = false,
+): Promise<Connection> => {
+  const token = await signInTo(rpcUrl, key, life);
+  return connectionTo(
+    `${rpcUrl}?token=${token}`,
+    `${websocketUrl(rpcUrl)}?token=${token}`,
+    life,
+    hangWhenEnded,
+  );
+};
+
+/** A key's session; each connection it opens belongs to the generation `life` names at that moment. */
+export const signedInSession = (
+  rpcUrl: string,
+  key: Keypair,
+  life: () => Generation | undefined,
+): Session => new Session(() => signedInConnection(rpcUrl, key, life()));
 
 export const newOrderSecret = (): Uint8Array => randomSecret();
 
@@ -296,25 +351,34 @@ export class Program {
    * `publishTimeSeconds` is the rollup's own clock: the program refuses a
    * time ahead of it, and one that is not after the feed's last.
    */
-  async publishPrice(
+  async publishPrices(
     connection: Connection,
     oracle: Keypair,
-    marketId: number,
-    price: bigint,
+    prices: { marketId: number; price: bigint }[],
     publishTimeSeconds: number,
+    /** The whole publish, send and confirmation, is given up after this long. */
+    timeoutMs: number,
   ): Promise<void> {
-    await sendInstructionWithin(
+    await sendInstructionsWithin(
       connection,
-      this.instructions.publishPrice(oracle.publicKey, marketId, price, BigInt(publishTimeSeconds)),
+      prices.map(({ marketId, price }) =>
+        this.instructions.publishPrice(
+          oracle.publicKey,
+          marketId,
+          price,
+          BigInt(publishTimeSeconds),
+        ),
+      ),
       oracle,
-      PUBLISH_WITHIN_MS,
+      timeoutMs,
+      true,
     );
   }
 
   async updateFunding(connection: Connection, payer: Keypair, marketId: number): Promise<void> {
-    await sendInstructionWithin(
+    await sendInstructionsWithin(
       connection,
-      this.instructions.updateFunding(marketId),
+      [this.instructions.updateFunding(marketId)],
       payer,
       PUBLISH_WITHIN_MS,
     );
@@ -381,8 +445,9 @@ export class Program {
     rpcUrl: string,
     owner: Keypair,
     checkpoint?: KeyCheckpoint,
+    life?: Generation,
   ): Promise<ProgramTrader | null> {
-    const connection = await signedInConnection(rpcUrl, owner);
+    const connection = await signedInConnection(rpcUrl, owner, life, true);
     const account = await connection.getAccountInfo(
       this.instructions.addresses.view(owner.publicKey),
     );
@@ -397,7 +462,7 @@ export class Program {
         owner,
       );
     }
-    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
+    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection, life);
   }
 
   /** As `ownTrader`, and opens the seat with the gate's signature when there is none. */
@@ -407,8 +472,9 @@ export class Program {
     gate: Keypair,
     gateConnection: Connection,
     checkpoint?: KeyCheckpoint,
+    life?: Generation,
   ): Promise<ProgramTrader> {
-    const existing = await this.ownTrader(rpcUrl, owner, checkpoint);
+    const existing = await this.ownTrader(rpcUrl, owner, checkpoint, life);
     if (existing) return existing;
     await sendAndConfirm(
       gateConnection,
@@ -416,14 +482,14 @@ export class Program {
       gate,
       [owner],
     );
-    return this.newTrader(rpcUrl, owner);
+    return this.newTrader(rpcUrl, owner, life);
   }
 
   /** A trader just opened with `firstOrderKeys(owner)`, before it sent anything. */
-  async newTrader(rpcUrl: string, owner: Keypair): Promise<ProgramTrader> {
-    const connection = await signedInConnection(rpcUrl, owner);
+  async newTrader(rpcUrl: string, owner: Keypair, life?: Generation): Promise<ProgramTrader> {
+    const connection = await signedInConnection(rpcUrl, owner, life, true);
     const keys = OrderKeyManager.fresh(orderKeySeedOf(owner));
-    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection);
+    return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection, life);
   }
 }
 
@@ -440,6 +506,15 @@ const restoredKeys = (
   }
 };
 
+const nativeSocket = globalSocket();
+/**
+ * What every bot's view subscription opens its websocket through, so that
+ * all ten share one backoff when the endpoint refuses them. Kept, rather than
+ * turning the subscription off (`push: false`), because without it each
+ * order polls the view every 50 ms until its result shows.
+ */
+const BOT_VIEW_SOCKETS = nativeSocket && backedOffSockets(nativeSocket);
+
 /** One trader: signs in as its owner, trades with one-time order keys, reads its own view. */
 export class ProgramTrader {
   private client: TraderClient;
@@ -447,6 +522,9 @@ export class ProgramTrader {
   private closed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private unsettled: Promise<unknown> = Promise.resolve();
+  /** Calls that may have signed and are under way, and calls whose outcome was unknown and not yet settled. */
+  private signingCalls = 0;
+  private unknownOutcomes = 0;
 
   /**
    * How many instructions the caller keeps in flight at once: one unless
@@ -462,6 +540,8 @@ export class ProgramTrader {
     private readonly keys: OrderKeyManager,
     private readonly programId: PublicKey,
     connection: Connection,
+    /** The generation it was made for: once it ends the trader sends nothing and refuses every call. */
+    private readonly life?: Generation,
   ) {
     this.client = this.clientOn(connection);
   }
@@ -473,13 +553,15 @@ export class ProgramTrader {
       this.owner.publicKey,
       this.keys,
       this.programId,
+      { socket: BOT_VIEW_SOCKETS },
     );
   }
 
   /**
    * Lets go of the websocket and the timer the client holds once it has made
    * a call, for good: the client starts both again on its next call, so a
-   * closed trader refuses every later one.
+   * closed trader refuses every later one. What the client still polls for,
+   * a result or a quarantined order key, stops with its generation.
    */
   close(): void {
     this.closed = true;
@@ -499,23 +581,38 @@ export class ProgramTrader {
    * outcome is still unknown: the instruction may run until the rollup's
    * clock passes its expiry.
    */
-  private run<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
-    if (this.inFlightLimit > 1) return this.runOne(operation);
-    const next = this.queue.then(() => this.unsettled).then(() => this.runOne(operation));
+  private run<T>(operation: (client: TraderClient) => Promise<T>, signs = true): Promise<T> {
+    if (this.inFlightLimit > 1) return this.runNow(operation, signs);
+    const next = this.queue.then(() => this.unsettled).then(() => this.runNow(operation, signs));
     this.queue = next.catch(() => undefined);
     return next;
   }
 
-  /** A failure on the wire signs in again before the next instruction. */
-  private async runOne<T>(operation: (client: TraderClient) => Promise<T>): Promise<T> {
+  private assertAlive(): void {
+    if (this.closed) throw new Error("this trader was closed");
+    if (this.life?.ended) throw new Error("this trader belongs to a generation that went to sleep");
+  }
+
+  /**
+   * A failure on the wire signs in again before the next instruction. Only a
+   * call that `signs` counts as one that may still land when the service
+   * sleeps: a read that is cut short signed nothing, so its keys are free.
+   */
+  private async runNow<T>(
+    operation: (client: TraderClient) => Promise<T>,
+    signs: boolean,
+  ): Promise<T> {
+    this.assertAlive();
     if (this.signInAgain) {
-      const connection = await signedInConnection(this.rpcUrl, this.owner);
+      const connection = await signedInConnection(this.rpcUrl, this.owner, this.life, true);
+      // The service may have gone to sleep while it signed in.
+      this.assertAlive();
       // The old client holds a websocket on the old token: results are pushed over it.
       this.client.close();
       this.client = this.clientOn(connection);
       this.signInAgain = false;
     }
-    if (this.closed) throw new Error("this trader was closed");
+    if (signs) this.signingCalls += 1;
     try {
       return await operation(this.client);
     } catch (error) {
@@ -525,7 +622,18 @@ export class ProgramTrader {
         error instanceof OutcomeUnknown;
       if (!answered) this.signInAgain = true;
       throw error;
+    } finally {
+      if (signs) this.signingCalls -= 1;
     }
+  }
+
+  /**
+   * Whether a call it signed may still land: one under way, or one whose
+   * outcome was unknown and is not settled. The order key it holds is not
+   * free until that call's expiry has passed.
+   */
+  get hasUnsettled(): boolean {
+    return this.signingCalls > 0 || this.unknownOutcomes > 0;
   }
 
   /**
@@ -544,12 +652,14 @@ export class ProgramTrader {
   }
 
   private unknownUntil(settled: Promise<PlaceOutcome>): PlaceOutcome {
+    this.unknownOutcomes += 1;
     this.unsettled = settled.catch(() => undefined);
+    void this.unsettled.then(() => (this.unknownOutcomes -= 1));
     return { status: "unknown", ...NOTHING_PLACED, settled };
   }
 
   view(): Promise<SeatView> {
-    return this.run(async (client) => seatViewOf(await client.view()));
+    return this.run(async (client) => seatViewOf(await client.view()), false);
   }
 
   place(marketId: number, order: ChainOrder, riskMarkets: number[]): Promise<PlaceOutcome> {

@@ -1,4 +1,3 @@
-import type { Connection } from "@solana/web3.js";
 import type { FillOrigin } from "../data/stats.js";
 import type { Clock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
@@ -13,9 +12,10 @@ import type {
   Venue,
 } from "../engine/types.js";
 import { rejectedOrder } from "../engine/venue-orders.js";
+import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
-import { ChainFeed } from "./chain-feed.js";
+import { ChainFeed, REREAD_INTERVAL_MS } from "./chain-feed.js";
 import {
   type ChainFill,
   type ChainPrice,
@@ -26,7 +26,8 @@ import {
 } from "./chain-types.js";
 import { Session, connectionTo } from "./connections.js";
 import { FundDesk } from "./fund-desk.js";
-import { PricePublisher } from "./price-publisher.js";
+import { Generation } from "./generation.js";
+import { MAX_SOURCE_AGE_MS, PricePublisher } from "./price-publisher.js";
 import {
   FIRST_TRADER_SEAT,
   SEAT_COUNT,
@@ -44,8 +45,11 @@ import { COLLATERAL_TOKEN, deployedToken } from "./tokens.js";
 import { chainPriceAndSize, placeResultOf, traderStateOf } from "./translation.js";
 import { toChainAmount } from "./units.js";
 
-const CONNECTED_WITHIN_MS = 15_000;
+/** Three of the feed's full reads: one missed is not an outage. */
+const CONNECTED_WITHIN_MS = 3 * REREAD_INTERVAL_MS;
 const MS_PER_SECOND = 1_000;
+/** How long a rest waits for the requests in flight before it lets them go. */
+const DRAIN_WITHIN_MS = 2_000;
 /** The program gives a bot's order no tag: its fills are recognised by receipt instead. */
 const NO_TAG = 0n;
 
@@ -65,6 +69,10 @@ export interface RollupVenueHandlers {
   onBotOrderSettled(executedAfterAll: boolean): void;
   onChainStats(stats: ChainStats): void;
   onError(what: string, error: unknown): void;
+  /** Whatever `onError` was last given under this name has worked again. */
+  onRecovered(what: string): void;
+  /** The rollup stopped answering an awake service: it should rest and wake again. */
+  onUnreachable(): void;
 }
 
 export interface RollupVenueOptions {
@@ -107,6 +115,16 @@ export class RollupVenue implements Venue {
   private readonly bots: BotAccounts;
   private readonly sweep: SeatSweep;
   private readonly faucet: Session;
+  /** Every key's connection, opened again after a rest. */
+  private readonly sessions: Session[] = [];
+  private stopped = false;
+  /**
+   * The generation now current: everything that sends is made for it and ends
+   * with it. Undefined while the service rests, when nothing may send.
+   */
+  private life: Generation | undefined = new Generation();
+  /** What the feed or the publisher is failing at right now, by name. */
+  private readonly failing = new Set<string>();
   private chainStats: ChainStats | null = null;
   private ordersPlaced = 0;
   private liquidatorSeat: number | null = null;
@@ -114,7 +132,6 @@ export class RollupVenue implements Venue {
   private constructor(
     private readonly options: RollupVenueOptions,
     markets: RollupMarket[],
-    feedConnection: Connection,
   ) {
     const { program, settings, handlers } = options;
     const [anyMarket] = markets;
@@ -126,36 +143,55 @@ export class RollupVenue implements Venue {
     const depositsThroughTheFilter =
       new URL(settings.depositRpcUrl).host === new URL(settings.rollupRpcUrl).host;
     this.faucet = depositsThroughTheFilter
-      ? signedInSession(settings.rollupRpcUrl, settings.faucet)
+      ? signedInSession(settings.rollupRpcUrl, settings.faucet, () => this.life)
       : Session.of(connectionTo(settings.depositRpcUrl));
+
+    const oracle = signedInSession(settings.rollupRpcUrl, settings.oracle, () => this.life);
+    const gate = signedInSession(settings.rollupRpcUrl, settings.gate, () => this.life);
+    this.sessions.push(this.faucet, oracle, gate);
+
+    // What the feed and the publisher fail at is what the rollup's reachability is judged by.
+    const watched = {
+      onError: (what: string, error: unknown) => {
+        this.failing.add(what);
+        handlers.onError(what, error);
+      },
+      onRecovered: (what: string) => {
+        this.failing.delete(what);
+        handlers.onRecovered(what);
+      },
+    };
 
     this.feed = new ChainFeed(
       program,
-      feedConnection,
+      () => connectionTo(settings.rollupRpcUrl, settings.rollupWsUrl, this.life),
       markets.map((market) => market.chain.marketId),
       {
         onPrice: (marketId, price) => this.acceptPrice(marketId, price),
         onTape: (marketId, update, readAtMs) => this.acceptTape(marketId, update, readAtMs),
         onStats: (stats) => this.acceptStats(stats),
-        onError: handlers.onError,
+        ...watched,
       },
     );
     this.publisher = new PricePublisher({
       program,
-      oracle: signedInSession(settings.rollupRpcUrl, settings.oracle),
+      oracle,
       oracleKey: settings.oracle,
       markets,
       intervalMs: options.publishIntervalMs,
-      onError: handlers.onError,
+      maxSourceAgeMs: MAX_SOURCE_AGE_MS,
+      onUnreachable: handlers.onUnreachable,
+      ...watched,
     });
     this.bots = new BotAccounts({
       program,
       settings,
       bots: options.bots,
-      gate: signedInSession(settings.rollupRpcUrl, settings.gate),
+      gate,
       faucet: this.faucet,
       keyCheckpoints: options.keyCheckpoints,
       syncMarketId: anyMarket.chain.marketId,
+      life: () => this.life,
     });
     // Seats fill from the lowest number, so none lies beyond the accounts ever opened.
     this.sweep = new SeatSweep(
@@ -167,25 +203,73 @@ export class RollupVenue implements Venue {
 
   static async connect(options: RollupVenueOptions): Promise<RollupVenue> {
     const { program, settings } = options;
-    const feedConnection = connectionTo(settings.rollupRpcUrl, settings.rollupWsUrl);
+    const reading = connectionTo(settings.rollupRpcUrl);
     const markets: RollupMarket[] = [];
     for (const config of options.markets) {
       const deployed = deployedMarket(settings.deployment, config.id);
-      const chain = await program.market(feedConnection, deployed.id);
+      const chain = await program.market(reading, deployed.id);
       markets.push(new RollupMarket(config, chain, deployed.baseDecimals));
     }
-    return new RollupVenue(options, markets, feedConnection);
+    return new RollupVenue(options, markets);
   }
 
-  async start(): Promise<void> {
-    await this.feed.start();
+  /**
+   * Starts following the chain's public accounts: reads them all, then
+   * listens. Throws when the first read fails, having started nothing.
+   */
+  follow(): Promise<void> {
+    this.life ??= new Generation();
+    return this.feed.follow();
+  }
+
+  /**
+   * Follows the chain, publishes every market's price at once, from a source
+   * price delivered at or after `sourceNotBeforeMs`, and keeps publishing.
+   * Throws unless that first publish established a fresh price for every
+   * market. Safe to call again after it threw: it picks up where it stopped.
+   */
+  async resume(sourceNotBeforeMs: number): Promise<void> {
+    if (this.stopped) return;
+    await this.follow();
+    if (this.stopped) return;
+    await this.publisher.publishNow(sourceNotBeforeMs);
     this.publisher.start();
   }
 
+  /**
+   * Sends nothing and listens to nothing until `resume`. The publishes and
+   * reads in flight get a moment to end, none of them asking for more; then
+   * the generation ends, and with it every connection, confirmation, order
+   * client and poll made for it. The bots are let go of, not paused: the next
+   * call for one opens a new trader for the next generation.
+   */
+  async rest(): Promise<void> {
+    this.publisher.stop();
+    this.feed.pause();
+    await idleWithin([this.publisher, this.feed], DRAIN_WITHIN_MS);
+    this.bots.retire();
+    this.life?.end();
+    this.life = undefined;
+    for (const session of this.sessions) session.renew();
+    this.failing.clear();
+  }
+
   async stop(): Promise<void> {
+    this.stopped = true;
     this.publisher.stop();
     this.bots.close();
     this.feed.stop();
+    this.life?.end();
+    this.life = undefined;
+  }
+
+  /**
+   * `work`, as long as the service is awake: it is refused while the service
+   * rests and rejected the moment the generation it began in ends.
+   */
+  private whileAwake<T>(work: () => Promise<T>): Promise<T> {
+    if (!this.life) return Promise.reject(new Error("the service is asleep"));
+    return this.life.until(work());
   }
 
   private market(id: MarketId): RollupMarket {
@@ -266,7 +350,7 @@ export class RollupVenue implements Venue {
   readiness(): Readiness {
     const now = Date.now();
     return {
-      connected: now - this.feed.readAtMs < CONNECTED_WITHIN_MS,
+      connected: now - this.feed.readAtMs < CONNECTED_WITHIN_MS && this.failing.size === 0,
       pricesFresh: [...this.followed.values()].every((market) =>
         market.priceIsFresh(now, this.publisher.lastPublishedAtMs(market)),
       ),
@@ -284,16 +368,16 @@ export class RollupVenue implements Venue {
   }
 
   /** Sets where the mark should be. The publisher walks the chain's price there. */
-  async publishPrice(market: MarketId, price: bigint): Promise<void> {
-    this.market(market).setTarget(price);
+  async publishPrice(market: MarketId, price: bigint, sourceAtMs: number): Promise<void> {
+    this.market(market).setTarget(price, sourceAtMs);
   }
 
   async openTrader(trader: TraderKey): Promise<void> {
-    await this.bots.trader(trader);
+    await this.whileAwake(() => this.bots.trader(trader));
   }
 
   deposit(trader: TraderKey, token: string, amount: bigint): Promise<void> {
-    return this.bots.topUp(trader, token, amount);
+    return this.whileAwake(() => this.bots.topUp(trader, token, amount));
   }
 
   async placeOrder(trader: TraderKey, order: NewOrder): Promise<PlaceResult> {
@@ -308,21 +392,22 @@ export class RollupVenue implements Venue {
     const rests = order.type === "limit" || order.type === "postOnly";
     let outcome: PlaceOutcome;
     try {
-      const programTrader = await this.bots.trader(trader);
-      outcome = await programTrader.place(
-        market.chain.marketId,
-        {
-          side: order.side,
-          type: order.type,
-          ...sendable,
-          reduceOnly: order.reduceOnly ?? false,
-          secret,
-          restingExpirySeconds:
-            rests && !order.reduceOnly
-              ? Math.floor(Date.now() / MS_PER_SECOND) + this.options.quoteExpirySeconds
-              : undefined,
-        },
-        this.perpMarketIds(),
+      outcome = await this.whileAwake(async () =>
+        (await this.bots.trader(trader)).place(
+          market.chain.marketId,
+          {
+            side: order.side,
+            type: order.type,
+            ...sendable,
+            reduceOnly: order.reduceOnly ?? false,
+            secret,
+            restingExpirySeconds:
+              rests && !order.reduceOnly
+                ? Math.floor(Date.now() / MS_PER_SECOND) + this.options.quoteExpirySeconds
+                : undefined,
+          },
+          this.perpMarketIds(),
+        ),
       );
     } catch (error) {
       this.secrets.retire(secret, Date.now());
@@ -354,15 +439,16 @@ export class RollupVenue implements Venue {
   }
 
   async cancelAll(trader: TraderKey, market: MarketId): Promise<number> {
-    const programTrader = await this.bots.trader(trader);
-    const cancelled = await programTrader.cancelAll(this.market(market).chain.marketId);
+    const cancelled = await this.whileAwake(async () =>
+      (await this.bots.trader(trader)).cancelAll(this.market(market).chain.marketId),
+    );
     if (cancelled === null) return 0;
     this.secrets.retireAll(market, trader, Date.now());
     return Number(cancelled);
   }
 
   async traderState(trader: TraderKey): Promise<TraderState> {
-    const view = await (await this.bots.trader(trader)).view();
+    const view = await this.whileAwake(async () => (await this.bots.trader(trader)).view());
     const { tokens } = this.options.settings.deployment;
     return traderStateOf(trader, view, this.followed.values(), tokens);
   }
@@ -379,10 +465,12 @@ export class RollupVenue implements Venue {
     const seat = seatOfTarget(target);
     const { chain, mark } = this.market(market);
     if (seat === null || mark === 0n) return false;
-    const programTrader = await this.bots.trader(liquidator);
-    this.liquidatorSeat ??= (await programTrader.view()).seat;
-    if (seat === this.liquidatorSeat) return false;
-    return programTrader.liquidate(chain.marketId, seat, mark, this.perpMarketIds());
+    return this.whileAwake(async () => {
+      const programTrader = await this.bots.trader(liquidator);
+      this.liquidatorSeat ??= (await programTrader.view()).seat;
+      if (seat === this.liquidatorSeat) return false;
+      return programTrader.liquidate(chain.marketId, seat, mark, this.perpMarketIds());
+    });
   }
 
   /** Where every open bot's order keys stand, by owner address, to save and restore from. */

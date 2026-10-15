@@ -43,7 +43,7 @@ const noiseTaker = (
   new NoiseTaker({
     market: market.id,
     baseToken: market.base,
-    traderCount: config.NOISE_TAKER_COUNT,
+    traderCount: Math.min(config.NOISE_TAKER_ACTIVE, config.NOISE_TAKER_COUNT),
     minSize: sizes.takerMin,
     maxSize: sizes.takerMax,
     lotSize: sizes.lotSize,
@@ -56,16 +56,23 @@ const noiseTaker = (
     random,
   });
 
+export interface BotProblems {
+  onError(what: string, error: unknown): void;
+  onRecovered(what: string): void;
+}
+
 /**
- * Opens and funds the makers, then starts every bot's loop: a maker and a
- * noise taker per market, one liquidator, and the funding updater where the
- * venue needs one.
+ * Opens and funds the makers, and returns what starts every bot's loop: a
+ * maker and a noise taker per market, one liquidator, and the funding updater
+ * where the venue needs one. Starting is separate from opening so that the
+ * loops can be stopped and started again without opening anything twice.
+ * Opening is safe to repeat after a failure.
  */
-export const startBots = async (
+export const openBots = async (
   config: Config,
   wiring: VenueWiring,
-  onError: (what: string, error: unknown) => void,
-): Promise<Repeating[]> => {
+  problems: BotProblems,
+): Promise<() => Repeating[]> => {
   const { venue, botVenue } = wiring;
   const random = new SeededRandom(config.NOISE_TAKER_SEED);
   const makers: HouseMaker[] = [];
@@ -83,32 +90,43 @@ export const startBots = async (
     markets: PERP_MARKET_IDS,
     startingQuoteBalance: config.LIQUIDATOR_STARTING_NUSD,
   });
+  const fundingUpdater = new FundingUpdater({
+    markets: PERP_MARKET_IDS,
+    intervalMs: config.FUNDING_INTERVAL_MS,
+    clock: systemClock,
+  });
   const loop = (what: string, intervalMs: number, tick: () => Promise<void>): Repeating =>
-    every(intervalMs, tick, (error) => onError(what, error));
-  const loops = [
-    ...makers.map((maker) =>
-      loop("maker tick failed", config.HOUSE_MAKER_TICK_MS, () => maker.tick(botVenue)),
-    ),
-    ...takers.map((taker) =>
-      loop("taker tick failed", config.NOISE_TAKER_TICK_MS, () => taker.tick(botVenue)),
-    ),
-    loop("liquidator tick failed", config.LIQUIDATOR_INTERVAL_MS, () =>
-      liquidator.tick(botVenue, wiring.liquidationTargets()),
-    ),
-  ];
-  if (wiring.needsFundingUpdater) {
-    const fundingUpdater = new FundingUpdater({
-      markets: PERP_MARKET_IDS,
-      intervalMs: config.FUNDING_INTERVAL_MS,
-      clock: systemClock,
-    });
-    loops.push(
-      loop(
-        "funding update failed",
-        Math.min(config.FUNDING_INTERVAL_MS, FUNDING_CHECK_AT_MOST_EVERY_MS),
-        () => fundingUpdater.tick(venue),
-      ),
+    every(
+      intervalMs,
+      tick,
+      (error) => problems.onError(what, error),
+      () => problems.onRecovered(what),
     );
-  }
-  return loops;
+  return () => {
+    const loops = [
+      ...makers.map((maker, at) =>
+        loop(`${MARKETS[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
+          maker.tick(botVenue),
+        ),
+      ),
+      ...takers.map((taker, at) =>
+        loop(`${MARKETS[at].id} taker tick`, config.NOISE_TAKER_TICK_MS, () =>
+          taker.tick(botVenue),
+        ),
+      ),
+      loop("liquidator tick", config.LIQUIDATOR_INTERVAL_MS, () =>
+        liquidator.tick(botVenue, wiring.liquidationTargets()),
+      ),
+    ];
+    if (wiring.needsFundingUpdater) {
+      loops.push(
+        loop(
+          "funding update",
+          Math.min(config.FUNDING_INTERVAL_MS, FUNDING_CHECK_AT_MOST_EVERY_MS),
+          () => fundingUpdater.tick(venue),
+        ),
+      );
+    }
+    return loops;
+  };
 };

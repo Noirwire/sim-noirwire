@@ -1,5 +1,5 @@
 import { type Connection, Keypair } from "@solana/web3.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MARKETS } from "../src/engine/markets.js";
 import type { ChainMarket } from "../src/rollup/chain-types.js";
 import { Session } from "../src/rollup/connections.js";
@@ -27,7 +27,7 @@ const SOL_PERP: ChainMarket = {
 const marketAwayFromItsTarget = (): RollupMarket => {
   const market = new RollupMarket(MARKETS[0], SOL_PERP, 9);
   market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
-  market.setTarget(dollars(151));
+  market.setTarget(dollars(151), Date.now());
   return market;
 };
 
@@ -36,7 +36,7 @@ const publisherOn = (market: RollupMarket, rollup: { clockSeconds: number; refus
   const publisher = new PricePublisher({
     program: {
       clockSeconds: async () => rollup.clockSeconds,
-      publishPrice: async (_connection, _oracle, _marketId, _price, publishTimeSeconds) => {
+      publishPrices: async (_connection, _oracle, _prices, publishTimeSeconds) => {
         if (rollup.refuses) throw new Error("the rollup did not confirm");
         publishTimes.push(publishTimeSeconds);
       },
@@ -45,32 +45,39 @@ const publisherOn = (market: RollupMarket, rollup: { clockSeconds: number; refus
     oracle: Session.of({} as Connection),
     oracleKey: Keypair.generate(),
     markets: [market],
-    intervalMs: 2_000,
+    intervalMs: 5_000,
+    maxSourceAgeMs: 30_000,
     onError: () => {},
+    onRecovered: () => {},
+    onUnreachable: () => {},
   });
   return { publisher, publishTimes };
 };
 
 describe("publishing a market's price", () => {
-  it("skips a publish while the rollup's clock still shows the second of the last accepted one", async () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("skips a publish while the rollup's clock still shows the second of the last accepted one, and says it did not establish a price", async () => {
     const market = marketAwayFromItsTarget();
     const rollup = { clockSeconds: 1_001 };
     const { publisher, publishTimes } = publisherOn(market, rollup);
 
-    await publisher.publishOnce(market);
-    await publisher.publishOnce(market);
+    await publisher.publishNow(0);
+    await expect(publisher.publishNow(0)).rejects.toThrow("NSOL-PERP");
     expect(publishTimes).toEqual([1_001]);
 
     rollup.clockSeconds = 1_002;
-    await publisher.publishOnce(market);
+    await publisher.publishNow(0);
     expect(publishTimes).toEqual([1_001, 1_002]);
   });
 
-  it("skips a publish at a second the chain's own feed has already taken", async () => {
+  it("skips a publish at a second the chain's own feed has already taken, and does not call that a fresh price", async () => {
     const market = marketAwayFromItsTarget();
     const { publisher, publishTimes } = publisherOn(market, { clockSeconds: 1_000 });
 
-    await publisher.publishOnce(market);
+    await expect(publisher.publishNow(0)).rejects.toThrow("NSOL-PERP");
+
     expect(publishTimes).toEqual([]);
     expect(publisher.lastPublishedAtMs(market)).toBe(0);
   });
@@ -80,9 +87,9 @@ describe("publishing a market's price", () => {
     const rollup = { clockSeconds: 1_001, refuses: true };
     const { publisher, publishTimes } = publisherOn(market, rollup);
 
-    await expect(publisher.publishOnce(market)).rejects.toThrow();
+    await expect(publisher.publishNow(0)).rejects.toThrow("the rollup did not confirm");
     rollup.refuses = false;
-    await publisher.publishOnce(market);
+    await publisher.publishNow(0);
     expect(publishTimes).toEqual([1_001]);
   });
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { Activity } from "../src/activity/activity.js";
 import { loadConfig, type Config } from "../src/config/config.js";
 import { CandleAggregator } from "../src/data/candles.js";
 import { FundLedger } from "../src/data/fund-ledger.js";
@@ -38,7 +39,12 @@ const buildCtx = (
     candles.record(fill);
     hub.broadcastFill(fill);
   });
-  return { ctx: { config, venue, tape, candles, stats, fundLedger, hub }, clock };
+  const activity = new Activity({
+    lifecycle: { wake: async () => {}, sleep: async () => {} },
+    idleAfterMs: 60_000,
+    onError: () => {},
+  });
+  return { ctx: { config, venue, tape, candles, stats, fundLedger, hub, activity }, clock };
 };
 
 let runningApp: FastifyInstance | null = null;

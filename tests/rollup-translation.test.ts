@@ -31,7 +31,7 @@ const SOL_PERP: ChainMarket = {
 const warmedUpAt150 = (): RollupMarket => {
   const market = new RollupMarket(MARKETS[0], SOL_PERP, 9);
   market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
-  market.setTarget(dollars(150));
+  market.setTarget(dollars(150), Date.now());
   return market;
 };
 
@@ -67,7 +67,7 @@ describe("an order on its way to the program", () => {
     expect(typeof chainPriceAndSize(market, order())).toBe("string");
 
     market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
-    market.setTarget(dollars(120));
+    market.setTarget(dollars(120), Date.now());
     expect(market.warmingUp).toBe(true);
     expect(typeof chainPriceAndSize(market, order())).toBe("string");
   });

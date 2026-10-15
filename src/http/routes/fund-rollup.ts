@@ -1,10 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import type { FundDesk } from "../../rollup/fund-desk.js";
+import { STILL_STARTING } from "../../engine/venue-not-ready.js";
+import type { FundRequests } from "../../rollup/fund-desk.js";
 import type { AppContext } from "../context.js";
 import { base58Address } from "../schemas.js";
 import { money } from "../serialize.js";
 
+const DESK_UNREACHABLE = "the rollup did not answer, try again";
+const DESK_COOLING_DOWN = "the rollup did not answer a moment ago, try again in a few seconds";
+const DESK_COOLDOWN_MS = 5_000;
+const DESK_BUSY = "the desk is busy with another request, try again";
 const ORDER_KEYS_PER_TRADER = 4;
 /** Well above an open-and-fund transaction in base64, well below anything worth parsing. */
 const MAX_TRANSACTION_CHARS = 4_096;
@@ -32,14 +37,69 @@ const submitSchema = z.object({
 export const registerRollupFundRoutes = (
   app: FastifyInstance,
   ctx: AppContext,
-  fundDesk: FundDesk,
+  fundDesk: FundRequests,
 ): void => {
-  const refusal = (owner: string, ip: string) => {
-    if (ctx.readiness && !ctx.readiness().botsFunded) {
-      return { status: 503 as const, reason: "the service is still starting, try again" };
+  /**
+   * Why the desk cannot be asked right now, or null. The request that got
+   * here already asked for activity, so a service that is asleep is waking.
+   */
+  const unavailable = (): string | null => {
+    const readiness = ctx.readiness?.();
+    if (ctx.startUp && !ctx.startUp.ready) return STILL_STARTING;
+    if (readiness && !readiness.botsFunded) return STILL_STARTING;
+    if (ctx.activity.phase !== "awake")
+      return "the service is waking up, try again in a few seconds";
+    if (readiness && !readiness.connected) {
+      return "the rollup cannot be reached right now, try again";
     }
-    const decision = ctx.fundLedger.check(owner, ip);
+    return null;
+  };
+
+  /** When the rollup last failed the desk: nobody is sent to it again for a few seconds, whoever they are. */
+  let deskFailedAtMs = -Infinity;
+  /** The desk takes one call at a time, so a burst cannot all pass the gate before the first fails. */
+  let deskBusy = false;
+
+  /**
+   * Why a request is turned away before it reaches the desk, or null. A
+   * `submit` is for a transaction `prepare` made and counted, so the IP limit
+   * that `prepare` paid for does not turn it away again.
+   */
+  const refusal = (owner: string, ip: string, submitting: boolean) => {
+    const reason =
+      unavailable() ??
+      (deskBusy ? DESK_BUSY : null) ??
+      (Date.now() - deskFailedAtMs < DESK_COOLDOWN_MS ? DESK_COOLING_DOWN : null);
+    if (reason) return { status: 503 as const, reason };
+    const decision = submitting
+      ? ctx.fundLedger.checkAddress(owner)
+      : ctx.fundLedger.check(owner, ip);
     return decision.ok ? null : decision;
+  };
+
+  /**
+   * Asks the desk, and answers null if it throws. A throw, or an answer that
+   * the rollup could not be reached or refused (502 or 503), starts the
+   * cooldown. Every try counts against the sender's IP: in `prepare` when it
+   * is asked, in `submit` when it ends without a grant, so a normal user costs
+   * one and a burst of failures runs into the limit.
+   */
+  const asked = async <T extends { ok: boolean; status?: number }>(
+    ask: () => Promise<T>,
+  ): Promise<T | null> => {
+    deskBusy = true;
+    try {
+      const answer = await ask();
+      if (!answer.ok && (answer.status === 502 || answer.status === 503)) {
+        deskFailedAtMs = Date.now();
+      }
+      return answer;
+    } catch {
+      deskFailedAtMs = Date.now();
+      return null;
+    } finally {
+      deskBusy = false;
+    }
   };
 
   app.post("/v1/fund/prepare", async (request, reply) => {
@@ -48,10 +108,12 @@ export const registerRollupFundRoutes = (
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
     const { owner, orderKeys } = parsed.data;
-    const refused = refusal(owner, request.ip);
+    const refused = refusal(owner, request.ip, false);
     if (refused) return reply.status(refused.status).send({ error: refused.reason });
 
-    const prepared = await fundDesk.prepare(owner, orderKeys);
+    ctx.fundLedger.countAgainstIp(request.ip);
+    const prepared = await asked(() => fundDesk.prepare(owner, orderKeys));
+    if (!prepared) return reply.status(502).send({ error: DESK_UNREACHABLE });
     if (!prepared.ok) return reply.status(prepared.status).send({ error: prepared.reason });
     return {
       transaction: prepared.transaction,
@@ -66,12 +128,19 @@ export const registerRollupFundRoutes = (
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
     const { owner, transaction } = parsed.data;
-    const refused = refusal(owner, request.ip);
+    const refused = refusal(owner, request.ip, true);
     if (refused) return reply.status(refused.status).send({ error: refused.reason });
 
-    const funded = await fundDesk.submit(owner, transaction);
-    if (!funded.ok) return reply.status(funded.status).send({ error: funded.reason });
-    ctx.fundLedger.record(owner, request.ip);
+    const funded = await asked(() => fundDesk.submit(owner, transaction));
+    if (!funded) {
+      ctx.fundLedger.countAgainstIp(request.ip);
+      return reply.status(502).send({ error: DESK_UNREACHABLE });
+    }
+    if (!funded.ok) {
+      ctx.fundLedger.countAgainstIp(request.ip);
+      return reply.status(funded.status).send({ error: funded.reason });
+    }
+    ctx.fundLedger.recordGrant(owner);
     ctx.stats.recordTrader(owner);
     return { amount: money(ctx.config.FUND_AMOUNT_NUSD), reference: funded.signature };
   });

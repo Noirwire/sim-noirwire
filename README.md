@@ -118,9 +118,37 @@ start when a required one is missing or a key is not the one the deployment name
 | `ORACLE_SECRET_KEY_FILE`, `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE` | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine |
 | `BOT_TRADER_SEEDS`                                                         | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
 | `SERVICE_LOCATION`                                                         | no       | Where the service runs; labels the latency figure                                        |
-| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`                 | no       | Publish cadence (2 s) and how long a resting bot quote stays valid by itself (30 s)      |
+| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`                 | no       | Publish cadence (5 s) and how long a resting bot quote stays valid by itself (180 s)     |
+| `IDLE_AFTER_MS`                                                            | no       | How long the service keeps trading after the last request or stream socket (10 minutes)  |
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`               | no       | Bot order sizes as notional                                                              |
 | `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                      | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
+
+### Awake and asleep
+
+A hosted rollup endpoint rate-limits a client that never stops asking, so with
+`VENUE=rollup` the service only works while somebody wants it to. After its one-time
+start-up work (connect, open and fund the bots) it is **asleep**: no price publishing, no
+bot loops, no reads of the chain, no websocket to the rollup, and Jupiter is polled once a
+minute. Snapshots keep being saved.
+
+- **Wakes** on any request to the public API (markets, tape, candles, stats, deployment, fund)
+  and on an open `/v1/stream` socket. `/v1/health` and paths that match no route do not wake it.
+  The request that wakes it does not wait: `/v1/markets` reports every market as `warmingUp`
+  until a fresh price is on chain and the loops run.
+- **Stays awake** while any stream socket is open, and for `IDLE_AFTER_MS` (10 minutes) after
+  the last request or the last socket closing.
+- **Starts asleep**, unless a request arrives while it starts.
+- `VENUE=memory` sends nothing outside the process, so it never sleeps.
+
+If the rollup refuses or is away at start-up, the HTTP API still starts and serves what needs
+no rollup (tape, candles and stats from the snapshot). `/v1/health` answers 503 with a
+`reason`, `/v1/markets`, `/v1/deployment` and the fund routes answer 503, and the start-up
+work is retried after 5 s, 10 s, 20 s and so on up to 5 minutes, but only while somebody is
+using the service: with nobody around, a refusing host is left alone after the first try.
+What a failed try opened is stopped before the next one. The rollup websocket
+reconnects on the same schedule, and a loop that keeps failing is asked less often (at most
+every 30 s) until it works. Logs say when something starts failing, a summary once a minute
+while it goes on, and when it works again.
 
 The fund button with `VENUE=rollup` is two steps, because the user's own key has to sign:
 
@@ -162,25 +190,25 @@ ones:
 | `JUPITER_POLL_INTERVAL_MS`                      | `2000`                  | How often every market's price is fetched, in one request                            |
 | `HOUSE_MAKER_*`                                 | see file                | Ladder depth, spread, requote thresholds, position limit, skew                       |
 | `NOISE_TAKER_*`                                 | see file                | How many bot traders, how often, how big                                             |
-| `LIQUIDATOR_INTERVAL_MS`, `FUNDING_INTERVAL_MS` | `3000`, `60000`         | Scan/update cadence                                                                  |
+| `LIQUIDATOR_INTERVAL_MS`, `FUNDING_INTERVAL_MS` | `60000`, `60000`        | Scan/update cadence                                                                  |
 
 ## API
 
 Prefix `/v1`. Every price, size and balance in a response is a plain decimal string (never
 a float, never a raw `bigint`), scaled from the engine's internal fixed-point integers.
 
-| Route                                                    | Returns                                                                                                                                                                                                                                                                                           |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /health`                                            | `{ ok, venue, network }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded`, and 503 until all three hold                                                                                                                                                                         |
-| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, and `warmingUp` (true with `VENUE=rollup` until the chain's price first reaches the real one; nothing is charted or traded by the bots before)                                           |
-| `GET /deployment`                                        | `VENUE=rollup` only, public, cacheable. Program id, the URLs a browser should use, exchange and stats addresses, and per market its on-chain id, addresses, token mints, decimals, lot size and tick. No key. Fields: [docs/DESIGN.md](docs/DESIGN.md)                                            |
-| `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity. With `VENUE=rollup` `makerTag` and `takerTag` are the chain's 8-byte receipts as big-endian unsigned decimal text                                                                                     |
-| `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                                                                                                                                                                                     |
-| `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at. With `VENUE=rollup` also `botOrdersOutcomeUnknown`: bot orders whose outcome was not known in time, and how many of them settled as executed late or as expired |
-| `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                                                                                                                                                                                          |
-| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                                                              |
-| `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                                                                                                                                                                                     |
-| `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                                                                                                                                                                                     |
+| Route                                                    | Returns                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /health`                                            | `{ ok, venue, network, awake }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded` and, while it is failing, `reason`. 503 until start-up is done and the bots are funded, and while awake also until `connected` and `pricesFresh`. An asleep service is healthy with stale prices. Never wakes the service |
+| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, and `warmingUp` (true with `VENUE=rollup` until the chain's price first reaches the real one; nothing is charted or traded by the bots before)                                                                      |
+| `GET /deployment`                                        | `VENUE=rollup` only, public, cacheable. Program id, the URLs a browser should use, exchange and stats addresses, and per market its on-chain id, addresses, token mints, decimals, lot size and tick. No key. Fields: [docs/DESIGN.md](docs/DESIGN.md)                                                                       |
+| `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity. With `VENUE=rollup` `makerTag` and `takerTag` are the chain's 8-byte receipts as big-endian unsigned decimal text                                                                                                                |
+| `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                                                                                                                                                                                                                |
+| `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at. With `VENUE=rollup` also `botOrdersOutcomeUnknown`: bot orders whose outcome was not known in time, and how many of them settled as executed late or as expired                            |
+| `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                                                                                                                                                                                                                     |
+| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                                                                                         |
+| `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                                                                                                                                                                                                                |
+| `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                                                                                                                                                                                                                |
 
 ## How numbers are labelled
 

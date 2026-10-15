@@ -57,6 +57,7 @@ interface Body {
   orders: { user: number; bot: number };
   volume: { user: string; bot: string };
   latency: { sampleSize: number; measuredFrom: string };
+  awake: boolean;
   transaction: string;
   amount: string;
 }
@@ -109,7 +110,7 @@ const signAndSubmit = (user: User, preparedTransaction: string) =>
 const DATA_DIR = join("data-test", `rollup-${Date.now()}`);
 const botSeeds = Array.from({ length: 16 }, () => randomBytes(32).toString("hex")).join(",");
 
-const startService = async (): Promise<WarmUp> => {
+const startService = async (extraEnv: Record<string, string> = {}): Promise<WarmUp> => {
   const config = loadConfig({
     VENUE: "rollup",
     HOST: "127.0.0.1",
@@ -127,6 +128,7 @@ const startService = async (): Promise<WarmUp> => {
     PUBLIC_ROLLUP_RPC_URL: "https://rollup.browser.example",
     NOISE_TAKER_MIN_INTERVAL_MS: "300",
     NOISE_TAKER_MAX_INTERVAL_MS: "900",
+    ...extraEnv,
   } as NodeJS.ProcessEnv);
   running = await startApp({ ...config, PORT: 0 }, { priceSource: prices });
   base = `http://127.0.0.1:${running.port}`;
@@ -383,7 +385,8 @@ describe("the service on the real program (local network)", () => {
       const priceBefore = (await program.price(chain, PERP_ID)).publishTimeSeconds;
       network.restore();
       await eventually("health to turn 200 again", async () => (await healthNow()) === 200, 60_000);
-      expect(Date.now() - cutUntil).toBeLessThan(30_000);
+      // Loops that failed for a while wait up to 30 s before they ask again.
+      expect(Date.now() - cutUntil).toBeLessThan(60_000);
 
       expect((await program.price(chain, PERP_ID)).publishTimeSeconds).toBeGreaterThan(priceBefore);
       await eventually("the bots to fill again", async () => {
@@ -398,5 +401,37 @@ describe("the service on the real program (local network)", () => {
       clearInterval(keepPricing);
       network.restore();
     }
+  });
+
+  it("sends nothing to the rollup while nobody uses it, and wakes on the next request", async () => {
+    await running.close();
+    await startService({ IDLE_AFTER_MS: "6000" });
+    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    await eventually("the service to go to sleep once nothing asks it for anything", async () => {
+      const { status, body } = await getJson("/v1/health");
+      return status === 200 && body.awake === false;
+    });
+    const publishedAt = (await program.price(chain, PERP_ID)).publishTimeSeconds;
+    const fillsAt = (await program.tape(chain, PERP_ID)).lastSequence;
+
+    await pause(15_000);
+    expect((await program.price(chain, PERP_ID)).publishTimeSeconds).toBe(publishedAt);
+    expect((await program.tape(chain, PERP_ID)).lastSequence).toBe(fillsAt);
+    const stillAsleep = await getJson("/v1/health");
+    expect(stillAsleep.status).toBe(200);
+    expect(stillAsleep.body.awake).toBe(false);
+
+    pushPrices(REAL_SOL_PRICE, 181);
+    const waking = await getJson("/v1/markets");
+    expect(waking.body.markets.every((market) => market.warmingUp)).toBe(true);
+    await eventually("a fresh price on chain", async () => {
+      return (await program.price(chain, PERP_ID)).publishTimeSeconds > publishedAt;
+    });
+    await eventually("the bots to fill again", async () => {
+      return (await program.tape(chain, PERP_ID)).lastSequence > fillsAt;
+    });
+    const awake = await getJson("/v1/health");
+    expect(awake.body.awake).toBe(true);
   });
 });
