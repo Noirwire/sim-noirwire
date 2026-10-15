@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Activity, type Lifecycle } from "../src/activity/activity.js";
 
 const IDLE_MS = 10 * 60_000;
+const AFTER_LAST_SOCKET_MS = 15_000;
 
 /** A lifecycle that counts its calls and finishes a wake only when the test lets it. */
 const recordingLifecycle = () => {
@@ -28,6 +29,7 @@ const activityOn = (lifecycle: Lifecycle, errors: string[] = []) =>
   new Activity({
     lifecycle,
     idleAfterMs: IDLE_MS,
+    idleAfterLastSocketMs: AFTER_LAST_SOCKET_MS,
     onError: (what) => errors.push(what),
   });
 
@@ -160,11 +162,55 @@ describe("when the service is awake", () => {
     expect(calls).toEqual(["wake"]);
 
     closeSocket();
-    await vi.advanceTimersByTimeAsync(IDLE_MS - 1);
+    await vi.advanceTimersByTimeAsync(AFTER_LAST_SOCKET_MS - 1);
     expect(activity.phase).toBe("awake");
     await vi.advanceTimersByTimeAsync(1);
     expect(activity.phase).toBe("asleep");
     expect(calls).toEqual(["wake", "sleep"]);
+  });
+
+  it("sleeps soon after the page closes, even though the page made requests", async () => {
+    const { calls, lifecycle } = recordingLifecycle();
+    const activity = activityOn(lifecycle);
+    activity.touch();
+    const closeSocket = activity.socketOpened();
+    activity.touch();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    closeSocket();
+    await vi.advanceTimersByTimeAsync(AFTER_LAST_SOCKET_MS);
+
+    expect(activity.phase).toBe("asleep");
+    expect(calls).toEqual(["wake", "sleep"]);
+  });
+
+  it("keeps trading through a page reload that reconnects within the grace", async () => {
+    const { calls, lifecycle } = recordingLifecycle();
+    const activity = activityOn(lifecycle);
+    const before = activity.socketOpened();
+    await vi.advanceTimersByTimeAsync(0);
+
+    before();
+    await vi.advanceTimersByTimeAsync(AFTER_LAST_SOCKET_MS - 1_000);
+    activity.socketOpened();
+    await vi.advanceTimersByTimeAsync(IDLE_MS);
+
+    expect(activity.phase).toBe("awake");
+    expect(calls).toEqual(["wake"]);
+  });
+
+  it("gives a request after the page closed the full idle time", async () => {
+    const { lifecycle } = recordingLifecycle();
+    const activity = activityOn(lifecycle);
+    const closeSocket = activity.socketOpened();
+    await vi.advanceTimersByTimeAsync(0);
+    closeSocket();
+
+    activity.touch();
+    await vi.advanceTimersByTimeAsync(IDLE_MS - 1);
+    expect(activity.phase).toBe("awake");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(activity.phase).toBe("asleep");
   });
 
   it("stays awake while any one of several sockets is open", async () => {
@@ -179,7 +225,7 @@ describe("when the service is awake", () => {
     expect(activity.phase).toBe("awake");
 
     second();
-    await vi.advanceTimersByTimeAsync(IDLE_MS);
+    await vi.advanceTimersByTimeAsync(AFTER_LAST_SOCKET_MS);
     expect(activity.phase).toBe("asleep");
   });
 

@@ -38,15 +38,17 @@ const envSchema = z.object({
   ALLOWED_ORIGINS: commaSeparated("http://localhost:3000"),
   DATA_DIR: z.string().default("./data"),
   SNAPSHOT_INTERVAL_MS: positiveInt(30_000),
-  /** VENUE=rollup: how long the service keeps trading after the last request or stream socket. */
+  /** VENUE=rollup: how long the service keeps trading after the last request, with no stream socket open. */
   IDLE_AFTER_MS: positiveInt(10 * 60_000),
+  /** VENUE=rollup: how long it keeps trading after the last stream socket closes, so a page reload does not stop it. */
+  IDLE_AFTER_LAST_SOCKET_MS: positiveInt(15_000),
 
   FUND_AMOUNT_NUSD: decimalAmount("5000"),
   FUND_IP_RATE_LIMIT: positiveInt(20),
   FUND_IP_RATE_WINDOW_MS: positiveInt(60 * 60_000),
 
   JUPITER_BASE_URL: z.string().default("https://lite-api.jup.ag/price/v3"),
-  JUPITER_POLL_INTERVAL_MS: positiveInt(2_000),
+  JUPITER_POLL_INTERVAL_MS: positiveInt(4_000),
 
   INSURANCE_SEED_NUSD: decimalAmount("10000000"),
   MAX_FUNDING_RATE_BPS_PER_UPDATE: positiveInt(75),
@@ -65,8 +67,8 @@ const envSchema = z.object({
   NOISE_TAKER_COUNT: positiveInt(6),
   /** How many of the takers trade. Each one that trades keeps a client running on the rollup. */
   NOISE_TAKER_ACTIVE: positiveInt(2),
-  NOISE_TAKER_MIN_INTERVAL_MS: positiveInt(10_000),
-  NOISE_TAKER_MAX_INTERVAL_MS: positiveInt(30_000),
+  NOISE_TAKER_MIN_INTERVAL_MS: positiveInt(3_000),
+  NOISE_TAKER_MAX_INTERVAL_MS: positiveInt(5_000),
   NOISE_TAKER_WORST_SLIPPAGE_BPS: positiveInt(50),
   NOISE_TAKER_STARTING_NUSD: decimalAmount("100000"),
   NOISE_TAKER_STARTING_BASE: decimalAmount("1000"),

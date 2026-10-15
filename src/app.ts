@@ -201,6 +201,7 @@ export const startApp = async (
   const activity = new Activity({
     lifecycle,
     idleAfterMs: config.IDLE_AFTER_MS,
+    idleAfterLastSocketMs: config.IDLE_AFTER_LAST_SOCKET_MS,
     onError: logError,
     onDemand: () => startUp.demand(),
   });

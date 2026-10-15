@@ -4,6 +4,8 @@ import type { AppContext } from "../context.js";
 import { marketId } from "../schemas.js";
 
 const POLICY_VIOLATION = 1008;
+/** A socket that has not answered a ping by the next one is dropped, so a vanished browser stops keeping the service awake. */
+const HEARTBEAT_MS = 30_000;
 
 const querySchema = z.object({ market: marketId });
 
@@ -22,7 +24,19 @@ export const registerStreamRoute = (app: FastifyInstance, ctx: AppContext): void
       if (socket.readyState === socket.OPEN) socket.send(payload);
     });
     const released = ctx.activity.socketOpened();
+    let answered = true;
+    socket.on("pong", () => (answered = true));
+    const heartbeat = setInterval(() => {
+      if (!answered) {
+        socket.terminate();
+        return;
+      }
+      answered = false;
+      socket.ping();
+    }, HEARTBEAT_MS);
+    heartbeat.unref();
     socket.on("close", () => {
+      clearInterval(heartbeat);
       unsubscribe();
       released();
     });
