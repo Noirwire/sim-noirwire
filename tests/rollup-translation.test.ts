@@ -25,13 +25,15 @@ const SOL_PERP: ChainMarket = {
   fundingIntervalSeconds: 60,
   baseToken: 1,
   quoteToken: 0,
+  positionCap: 1_000_000n,
+  status: "active",
+  oracleHealth: "healthy",
 };
 
 /** One lot is 0.001 SOL; a chain price is quote atoms per lot. */
-const warmedUpAt150 = (): RollupMarket => {
+const markedAt150 = (): RollupMarket => {
   const market = new RollupMarket(MARKETS[0], SOL_PERP, 9);
   market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
-  market.setTarget(dollars(150), Date.now());
   return market;
 };
 
@@ -59,28 +61,32 @@ describe("an order on its way to the program", () => {
   });
 
   it("turns a price per unit and a size in units into a price per lot and lots", () => {
-    expect(chainPriceAndSize(warmedUpAt150(), order())).toEqual({ price: 150_000n, size: 2_000n });
+    expect(chainPriceAndSize(markedAt150(), order())).toEqual({ price: 150_000n, size: 2_000n });
   });
 
-  it("refuses an order before the market has a mark, and while the mark is still warming up", () => {
+  it("refuses an order before the market has a mark, and takes it once the chain shows one", () => {
     const market = new RollupMarket(MARKETS[0], SOL_PERP, 9);
     expect(typeof chainPriceAndSize(market, order())).toBe("string");
 
     market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
-    market.setTarget(dollars(120), Date.now());
-    expect(market.warmingUp).toBe(true);
-    expect(typeof chainPriceAndSize(market, order())).toBe("string");
+    expect(typeof chainPriceAndSize(market, order())).toBe("object");
+  });
+
+  it("calls the chain's mark fresh only within the market's own age limit", () => {
+    const market = markedAt150();
+    expect(market.priceIsFresh(1_000_000 + 9_000)).toBe(true);
+    expect(market.priceIsFresh(1_000_000 + 10_000)).toBe(false);
   });
 
   it("refuses a size that is not whole lots and a price finer than the market counts", () => {
-    const market = warmedUpAt150();
+    const market = markedAt150();
     expect(typeof chainPriceAndSize(market, order({ size: 2_000_500n }))).toBe("string");
     expect(typeof chainPriceAndSize(market, order({ price: 150_000_001n }))).toBe("string");
   });
 });
 
 describe("what the program made of a bot's order", () => {
-  const market = warmedUpAt150();
+  const market = markedAt150();
   const result = (over: Partial<PlaceOutcome>) =>
     placeResultOf("bot#1", order(), market, 2_000n, outcome(over));
 
@@ -107,8 +113,8 @@ describe("what the program made of a bot's order", () => {
 
 describe("a trader's own view of its seat", () => {
   const tokens = [
-    { index: 0, symbol: "nUSD", decimals: 6, mint: "nusd-mint" },
-    { index: 1, symbol: "nSOL", decimals: 9, mint: "nsol-mint" },
+    { index: 0, symbol: "nUSD", decimals: 6, mint: "nusd-mint", custodyNonce: "1" },
+    { index: 1, symbol: "nSOL", decimals: 9, mint: "nsol-mint", custodyNonce: "2" },
   ];
   const view: SeatView = {
     seat: 7,
@@ -121,7 +127,7 @@ describe("a trader's own view of its seat", () => {
     ordersMarketId: 0,
     orders: [{ side: "sell", price: 151_000n, remaining: 500n, sequence: 42n }],
   };
-  const state = traderStateOf("bot:maker:NSOL-PERP", view, [warmedUpAt150()], tokens);
+  const state = traderStateOf("bot:maker:NSOL-PERP", view, [markedAt150()], tokens);
 
   it("shows a short as a negative size at the price it was entered, and marks it into equity", () => {
     expect(state.positions["NSOL-PERP"]).toEqual({ size: -dollars(2), entryPrice: dollars(148) });

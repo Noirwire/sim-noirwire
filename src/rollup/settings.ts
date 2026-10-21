@@ -2,15 +2,20 @@ import { readFileSync } from "node:fs";
 import { Keypair } from "@solana/web3.js";
 import { z } from "zod";
 import type { Config } from "../config/config.js";
+import type { MarketConfig } from "../engine/markets.js";
 
 const address = z.string().min(32).max(44);
 
+/**
+ * Only what this service reads of the description the order book
+ * repository's set-up writes. A test network's names a faucet; a
+ * mainnet-profile deployment has none, and prices its markets from Pyth.
+ */
 const deploymentSchema = z.object({
   network: z.string(),
   programId: address,
   gate: address,
-  oracle: address,
-  faucet: address,
+  faucet: address.optional(),
   depositUrl: z.url(),
   tokens: z.array(
     z.object({
@@ -18,6 +23,8 @@ const deploymentSchema = z.object({
       symbol: z.string(),
       decimals: z.number().int().nonnegative(),
       mint: address,
+      /** The nonce of the token's custody authority, as decimal text: every deposit names it. */
+      custodyNonce: z.string().regex(/^\d+$/, "must be decimal text"),
     }),
   ),
   markets: z.array(
@@ -34,7 +41,7 @@ const deploymentSchema = z.object({
 export type Deployment = z.infer<typeof deploymentSchema>;
 
 const URLS = ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL"] as const;
-const ROLE_KEYS = ["ORACLE_SECRET_KEY", "GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
+const ROLE_KEYS = ["GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
 type RoleKey = (typeof ROLE_KEYS)[number];
 
 export type RollupEnv = Pick<
@@ -59,9 +66,9 @@ export interface RollupSettings {
    */
   depositRpcUrl: string;
   deployment: Deployment;
-  oracle: Keypair;
   gate: Keypair;
-  faucet: Keypair;
+  /** Null on a deployment without a faucet: this service then deposits nothing. */
+  faucet: Keypair | null;
   botOwners: Keypair[];
 }
 
@@ -108,61 +115,106 @@ const botOwnersFrom = (value: string, needed: number): Keypair[] => {
   return seeds.slice(0, needed).map((seed) => Keypair.fromSeed(Buffer.from(seed, "hex")));
 };
 
-/** The deployment description, checked to hold every market in `marketSymbols`. */
+const issuesOf = (error: z.ZodError): string =>
+  error.issues
+    .map((issue) => `${issue.path.join(".") || "the description"}: ${issue.message}`)
+    .join("; ");
+
+/**
+ * The deployment description, from DEPLOYMENT_JSON or the file DEPLOYMENT_PATH
+ * names. One this service cannot read is refused with every field that is
+ * wrong, and one without custody nonces (written before the client release
+ * that names them in every deposit) is called the stale description it is.
+ */
 export const loadDeployment = (
   env: Pick<RollupEnv, "DEPLOYMENT_JSON" | "DEPLOYMENT_PATH">,
-  marketSymbols: string[],
 ): Deployment => {
   const raw =
     env.DEPLOYMENT_JSON ??
     (env.DEPLOYMENT_PATH ? readFileSync(env.DEPLOYMENT_PATH, "utf8") : undefined);
   if (raw === undefined) throw new Error("set DEPLOYMENT_JSON or DEPLOYMENT_PATH");
-  const deployment = deploymentSchema.parse(JSON.parse(raw));
-  for (const symbol of marketSymbols) deployedMarket(deployment, symbol);
-  return deployment;
+  const parsed = deploymentSchema.safeParse(JSON.parse(raw));
+  if (parsed.success) return parsed.data;
+  const noNonce = parsed.error.issues.some((issue) => issue.path.at(-1) === "custodyNonce");
+  if (noNonce) {
+    throw new Error(
+      "the deployment description names no custody nonce for its tokens: it was written by an " +
+        "order book set-up older than this service's client, and that deployment is retired here. " +
+        "Point DEPLOYMENT_PATH or DEPLOYMENT_JSON at a description a current set-up wrote " +
+        `(docs/deploy.md). What does not fit: ${issuesOf(parsed.error)}`,
+    );
+  }
+  throw new Error(`the deployment description does not fit: ${issuesOf(parsed.error)}`);
+};
+
+/**
+ * The symbols a deployment may give a market of this service: a test
+ * network's own, and the mainnet profile's SOL perpetual.
+ */
+const CHAIN_SYMBOLS_OF: Record<string, string[]> = { "NSOL-PERP": ["NSOL-PERP", "SOL-PERP"] };
+
+const findDeployedMarket = (
+  deployment: Deployment,
+  symbol: string,
+): Deployment["markets"][number] | undefined => {
+  const symbols = CHAIN_SYMBOLS_OF[symbol] ?? [symbol];
+  return deployment.markets.find((entry) => symbols.includes(entry.symbol));
 };
 
 export const deployedMarket = (
   deployment: Deployment,
   symbol: string,
 ): Deployment["markets"][number] => {
-  const market = deployment.markets.find((entry) => entry.symbol === symbol);
+  const market = findDeployedMarket(deployment, symbol);
   if (!market) throw new Error(`the deployment has no market ${symbol}`);
   return market;
+};
+
+/** The markets of this service that the deployment has, in this service's order. Throws when it has none. */
+export const deployedMarkets = (
+  deployment: Deployment,
+  markets: readonly MarketConfig[],
+): MarketConfig[] => {
+  const found = markets.filter((market) => findDeployedMarket(deployment, market.id));
+  if (found.length === 0) {
+    throw new Error(
+      `the deployment has none of the markets ${markets.map((market) => market.id).join(", ")}`,
+    );
+  }
+  return found;
 };
 
 /**
  * Everything VENUE=rollup needs, checked before anything is sent: every
  * value present, every key well formed and the very key the deployment names
- * for its role. Security: throws with the name of what is wrong, never with a secret.
+ * for its role. The faucet key is needed only when the deployment names a
+ * faucet. Security: throws with the name of what is wrong, never with a secret.
  */
 export const loadRollupSettings = (
   env: RollupEnv,
+  deployment: Deployment,
   botCount: number,
-  marketSymbols: string[],
 ): RollupSettings => {
   const [solanaRpcUrl, rollupRpcUrl, rollupWsUrl] = URLS.map((name) => env[name] ?? "");
   const botSeeds = env.BOT_TRADER_SEEDS ?? "";
+  const neededKeys = deployment.faucet ? ROLE_KEYS : (["GATE_SECRET_KEY"] as const);
   const missing = [
     ...URLS.filter((name) => !env[name]),
     ...(botSeeds ? [] : ["BOT_TRADER_SEEDS"]),
-    ...ROLE_KEYS.filter((name) => !env[name] && !env[`${name}_FILE`]),
+    ...neededKeys.filter((name) => !env[name] && !env[`${name}_FILE`]),
   ];
   if (missing.length > 0) throw new Error(`VENUE=rollup needs ${missing.join(", ")}`);
   for (const name of URLS) {
     if (!URL.canParse(env[name] ?? "")) throw new Error(`${name} must be a URL`);
   }
 
-  const deployment = loadDeployment(env, marketSymbols);
-  const roles = {
-    oracle: roleKey(env, "ORACLE_SECRET_KEY"),
-    gate: roleKey(env, "GATE_SECRET_KEY"),
-    faucet: roleKey(env, "FAUCET_SECRET_KEY"),
-  };
-  for (const role of ["oracle", "gate", "faucet"] as const) {
-    if (roles[role].publicKey.toBase58() !== deployment[role]) {
-      throw new Error(`the ${role} key is not the ${role} this deployment names`);
-    }
+  const gate = roleKey(env, "GATE_SECRET_KEY");
+  if (gate.publicKey.toBase58() !== deployment.gate) {
+    throw new Error("the gate key is not the gate this deployment names");
+  }
+  const faucet = deployment.faucet ? roleKey(env, "FAUCET_SECRET_KEY") : null;
+  if (faucet && faucet.publicKey.toBase58() !== deployment.faucet) {
+    throw new Error("the faucet key is not the faucet this deployment names");
   }
 
   return {
@@ -171,7 +223,8 @@ export const loadRollupSettings = (
     rollupWsUrl,
     depositRpcUrl: env.DEPOSIT_RPC_URL || deployment.depositUrl,
     deployment,
-    ...roles,
+    gate,
+    faucet,
     botOwners: botOwnersFrom(botSeeds, botCount),
   };
 };

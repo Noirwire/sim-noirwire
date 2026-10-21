@@ -1,7 +1,7 @@
 import type { Connection } from "@solana/web3.js";
 import { InFlight } from "../scheduling/in-flight.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
-import type { ChainPrice, ChainStats } from "./chain-types.js";
+import type { ChainExchange, ChainMarket, ChainPrice, ChainStats } from "./chain-types.js";
 import { hangUp } from "./connections.js";
 import type { Program } from "./program.js";
 import { TapeTracker, type TapeUpdate } from "./tape-tracker.js";
@@ -10,18 +10,26 @@ export interface ChainFeedHandlers {
   onPrice(marketId: number, price: ChainPrice): void;
   onTape(marketId: number, update: TapeUpdate, readAtMs: number): void;
   onStats(stats: ChainStats): void;
+  /** The market's settings and state: whether it is paused, reduce-only or dislocated. */
+  onMarket(market: ChainMarket): void;
+  onExchange(exchange: ChainExchange): void;
   onError(what: string, error: unknown): void;
   onRecovered(what: string): void;
+  /** Full reads failed in a row: the rollup is not answering. */
+  onUnreachable(): void;
 }
 
 /** How often every account is read in full, as the safety net under the websocket. */
 export const REREAD_INTERVAL_MS = 60_000;
 const REREAD_FAILING = "reading the public accounts";
+/** Full reads that fail in a row before the rollup counts as away. */
+const FAILED_READS_BEFORE_UNREACHABLE = 2;
 
 /**
  * The public accounts of every market, followed over the rollup's websocket:
- * the tape, the price feed and the stats. A websocket drops notifications
- * while it reconnects, so every account is also read in full on an interval;
+ * the tape, the price feed, the market itself, the exchange and the stats. A
+ * websocket drops notifications while it reconnects, so every account is also
+ * read in full on an interval;
  * the tape tracker turns either source into each fill exactly once.
  *
  * Following can be paused and resumed: pausing ends the websocket for good
@@ -73,13 +81,23 @@ export class ChainFeed {
       program.subscribeTape(connection, marketId, (tape) =>
         handlers.onTape(marketId, tracker.take(tape), Date.now()),
       );
+      program.subscribeMarket(connection, marketId, (market) => handlers.onMarket(market));
     }
+    program.subscribeExchange(connection, (exchange) => handlers.onExchange(exchange));
     program.subscribeStats(connection, (stats) => handlers.onStats(stats));
+    let failedReads = 0;
     this.rereading = every(
       REREAD_INTERVAL_MS,
       () => this.read(connection),
-      (error) => handlers.onError(REREAD_FAILING, error),
-      () => handlers.onRecovered(REREAD_FAILING),
+      (error) => {
+        handlers.onError(REREAD_FAILING, error);
+        failedReads += 1;
+        if (failedReads === FAILED_READS_BEFORE_UNREACHABLE) handlers.onUnreachable();
+      },
+      () => {
+        failedReads = 0;
+        handlers.onRecovered(REREAD_FAILING);
+      },
     );
   }
 
@@ -99,7 +117,13 @@ export class ChainFeed {
       const tape = await program.tape(connection, marketId);
       if (!live()) return;
       handlers.onTape(marketId, tracker.take(tape), readAtMs);
+      const market = await program.market(connection, marketId);
+      if (!live()) return;
+      handlers.onMarket(market);
     }
+    const exchange = await program.exchange(connection);
+    if (!live()) return;
+    handlers.onExchange(exchange);
     const stats = await program.stats(connection);
     if (!live()) return;
     handlers.onStats(stats);

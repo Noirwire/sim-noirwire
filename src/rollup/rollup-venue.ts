@@ -17,7 +17,9 @@ import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
 import { ChainFeed, REREAD_INTERVAL_MS } from "./chain-feed.js";
 import {
+  type ChainExchange,
   type ChainFill,
+  type ChainMarket,
   type ChainPrice,
   type ChainStats,
   type KeyCheckpoint,
@@ -27,7 +29,7 @@ import {
 import { Session, connectionTo } from "./connections.js";
 import { FundDesk } from "./fund-desk.js";
 import { Generation } from "./generation.js";
-import { MAX_SOURCE_AGE_MS, PricePublisher } from "./price-publisher.js";
+import { noteMakerQuote } from "./maker-quotes.js";
 import {
   FIRST_TRADER_SEAT,
   SEAT_COUNT,
@@ -81,7 +83,6 @@ export interface RollupVenueOptions {
   markets: readonly MarketConfig[];
   bots: BotSpec[];
   quoteExpirySeconds: number;
-  publishIntervalMs: number;
   /** Per market, the last fill sequence an earlier run already recorded. */
   recordedThrough: Record<MarketId, number>;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
@@ -95,15 +96,15 @@ export interface Readiness {
   connected: boolean;
   pricesFresh: boolean;
   botsFunded: boolean;
-  /** Per perpetual, how often this process has advanced its funding since it started. */
-  fundingUpdates: Record<MarketId, number>;
 }
 
 /**
- * The real order book program behind the `Venue` interface. Prices are
- * published by the oracle key, every bot is an ordinary trader with its own
- * seat, private view and one-time order keys, and everything public (fills,
- * marks, counters) is read back from the chain, never from what this process
+ * The real order book program behind the `Venue` interface. The marks are
+ * the program's own (on a mainnet-profile deployment, Pyth's, synced by a
+ * crank this service does not run), and so is funding, which the program's
+ * schedule advances. Every bot is an ordinary trader with its own seat,
+ * private view and one-time order keys, and everything public (fills, marks,
+ * counters) is read back from the chain, never from what this process
  * remembers having sent.
  */
 export class RollupVenue implements Venue {
@@ -111,10 +112,10 @@ export class RollupVenue implements Venue {
   private readonly secrets = new BotOrderSecrets();
   private readonly listeners = new Set<(fill: Fill) => void>();
   private readonly feed: ChainFeed;
-  private readonly publisher: PricePublisher;
   private readonly bots: BotAccounts;
   private readonly sweep: SeatSweep;
-  private readonly faucet: Session;
+  /** Null on a deployment without a faucet. */
+  private readonly faucet: Session | null;
   /** Every key's connection, opened again after a rest. */
   private readonly sessions: Session[] = [];
   private stopped = false;
@@ -123,9 +124,11 @@ export class RollupVenue implements Venue {
    * with it. Undefined while the service rests, when nothing may send.
    */
   private life: Generation | undefined = new Generation();
-  /** What the feed or the publisher is failing at right now, by name. */
+  /** What the feed is failing at right now, by name. */
   private readonly failing = new Set<string>();
   private chainStats: ChainStats | null = null;
+  /** Null until the feed has read it. */
+  private exchange: ChainExchange | null = null;
   private ordersPlaced = 0;
   private liquidatorSeat: number | null = null;
 
@@ -142,15 +145,18 @@ export class RollupVenue implements Venue {
     // local stack's own port, where its deposits go, takes one from anyone.
     const depositsThroughTheFilter =
       new URL(settings.depositRpcUrl).host === new URL(settings.rollupRpcUrl).host;
-    this.faucet = depositsThroughTheFilter
-      ? signedInSession(settings.rollupRpcUrl, settings.faucet, () => this.life)
-      : Session.of(connectionTo(settings.depositRpcUrl));
+    const faucetKey = settings.faucet;
+    this.faucet = !faucetKey
+      ? null
+      : depositsThroughTheFilter
+        ? signedInSession(settings.rollupRpcUrl, faucetKey, () => this.life)
+        : Session.of(connectionTo(settings.depositRpcUrl));
 
-    const oracle = signedInSession(settings.rollupRpcUrl, settings.oracle, () => this.life);
     const gate = signedInSession(settings.rollupRpcUrl, settings.gate, () => this.life);
-    this.sessions.push(this.faucet, oracle, gate);
+    this.sessions.push(gate);
+    if (this.faucet) this.sessions.push(this.faucet);
 
-    // What the feed and the publisher fail at is what the rollup's reachability is judged by.
+    // What the feed fails at is what the rollup's reachability is judged by.
     const watched = {
       onError: (what: string, error: unknown) => {
         this.failing.add(what);
@@ -170,19 +176,12 @@ export class RollupVenue implements Venue {
         onPrice: (marketId, price) => this.acceptPrice(marketId, price),
         onTape: (marketId, update, readAtMs) => this.acceptTape(marketId, update, readAtMs),
         onStats: (stats) => this.acceptStats(stats),
+        onMarket: (market) => this.acceptMarket(market),
+        onExchange: (exchange) => (this.exchange = exchange),
+        onUnreachable: handlers.onUnreachable,
         ...watched,
       },
     );
-    this.publisher = new PricePublisher({
-      program,
-      oracle,
-      oracleKey: settings.oracle,
-      markets,
-      intervalMs: options.publishIntervalMs,
-      maxSourceAgeMs: MAX_SOURCE_AGE_MS,
-      onUnreachable: handlers.onUnreachable,
-      ...watched,
-    });
     this.bots = new BotAccounts({
       program,
       settings,
@@ -223,30 +222,26 @@ export class RollupVenue implements Venue {
   }
 
   /**
-   * Follows the chain, publishes every market's price at once, from a source
-   * price delivered at or after `sourceNotBeforeMs`, and keeps publishing.
-   * Throws unless that first publish established a fresh price for every
-   * market. Safe to call again after it threw: it picks up where it stopped.
+   * Follows the chain again after a rest. Throws when the first read fails;
+   * safe to call again after it threw. A mark that is missing or stale is
+   * reported by `readiness`, not refused here: the program refuses the orders
+   * it would price, and the crank that syncs it is not this service.
    */
-  async resume(sourceNotBeforeMs: number): Promise<void> {
+  async resume(): Promise<void> {
     if (this.stopped) return;
     await this.follow();
-    if (this.stopped) return;
-    await this.publisher.publishNow(sourceNotBeforeMs);
-    this.publisher.start();
   }
 
   /**
-   * Sends nothing and listens to nothing until `resume`. The publishes and
-   * reads in flight get a moment to end, none of them asking for more; then
-   * the generation ends, and with it every connection, confirmation, order
-   * client and poll made for it. The bots are let go of, not paused: the next
-   * call for one opens a new trader for the next generation.
+   * Sends nothing and listens to nothing until `resume`. The reads in flight
+   * get a moment to end, none of them asking for more; then the generation
+   * ends, and with it every connection, confirmation, order client and poll
+   * made for it. The bots are let go of, not paused: the next call for one
+   * opens a new trader for the next generation.
    */
   async rest(): Promise<void> {
-    this.publisher.stop();
     this.feed.pause();
-    await idleWithin([this.publisher, this.feed], DRAIN_WITHIN_MS);
+    await idleWithin([this.feed], DRAIN_WITHIN_MS);
     this.bots.retire();
     this.life?.end();
     this.life = undefined;
@@ -256,7 +251,6 @@ export class RollupVenue implements Venue {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    this.publisher.stop();
     this.bots.close();
     this.feed.stop();
     this.life?.end();
@@ -285,16 +279,14 @@ export class RollupVenue implements Venue {
     throw new Error(`the chain feed named market ${marketId}, which this venue does not follow`);
   }
 
-  private perpMarketIds(): number[] {
-    return [...this.followed.values()]
-      .filter((market) => market.chain.kind === "perp")
-      .map((market) => market.chain.marketId);
-  }
-
   private acceptPrice(marketId: number, reading: ChainPrice): void {
     const market = this.marketOnChain(marketId);
     const news = market.acceptPrice(reading);
     if (news) this.options.handlers.onPrice(market.config.id, news.price, news.atMs);
+  }
+
+  private acceptMarket(reading: ChainMarket): void {
+    this.marketOnChain(reading.marketId).acceptMarket(reading);
   }
 
   private acceptTape(marketId: number, update: TapeUpdate, readAtMs: number): void {
@@ -314,11 +306,10 @@ export class RollupVenue implements Venue {
     const marketId = market.config.id;
     const alreadyRecorded =
       Number(chainFill.sequence) <= (this.options.recordedThrough[marketId] ?? 0);
-    const replayed = market.warmingUp || alreadyRecorded;
     const fill = market.acceptFill(chainFill);
     const origin = originOf(fillRoles(chainFill, this.secrets.of(marketId)));
-    this.options.handlers.onFill({ fill, origin, replayed });
-    if (!replayed) for (const listener of this.listeners) listener(fill);
+    this.options.handlers.onFill({ fill, origin, replayed: alreadyRecorded });
+    if (!alreadyRecorded) for (const listener of this.listeners) listener(fill);
   }
 
   private acceptStats(stats: ChainStats): void {
@@ -340,8 +331,9 @@ export class RollupVenue implements Venue {
     return publicDeployment(
       settings.deployment,
       urls,
-      [...this.followed.values()].map(({ chain }) => ({
+      [...this.followed.values()].map(({ chain, config }) => ({
         chain,
+        symbol: config.id,
         addresses: program.publicAddresses(chain.marketId),
       })),
     );
@@ -351,11 +343,8 @@ export class RollupVenue implements Venue {
     const now = Date.now();
     return {
       connected: now - this.feed.readAtMs < CONNECTED_WITHIN_MS && this.failing.size === 0,
-      pricesFresh: [...this.followed.values()].every((market) =>
-        market.priceIsFresh(now, this.publisher.lastPublishedAtMs(market)),
-      ),
+      pricesFresh: [...this.followed.values()].every((market) => market.priceIsFresh(now)),
       botsFunded: this.bots.allFunded(),
-      fundingUpdates: this.publisher.fundingUpdates(),
     };
   }
 
@@ -363,13 +352,17 @@ export class RollupVenue implements Venue {
     const now = Date.now();
     const openInterest = this.chainStats?.openInterest;
     return [...this.followed.values()].map((market) =>
-      market.info(now, openInterest ? (openInterest[market.chain.marketId] ?? 0n) : null),
+      market.info(
+        now,
+        openInterest ? (openInterest[market.chain.marketId] ?? 0n) : null,
+        this.exchange,
+      ),
     );
   }
 
-  /** Sets where the mark should be. The publisher walks the chain's price there. */
-  async publishPrice(market: MarketId, price: bigint, sourceAtMs: number): Promise<void> {
-    this.market(market).setTarget(price, sourceAtMs);
+  /** Refused: the mark is the program's own, and nothing here sets it. */
+  async publishPrice(market: MarketId): Promise<void> {
+    throw new Error(`${market}: the mark on the rollup is the program's own, not this service's`);
   }
 
   async openTrader(trader: TraderKey): Promise<void> {
@@ -391,24 +384,23 @@ export class RollupVenue implements Venue {
     this.secrets.add(order.market, trader, secret);
     const rests = order.type === "limit" || order.type === "postOnly";
     let outcome: PlaceOutcome;
+    let owner = "";
     try {
-      outcome = await this.whileAwake(async () =>
-        (await this.bots.trader(trader)).place(
-          market.chain.marketId,
-          {
-            side: order.side,
-            type: order.type,
-            ...sendable,
-            reduceOnly: order.reduceOnly ?? false,
-            secret,
-            restingExpirySeconds:
-              rests && !order.reduceOnly
-                ? Math.floor(Date.now() / MS_PER_SECOND) + this.options.quoteExpirySeconds
-                : undefined,
-          },
-          this.perpMarketIds(),
-        ),
-      );
+      outcome = await this.whileAwake(async () => {
+        const programTrader = await this.bots.trader(trader);
+        owner = programTrader.address;
+        return programTrader.place(market.chain.marketId, {
+          side: order.side,
+          type: order.type,
+          ...sendable,
+          reduceOnly: order.reduceOnly ?? false,
+          secret,
+          restingExpirySeconds:
+            rests && !order.reduceOnly
+              ? Math.floor(Date.now() / MS_PER_SECOND) + this.options.quoteExpirySeconds
+              : undefined,
+        });
+      });
     } catch (error) {
       this.secrets.retire(secret, Date.now());
       const reason = error instanceof Error ? error.message : String(error);
@@ -416,6 +408,9 @@ export class RollupVenue implements Venue {
     }
     if (outcome.settled) outcome = await this.onceSettled(outcome.settled);
     if (outcome.status !== "rested") this.secrets.retire(secret, Date.now());
+    if (rests && !order.reduceOnly) {
+      noteMakerQuote(this.options.handlers, trader, order.market, owner, outcome);
+    }
     this.options.handlers.onBotOrder(trader, outcome);
     return placeResultOf(orderId, order, market, sendable.size, outcome);
   }
@@ -453,7 +448,7 @@ export class RollupVenue implements Venue {
     return traderStateOf(trader, view, this.followed.values(), tokens);
   }
 
-  /** Invariant: nothing to do on request. The publisher advances funding right after a fresh price. */
+  /** Invariant: nothing to do on request. The program's own schedule advances funding. */
   async updateFunding(): Promise<void> {}
 
   /** The seats the liquidator tries next, as targets `liquidate` accepts. */
@@ -469,7 +464,7 @@ export class RollupVenue implements Venue {
       const programTrader = await this.bots.trader(liquidator);
       this.liquidatorSeat ??= (await programTrader.view()).seat;
       if (seat === this.liquidatorSeat) return false;
-      return programTrader.liquidate(chain.marketId, seat, mark, this.perpMarketIds());
+      return programTrader.liquidate(chain.marketId, seat, mark);
     });
   }
 
@@ -478,9 +473,10 @@ export class RollupVenue implements Venue {
     return this.bots.keyCheckpoints();
   }
 
-  /** The desk that opens and funds users. */
-  fundDesk(amount: bigint, clock: Clock): FundDesk {
+  /** The desk that opens and funds users, or null on a deployment without a faucet. */
+  fundDesk(amount: bigint, clock: Clock): FundDesk | null {
     const { settings, program, handlers } = this.options;
+    if (!this.faucet || !settings.faucet) return null;
     const collateral = deployedToken(settings.deployment, COLLATERAL_TOKEN);
     if (!collateral) throw new Error(`the deployment has no ${COLLATERAL_TOKEN} token`);
     return new FundDesk({
@@ -488,7 +484,7 @@ export class RollupVenue implements Venue {
       session: this.faucet,
       gate: settings.gate,
       faucet: settings.faucet,
-      mint: collateral.mint,
+      token: collateral,
       amountAtoms: toChainAmount(amount, collateral.decimals),
       clock,
       onError: handlers.onError,

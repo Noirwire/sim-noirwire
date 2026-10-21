@@ -10,6 +10,7 @@ interface PublicToken {
 interface PublicMarket {
   /** The id every instruction and address of this market is built from. */
   marketId: number;
+  /** This service's id for the market, the one `/v1/markets` uses, whatever the deployment calls it. */
   symbol: string;
   kind: "spot" | "perp";
   market: string;
@@ -52,7 +53,7 @@ export interface BrowserUrls {
 export const publicDeployment = (
   deployment: Deployment,
   urls: BrowserUrls,
-  markets: { chain: ChainMarket; addresses: PublicAddresses }[],
+  markets: { chain: ChainMarket; symbol: string; addresses: PublicAddresses }[],
 ): PublicDeployment => {
   const token = (index: number): PublicToken => {
     const found = deployment.tokens.find((entry) => entry.index === index);
@@ -69,13 +70,13 @@ export const publicDeployment = (
     rollupWsUrl: urls.rollupWsUrl,
     exchange: first.addresses.exchange,
     stats: first.addresses.stats,
-    markets: markets.map(({ chain, addresses }) => {
+    markets: markets.map(({ chain, symbol, addresses }) => {
       const described = deployment.markets.find((market) => market.id === chain.marketId);
       if (!described) throw new Error(`the deployment has no market ${chain.marketId}`);
       const quoteToken = token(chain.quoteToken);
       return {
         marketId: chain.marketId,
-        symbol: described.symbol,
+        symbol,
         kind: chain.kind,
         market: addresses.market,
         tape: addresses.tape,

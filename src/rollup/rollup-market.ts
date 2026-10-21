@@ -1,38 +1,34 @@
 import { DAY_MS, DayVolume, PriceHistory, percentChange } from "../engine/day-window.js";
 import { type MarketConfig, maxLeverageAt } from "../engine/markets.js";
 import type { Fill, MarketInfo } from "../engine/types.js";
-import type { ChainFill, ChainMarket, ChainPrice } from "./chain-types.js";
-import { type PriceStep, nextPublishPrice, withinOneStep } from "./price-walk.js";
-import {
-  type MarketUnits,
-  marketUnits,
-  roundDownToChainPrice,
-  toSimPrice,
-  toSimSize,
-} from "./units.js";
+import type { ChainExchange, ChainFill, ChainMarket, ChainPrice } from "./chain-types.js";
+import { type MarketUnits, marketUnits, toSimPrice, toSimSize } from "./units.js";
 
 const MS_PER_SECOND = 1_000;
 
 const tagOf = (receipt: Uint8Array): bigint => Buffer.from(receipt).readBigUInt64BE(0);
 
-/** One market as the chain shows it, and where this service wants its price to be. */
+/** One market as the chain shows it. Its mark is the chain's own: this service never sets it. */
 export class RollupMarket {
   readonly units: MarketUnits;
   /** The last fill sequence read from the tape. */
   tapeCursor = 0;
   private chainPrice: ChainPrice | null = null;
-  private target: bigint | null = null;
-  private targetAtMs: number | null = null;
-  private warmedUp = false;
   private readonly volume = new DayVolume();
   private readonly priceHistory = new PriceHistory(DAY_MS);
 
   constructor(
     readonly config: MarketConfig,
-    readonly chain: ChainMarket,
+    /** As last read: its status and oracle health change while it is followed. */
+    public chain: ChainMarket,
     baseDecimals: number,
   ) {
     this.units = marketUnits(chain.baseLot, baseDecimals);
+  }
+
+  /** Takes a fresh reading of the market account. Its lot never changes, so neither do the units. */
+  acceptMarket(reading: ChainMarket): void {
+    if (reading.marketId === this.chain.marketId) this.chain = reading;
   }
 
   /** The chain's mark in the program's units, or 0 while the feed has none. */
@@ -45,55 +41,8 @@ export class RollupMarket {
   }
 
   /**
-   * True until the chain's price has first come within one allowed step of
-   * the real one. A deployment starts at its set-up price and is walked to
-   * the real price under the move limit; nothing on that walk is a market
-   * move, so nothing of it is charted, counted or traded on by the bots.
-   */
-  get warmingUp(): boolean {
-    return !this.warmedUp;
-  }
-
-  private step(): PriceStep | null {
-    if (this.target === null || this.chainPrice === null) return null;
-    return {
-      current: this.chainPrice.price,
-      target: roundDownToChainPrice(this.units, this.target, this.chain.tick),
-      maxMoveBps: this.chain.maxMoveBps,
-      tick: this.chain.tick,
-    };
-  }
-
-  private noteWarmUp(): void {
-    const step = this.step();
-    if (!this.warmedUp && step) this.warmedUp = withinOneStep(step);
-  }
-
-  /** Where the mark should be, as this service prices it, and when its source said so. */
-  setTarget(price: bigint, sourceAtMs: number): void {
-    this.target = price;
-    this.targetAtMs = sourceAtMs;
-    this.noteWarmUp();
-  }
-
-  /**
-   * The price to publish next on the way to the target, or null when there is
-   * nothing to publish: no target, no price on chain to walk from, or a
-   * target whose source spoke more than `maxSourceAgeMs` ago, or before
-   * `sourceNotBeforeMs`. A publish is stamped with the rollup's clock, so it
-   * would pass an old price off as new.
-   */
-  nextPublishPrice(nowMs: number, maxSourceAgeMs: number, sourceNotBeforeMs = 0): bigint | null {
-    if (this.targetAtMs === null || nowMs - this.targetAtMs > maxSourceAgeMs) return null;
-    if (this.targetAtMs < sourceNotBeforeMs) return null;
-    const step = this.step();
-    const price = step ? nextPublishPrice(step) : 0n;
-    return price === 0n ? null : price;
-  }
-
-  /**
    * Takes a reading of the price feed. Returns the price to announce when it
-   * is news: a changed price on a market that has warmed up.
+   * is news: a changed, non-zero price.
    */
   acceptPrice(reading: ChainPrice): { price: bigint; atMs: number } | null {
     const before = this.chainPrice;
@@ -104,8 +53,7 @@ export class RollupMarket {
       before.price !== reading.price ||
       before.publishTimeSeconds !== reading.publishTimeSeconds;
     this.chainPrice = reading;
-    this.noteWarmUp();
-    if (!changed || reading.price === 0n || !this.warmedUp) return null;
+    if (!changed || reading.price === 0n) return null;
     const point = {
       price: toSimPrice(this.units, reading.price),
       atMs: reading.publishTimeSeconds * MS_PER_SECOND,
@@ -132,21 +80,50 @@ export class RollupMarket {
     };
   }
 
-  /** Whether the chain holds a price that this process published within the program's age limit. */
-  priceIsFresh(nowMs: number, lastPublishedAtMs: number): boolean {
+  /** Whether the chain holds a mark the program still calls fresh. */
+  priceIsFresh(nowMs: number): boolean {
     const maxAgeMs = this.chain.maxPriceAgeSeconds * MS_PER_SECOND;
-    return (
-      this.warmedUp &&
-      this.mark > 0n &&
-      nowMs - lastPublishedAtMs < maxAgeMs &&
-      nowMs - this.publishTimeSeconds * MS_PER_SECOND < maxAgeMs
-    );
+    return this.mark > 0n && nowMs - this.publishTimeSeconds * MS_PER_SECOND < maxAgeMs;
   }
 
-  info(nowMs: number, openInterestLots: bigint | null): MarketInfo {
+  /**
+   * Why the program would refuse a resting order that adds exposure here now,
+   * by the checks it makes before any seat's own: or null while it takes one.
+   * `exchange` is null until the exchange has been read.
+   */
+  quotesRefusedBecause(nowMs: number, exchange: ChainExchange | null): string | null {
+    const { chain } = this;
+    if (exchange?.paused) return "the exchange is paused (ExchangePaused, 6030)";
+    if (chain.status === "paused") return "the market is paused (MarketPaused, 6031)";
+    if (chain.status === "reduceOnly") {
+      return "the market takes reduce-only orders alone (MarketReduceOnly, 6032)";
+    }
+    if (chain.oracleHealth === "dislocated") {
+      return "its mark is dislocated from the oracle (OracleDislocated, 6077)";
+    }
+    if (this.mark === 0n) return "its price feed holds no mark yet";
+    if (!this.priceIsFresh(nowMs)) {
+      const ageSeconds = Math.floor(nowMs / MS_PER_SECOND) - this.publishTimeSeconds;
+      return (
+        `its mark is ${ageSeconds} s old and the market takes one up to ` +
+        `${chain.maxPriceAgeSeconds} s old (StalePrice, 6038): is the price crank running?`
+      );
+    }
+    const guardUntil = exchange?.quoteGuardOkUntilSeconds ?? null;
+    if (chain.kind === "perp" && guardUntil !== null && nowMs > guardUntil * MS_PER_SECOND) {
+      return (
+        `the USDC guard tripped at ${new Date(guardUntil * MS_PER_SECOND).toISOString()} ` +
+        "(QuoteGuardTripped, 6081): is the USDC price synced?"
+      );
+    }
+    return null;
+  }
+
+  info(nowMs: number, openInterestLots: bigint | null, exchange: ChainExchange | null): MarketInfo {
     const { config, chain, units } = this;
     const isPerp = chain.kind === "perp";
     const markPrice = this.mark > 0n ? toSimPrice(units, this.mark) : null;
+    const refused = this.quotesRefusedBecause(nowMs, exchange);
     return {
       id: config.id,
       kind: config.kind,
@@ -156,13 +133,14 @@ export class RollupMarket {
       lotSize: toSimSize(units, 1n),
       maxLeverage: isPerp ? maxLeverageAt(chain.initialMarginBps) : 0,
       markPrice,
-      warmingUp: this.warmingUp,
       markPriceUpdatedAtMs: markPrice ? this.publishTimeSeconds * MS_PER_SECOND : null,
       change24h: markPrice
         ? percentChange(this.priceHistory.firstSince(nowMs - DAY_MS), markPrice)
         : null,
       volume24h: this.volume.total(nowMs),
       openInterest: isPerp && openInterestLots !== null ? toSimSize(units, openInterestLots) : null,
+      ...(refused === null ? {} : { quotesRefusedBecause: refused }),
+      ...(isPerp ? { positionCap: toSimSize(units, chain.positionCap) } : {}),
     };
   }
 }

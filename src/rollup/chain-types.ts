@@ -6,6 +6,9 @@
 
 export type ChainSide = "buy" | "sell";
 export type ChainOrderType = "limit" | "postOnly" | "ioc" | "market";
+export type ChainMarketStatus = "active" | "paused" | "reduceOnly";
+/** Only `dislocated` stops orders; `settling` follows a dislocation and takes them again. */
+export type ChainOracleHealth = "healthy" | "dislocated" | "settling";
 
 export interface ChainMarket {
   marketId: number;
@@ -20,6 +23,24 @@ export interface ChainMarket {
   fundingIntervalSeconds: number;
   baseToken: number;
   quoteToken: number;
+  /**
+   * In lots, on a perpetual: the most one seat may reach on one side, its
+   * position on that side, its open orders there and the new order together.
+   */
+  positionCap: bigint;
+  status: ChainMarketStatus;
+  oracleHealth: ChainOracleHealth;
+}
+
+/** The exchange-wide state every order on every market depends on. */
+export interface ChainExchange {
+  paused: boolean;
+  /**
+   * Unix seconds until which the USDC guard lets a perpetual take orders that
+   * add exposure; null when no USDC source is bound, which a test network's
+   * build lets pass and a mainnet build does not, so it is left to the program.
+   */
+  quoteGuardOkUntilSeconds: number | null;
 }
 
 export interface PublicAddresses {
@@ -84,6 +105,8 @@ export interface PlaceOutcome {
   /** From the send to the result showing in the trader's private view, as the client timed it. */
   sendToResultMs: number;
   reason?: string;
+  /** Only with `failed`: the program's error number (6000 and up, as it reports them), when it gave one. */
+  programError?: number;
   /**
    * Only with `unknown`: the client stopped waiting while the order could
    * still run. Resolves, once the rollup's clock is past the order's expiry

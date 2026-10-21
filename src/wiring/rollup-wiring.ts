@@ -2,9 +2,9 @@ import { liquidatorTraderKey, makerTraderKey, takerTraderKey } from "../bots/bot
 import type { Config } from "../config/config.js";
 import type { SnapshotData } from "../data/snapshot.js";
 import { systemClock } from "../engine/clock.js";
-import { MARKETS, MARKET_IDS, type MarketConfig } from "../engine/markets.js";
+import { MARKETS, type MarketConfig } from "../engine/markets.js";
 import { divScale, roundUpToStep } from "../engine/money.js";
-import type { MarketId, Venue } from "../engine/types.js";
+import type { Venue } from "../engine/types.js";
 import { placingOrdersThrough } from "../engine/venue-orders.js";
 import { STILL_STARTING, VenueNotReady } from "../engine/venue-not-ready.js";
 import type { PublicDeployment } from "../rollup/public-deployment.js";
@@ -14,7 +14,7 @@ import { refuseMainnet } from "../rollup/connections.js";
 import type { FundRequests } from "../rollup/fund-desk.js";
 import { Program } from "../rollup/program.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
-import { loadRollupSettings } from "../rollup/settings.js";
+import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
 import { UserOrderCount } from "./user-order-count.js";
 import { type PublicData, type VenueWiring, recordAndBroadcastFill } from "./venue-wiring.js";
 
@@ -35,8 +35,13 @@ const NOT_CONNECTED: Readiness = {
   connected: false,
   pricesFresh: false,
   botsFunded: false,
-  fundingUpdates: {},
 };
+
+const NO_FAUCET = {
+  ok: false,
+  status: 503,
+  reason: "this deployment has no faucet: test funds are not handed out here",
+} as const;
 
 /** A request that needs the venue before the service has connected to it is refused, not failed. */
 const refusedWhileStarting = (error: unknown) => {
@@ -44,15 +49,23 @@ const refusedWhileStarting = (error: unknown) => {
   return { ok: false, status: 503, reason: error.reason } as const;
 };
 
-/** One maker per market, the takers, and the liquidator: each a trader with a seat of its own. */
-const botRoles = (takerKeys: string[]): BotRole[] => [
-  ...MARKETS.map((market) => ({
+/**
+ * One maker per market, then the takers and the liquidator when they run:
+ * each a trader with a seat of its own. A bot's seed is its place in this
+ * list, so the makers keep theirs whichever of the others run.
+ */
+const botRoles = (
+  markets: readonly MarketConfig[],
+  takerKeys: string[],
+  liquidator: boolean,
+): BotRole[] => [
+  ...markets.map((market) => ({
     key: makerTraderKey(market.id),
     tradesPerps: market.kind === "perp",
     tradesSpot: market.kind === "spot",
   })),
   ...takerKeys.map((key) => ({ key, tradesPerps: true, tradesSpot: true })),
-  { key: liquidatorTraderKey, tradesPerps: true, tradesSpot: false },
+  ...(liquidator ? [{ key: liquidatorTraderKey, tradesPerps: true, tradesSpot: false }] : []),
 ];
 
 /**
@@ -60,12 +73,32 @@ const botRoles = (takerKeys: string[]): BotRole[] => [
  * has succeeded, nothing here is connected: the venue the routes see answers
  * with `VenueNotReady`, and the rest answers as a service that is not ready.
  * Configuration that is wrong still throws here, before anything starts.
+ *
+ * The marks are the program's own and so is funding: nothing here publishes
+ * a price or advances funding. Only the markets the deployment has are followed.
  */
 export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const { config, data, snapshot, onError, onRecovered } = options;
-  const takerKeys = Array.from({ length: config.NOISE_TAKER_COUNT }, (_, i) => takerTraderKey(i));
-  const roles = botRoles(takerKeys);
-  const settings = loadRollupSettings(config, roles.length, MARKET_IDS);
+  const deployment = loadDeployment(config);
+  const markets = deployedMarkets(deployment, MARKETS);
+  if (!deployment.faucet && (config.NOISE_TAKERS_ENABLED || config.LIQUIDATOR_ENABLED)) {
+    throw new Error(
+      "this deployment has no faucet, so only the house makers can run on it: " +
+        "set NOISE_TAKERS_ENABLED=0 and LIQUIDATOR_ENABLED=0",
+    );
+  }
+  const takerKeys = config.NOISE_TAKERS_ENABLED
+    ? Array.from({ length: config.NOISE_TAKER_COUNT }, (_, i) => takerTraderKey(i))
+    : [];
+  const roles = botRoles(markets, takerKeys, config.LIQUIDATOR_ENABLED);
+  const settings = loadRollupSettings(config, deployment, roles.length);
+  for (const [at, market] of markets.entries()) {
+    onError(
+      `the ${market.id} maker's seat owner is ${settings.botOwners[at]?.publicKey.toBase58()}; ` +
+        "on a market with a maker list, the exchange admin lists it with set_seat_access",
+      null,
+    );
+  }
 
   // The counters cover what this process saw happen, not what the tape still holds from before.
   const countingSinceMs = Date.now();
@@ -73,22 +106,19 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
 
   let rollup: RollupVenue | null = null;
   let mainnetRefused = false;
-  /** Where the real price is, per market, for a venue that has not connected yet to take it. */
-  const targets = new Map<MarketId, { price: bigint; atMs: number }>();
 
   const connected = (): RollupVenue => {
     if (!rollup) throw new VenueNotReady(STILL_STARTING);
     return rollup;
   };
 
-  const connect = async (): Promise<RollupVenue> => {
-    const venue = await RollupVenue.connect({
+  const connect = (): Promise<RollupVenue> =>
+    RollupVenue.connect({
       program: new Program(settings.deployment.programId),
       settings,
-      markets: MARKETS,
+      markets,
       bots: roles.map((role, at) => ({ ...role, owner: settings.botOwners[at] })),
       quoteExpirySeconds: config.ROLLUP_QUOTE_EXPIRY_SECONDS,
-      publishIntervalMs: config.PRICE_PUBLISH_INTERVAL_MS,
       recordedThrough: snapshot?.tapeCursors ?? {},
       keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
       usersEverOpened: options.usersEverOpened,
@@ -118,13 +148,10 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
         onUnreachable: options.onUnreachable,
       },
     });
-    for (const [market, { price, atMs }] of targets) void venue.publishPrice(market, price, atMs);
-    return venue;
-  };
 
   const venue: Venue = {
     markets: () => connected().markets(),
-    publishPrice: (market, price, atMs) => connected().publishPrice(market, price, atMs),
+    publishPrice: (market) => connected().publishPrice(market),
     openTrader: (trader) => connected().openTrader(trader),
     deposit: (trader, token, amount) => connected().deposit(trader, token, amount),
     placeOrder: (trader, order) => connected().placeOrder(trader, order),
@@ -160,16 +187,18 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     };
   };
 
-  const openTakersAndLiquidator = async (): Promise<void> => {
+  const openTheOtherBots = async (): Promise<void> => {
     for (const key of takerKeys) {
       await venue.openTrader(key);
       await venue.deposit(key, "nUSD", config.NOISE_TAKER_STARTING_NUSD);
       await venue.deposit(key, "SOL", config.NOISE_TAKER_STARTING_BASE);
     }
-    await venue.openTrader(liquidatorTraderKey);
-    await venue.deposit(liquidatorTraderKey, "nUSD", config.LIQUIDATOR_STARTING_NUSD);
+    if (config.LIQUIDATOR_ENABLED) {
+      await venue.openTrader(liquidatorTraderKey);
+      await venue.deposit(liquidatorTraderKey, "nUSD", config.LIQUIDATOR_STARTING_NUSD);
+    }
     // Quotes a previous run left resting would fill unrecognised as a bot's.
-    for (const market of MARKETS) await venue.cancelAll(makerTraderKey(market.id), market.id);
+    for (const market of markets) await venue.cancelAll(makerTraderKey(market.id), market.id);
     for (const { key } of roles) data.stats.recordTrader(key);
   };
 
@@ -177,16 +206,17 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const viaDesk = async <T>(ask: (desk: FundRequests) => Promise<T>) => {
     try {
       fundDesk ??= connected().fundDesk(config.FUND_AMOUNT_NUSD, systemClock);
-      return await ask(fundDesk);
+      return fundDesk ? await ask(fundDesk) : NO_FAUCET;
     } catch (error) {
       return refusedWhileStarting(error);
     }
   };
-  let deployment: PublicDeployment | null = null;
+  let publicDescription: PublicDeployment | null = null;
 
   return {
     venue,
     botVenue,
+    botMarkets: markets,
     rollupRoutes: {
       fundDesk: {
         prepare: (owner, orderKeys) => viaDesk((desk) => desk.prepare(owner, orderKeys)),
@@ -195,12 +225,12 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       readiness: () => rollup?.readiness() ?? NOT_CONNECTED,
       deployment: () => {
         if (!rollup) return null;
-        deployment ??= rollup.publicDeployment({
+        publicDescription ??= rollup.publicDeployment({
           solanaRpcUrl: config.PUBLIC_SOLANA_RPC_URL ?? settings.solanaRpcUrl,
           rollupRpcUrl: config.PUBLIC_ROLLUP_RPC_URL ?? settings.rollupRpcUrl,
           rollupWsUrl: config.PUBLIC_ROLLUP_WS_URL ?? settings.rollupWsUrl,
         });
-        return deployment;
+        return publicDescription;
       },
     },
     prepare: async () => {
@@ -211,17 +241,13 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       rollup ??= await connect();
       await rollup.follow();
     },
-    resume: (sourceNotBeforeMs) => connected().resume(sourceNotBeforeMs),
+    resume: () => connected().resume(),
     rest: async () => {
       await rollup?.rest();
     },
     botSizes,
     liquidationTargets: () => connected().nextLiquidationTargets(config.LIQUIDATOR_SEATS_PER_TICK),
-    afterMakersOpen: openTakersAndLiquidator,
-    acceptPricePoint: (market, price, atMs) => {
-      targets.set(market, { price, atMs });
-      void rollup?.publishPrice(market, price, atMs);
-    },
+    afterMakersOpen: openTheOtherBots,
     needsFundingUpdater: false,
     snapshotExtras: () => ({
       tapeCursors: rollup?.tapeCursors() ?? snapshot?.tapeCursors ?? {},

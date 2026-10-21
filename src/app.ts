@@ -100,16 +100,19 @@ export const startApp = async (
         })
       : memoryWiring(config, data);
 
-  const priceSource =
-    overrides.priceSource ??
-    new JupiterPriceSource({
-      ids: [SOL_MINT, NVDAX_MINT],
-      baseUrl: config.JUPITER_BASE_URL,
-      pollIntervalMs: config.JUPITER_POLL_INTERVAL_MS,
-      slowPollIntervalMs: ASLEEP_PRICE_POLL_INTERVAL_MS,
-      onError: (error) => logError("polling Jupiter prices", error),
-      onRecovered: () => logRecovered("polling Jupiter prices"),
-    });
+  // A venue whose marks are not this service's to set (the rollup's are the program's) takes no prices.
+  const acceptPricePoint = wiring.acceptPricePoint;
+  const priceSource = !acceptPricePoint
+    ? null
+    : (overrides.priceSource ??
+      new JupiterPriceSource({
+        ids: [SOL_MINT, NVDAX_MINT],
+        baseUrl: config.JUPITER_BASE_URL,
+        pollIntervalMs: config.JUPITER_POLL_INTERVAL_MS,
+        slowPollIntervalMs: ASLEEP_PRICE_POLL_INTERVAL_MS,
+        onError: (error) => logError("polling Jupiter prices", error),
+        onRecovered: () => logRecovered("polling Jupiter prices"),
+      }));
 
   const saveSnapshot = (): Promise<void> =>
     snapshotStore.save({
@@ -172,17 +175,18 @@ export const startApp = async (
         throw new Error(startUp.problem ?? "the service has not finished starting");
       }
       try {
-        const wakeStartedAtMs = Date.now();
-        priceSource.setPace("fast");
-        // The first publish needs a price the source delivered during this wake, not one cached before it.
-        const delivered = await Promise.race([
-          priceSource.pollNow(),
-          waitFor(WAIT_FOR_FRESH_PRICE_MS).then(() => false),
-        ]);
-        if (!delivered) throw new Error("the price source did not deliver prices");
-        await wiring.resume(wakeStartedAtMs);
+        if (priceSource) {
+          priceSource.setPace("fast");
+          // The bots quote on a price the source delivered during this wake, not one cached before it.
+          const delivered = await Promise.race([
+            priceSource.pollNow(),
+            waitFor(WAIT_FOR_FRESH_PRICE_MS).then(() => false),
+          ]);
+          if (!delivered) throw new Error("the price source did not deliver prices");
+        }
+        await wiring.resume();
       } catch (error) {
-        // A wake that failed must not leave a feed or a publisher running while it waits to try again.
+        // A wake that failed must not leave a feed running while it waits to try again.
         await wiring.rest();
         throw error;
       }
@@ -191,7 +195,7 @@ export const startApp = async (
     },
     sleep: async () => {
       await stopAwakeLoops();
-      priceSource.setPace("slow");
+      priceSource?.setPace("slow");
       await wiring.rest();
       console.log(
         "sim-noirwire: asleep, sending nothing to the rollup until a request or a stream socket wakes it",
@@ -232,10 +236,9 @@ export const startApp = async (
   const port = typeof address === "object" && address ? address.port : config.PORT;
   console.log(`sim-noirwire: listening on http://${config.HOST}:${port} (venue=${config.VENUE})`);
 
-  if (config.VENUE === "rollup") priceSource.setPace("slow");
-  priceSource.start((point) => {
+  priceSource?.start((point) => {
     for (const market of MARKETS_PRICED_BY[point.id] ?? []) {
-      wiring.acceptPricePoint(market, point.price, point.atMs);
+      acceptPricePoint?.(market, point.price, point.atMs);
     }
   });
 
@@ -249,7 +252,7 @@ export const startApp = async (
         startUp.stop();
         activity.close();
         for (const loop of loops) loop.stop();
-        priceSource.stop();
+        priceSource?.stop();
         // A stop must not depend on the network: a run still going after a
         // moment is abandoned, and a restart finds keys that moved past their
         // checkpoint by search.

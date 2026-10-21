@@ -120,7 +120,6 @@ const startService = async (extraEnv: Record<string, string> = {}): Promise<Warm
     ROLLUP_RPC_URL: `http://127.0.0.1:${PROXY_RPC_PORT}`,
     ROLLUP_WS_URL: `ws://127.0.0.1:${PROXY_RPC_PORT + 1}`,
     DEPLOYMENT_PATH: join(LOCALNET, "deployment.json"),
-    ORACLE_SECRET_KEY: localFile("localnet-oracle.json"),
     GATE_SECRET_KEY: localFile("localnet-gate.json"),
     FAUCET_SECRET_KEY: localFile("localnet-faucet.json"),
     BOT_TRADER_SEEDS: botSeeds,
@@ -261,18 +260,14 @@ describe("the service on the real program (local network)", () => {
 
       const mark = (await program.price(chain, PERP_ID)).price;
       const lots = 40n;
-      const placed = await trader.place(
-        PERP_ID,
-        {
-          side: "buy",
-          type: "market",
-          price: mark + 1_500n,
-          size: lots,
-          reduceOnly: false,
-          secret: new Uint8Array(randomBytes(16)),
-        },
-        [0, 1],
-      );
+      const placed = await trader.place(PERP_ID, {
+        side: "buy",
+        type: "market",
+        price: mark + 1_500n,
+        size: lots,
+        reduceOnly: false,
+        secret: new Uint8Array(randomBytes(16)),
+      });
       expect(placed.status).toBe("filled");
       expect(placed.filled).toBe(lots);
       expect((await trader.view()).perp[PERP_ID]!.base).toBe(lots);
@@ -320,13 +315,8 @@ describe("the service on the real program (local network)", () => {
     }
 
     const deployed = JSON.parse(localFile("deployment.json")) as Record<string, string>;
-    const secrets = ["oracle", "gate", "faucet"].map((role) => localFile(`localnet-${role}.json`));
-    for (const hidden of [
-      deployed.gate!,
-      deployed.oracle!,
-      deployed.faucet!,
-      ...botSeeds.split(","),
-    ]) {
+    const secrets = ["gate", "faucet"].map((role) => localFile(`localnet-${role}.json`));
+    for (const hidden of [deployed.gate!, deployed.faucet!, ...botSeeds.split(",")]) {
       expect(text).not.toContain(hidden);
     }
     for (const secret of secrets) {

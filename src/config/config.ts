@@ -63,6 +63,8 @@ const envSchema = z.object({
   HOUSE_MAKER_POSITION_LIMIT_NUSD: decimalAmount("50000"),
   HOUSE_MAKER_MAX_SKEW_BPS: positiveInt(20),
 
+  /** The noise takers trade at all. Off, none is opened, funded or started. */
+  NOISE_TAKERS_ENABLED: boolFlag("1"),
   NOISE_TAKER_TICK_MS: positiveInt(500),
   NOISE_TAKER_COUNT: positiveInt(6),
   /** How many of the takers trade. Each one that trades keeps a client running on the rollup. */
@@ -74,6 +76,8 @@ const envSchema = z.object({
   NOISE_TAKER_STARTING_BASE: decimalAmount("1000"),
   NOISE_TAKER_SEED: positiveInt(42),
 
+  /** The liquidator sweeps at all. Off, it is not opened, funded or started. */
+  LIQUIDATOR_ENABLED: boolFlag("1"),
   LIQUIDATOR_INTERVAL_MS: positiveInt(60_000),
   LIQUIDATOR_STARTING_NUSD: decimalAmount("1000000"),
 
@@ -86,10 +90,8 @@ const envSchema = z.object({
   DEPOSIT_RPC_URL: z.string().optional(),
   DEPLOYMENT_JSON: z.string().optional(),
   DEPLOYMENT_PATH: z.string().optional(),
-  ORACLE_SECRET_KEY: z.string().optional(),
   GATE_SECRET_KEY: z.string().optional(),
   FAUCET_SECRET_KEY: z.string().optional(),
-  ORACLE_SECRET_KEY_FILE: z.string().optional(),
   GATE_SECRET_KEY_FILE: z.string().optional(),
   FAUCET_SECRET_KEY_FILE: z.string().optional(),
   BOT_TRADER_SEEDS: z.string().optional(),
@@ -97,7 +99,6 @@ const envSchema = z.object({
   PUBLIC_ROLLUP_RPC_URL: z.url().optional(),
   PUBLIC_ROLLUP_WS_URL: z.url().optional(),
   SERVICE_LOCATION: z.string().default("unnamed machine"),
-  PRICE_PUBLISH_INTERVAL_MS: positiveInt(5_000),
   ROLLUP_QUOTE_EXPIRY_SECONDS: positiveInt(180),
   ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("400"),
   ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),

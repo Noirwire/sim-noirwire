@@ -1,5 +1,6 @@
 import { withBotTracking } from "../bots/instrumented-venue.js";
 import type { Config } from "../config/config.js";
+import { MARKETS } from "../engine/markets.js";
 import { MemoryVenue } from "../engine/memory-venue.js";
 import { type PublicData, type VenueWiring, recordAndBroadcastFill } from "./venue-wiring.js";
 
@@ -18,6 +19,7 @@ export const memoryWiring = (config: Config, data: PublicData): VenueWiring => {
     venue,
     botVenue: withBotTracking(venue, data.stats),
     rollupRoutes: {},
+    botMarkets: MARKETS,
     prepare: async () => {},
     resume: async () => {},
     rest: async () => {},

@@ -29,7 +29,6 @@ if (!existsSync(SEEDS_FILE)) {
 }
 
 process.env.DEPLOYMENT_JSON = held("deployment.json");
-process.env.ORACLE_SECRET_KEY = held("localnet-oracle.json");
 process.env.GATE_SECRET_KEY = held("localnet-gate.json");
 process.env.FAUCET_SECRET_KEY = held("localnet-faucet.json");
 process.env.BOT_TRADER_SEEDS = readFileSync(SEEDS_FILE, "utf8").trim();

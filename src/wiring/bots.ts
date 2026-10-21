@@ -5,7 +5,7 @@ import { NoiseTaker } from "../bots/noise-taker.js";
 import { SeededRandom } from "../bots/rng.js";
 import type { Config } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
-import { MARKETS, type MarketConfig, PERP_MARKET_IDS } from "../engine/markets.js";
+import type { MarketConfig } from "../engine/markets.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
@@ -63,35 +63,38 @@ export interface BotProblems {
 
 /**
  * Opens and funds the makers, and returns what starts every bot's loop: a
- * maker and a noise taker per market, one liquidator, and the funding updater
- * where the venue needs one. Starting is separate from opening so that the
- * loops can be stopped and started again without opening anything twice.
- * Opening is safe to repeat after a failure.
+ * maker per market, a noise taker per market and one liquidator where they
+ * are enabled, and the funding updater where the venue needs one. Starting is
+ * separate from opening so that the loops can be stopped and started again
+ * without opening anything twice. Opening is safe to repeat after a failure.
  */
 export const openBots = async (
   config: Config,
   wiring: VenueWiring,
   problems: BotProblems,
 ): Promise<() => Repeating[]> => {
-  const { venue, botVenue } = wiring;
+  const { venue, botVenue, botMarkets } = wiring;
   const random = new SeededRandom(config.NOISE_TAKER_SEED);
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
-  for (const market of MARKETS) {
+  for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
     const maker = houseMaker(config, market, sizes);
     await maker.ensureOpen(botVenue);
     makers.push(maker);
-    takers.push(noiseTaker(config, market, sizes, random));
+    if (config.NOISE_TAKERS_ENABLED) takers.push(noiseTaker(config, market, sizes, random));
   }
   await wiring.afterMakersOpen();
 
-  const liquidator = new Liquidator({
-    markets: PERP_MARKET_IDS,
-    startingQuoteBalance: config.LIQUIDATOR_STARTING_NUSD,
-  });
+  const perpMarkets = botMarkets.filter((market) => market.kind === "perp").map(({ id }) => id);
+  const liquidator = config.LIQUIDATOR_ENABLED
+    ? new Liquidator({
+        markets: perpMarkets,
+        startingQuoteBalance: config.LIQUIDATOR_STARTING_NUSD,
+      })
+    : null;
   const fundingUpdater = new FundingUpdater({
-    markets: PERP_MARKET_IDS,
+    markets: perpMarkets,
     intervalMs: config.FUNDING_INTERVAL_MS,
     clock: systemClock,
   });
@@ -105,19 +108,23 @@ export const openBots = async (
   return () => {
     const loops = [
       ...makers.map((maker, at) =>
-        loop(`${MARKETS[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
+        loop(`${botMarkets[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
           maker.tick(botVenue),
         ),
       ),
       ...takers.map((taker, at) =>
-        loop(`${MARKETS[at].id} taker tick`, config.NOISE_TAKER_TICK_MS, () =>
+        loop(`${botMarkets[at].id} taker tick`, config.NOISE_TAKER_TICK_MS, () =>
           taker.tick(botVenue),
         ),
       ),
-      loop("liquidator tick", config.LIQUIDATOR_INTERVAL_MS, () =>
-        liquidator.tick(botVenue, wiring.liquidationTargets()),
-      ),
     ];
+    if (liquidator) {
+      loops.push(
+        loop("liquidator tick", config.LIQUIDATOR_INTERVAL_MS, () =>
+          liquidator.tick(botVenue, wiring.liquidationTargets()),
+        ),
+      );
+    }
     if (wiring.needsFundingUpdater) {
       loops.push(
         loop(

@@ -67,6 +67,18 @@ class FakeConnection {
 const NO_PRICE = { price: 0n, publishTimeSeconds: 0 };
 const NO_TAPE = { lastSequence: 0n, fills: [] };
 const NO_STATS = { orders: 0n, fills: 0n, openInterest: [] };
+const OPEN_EXCHANGE = { paused: false, quoteGuardOkUntilSeconds: null };
+
+const quietHandlers = {
+  onPrice: () => {},
+  onTape: () => {},
+  onStats: () => {},
+  onMarket: () => {},
+  onExchange: () => {},
+  onError: () => {},
+  onRecovered: () => {},
+  onUnreachable: () => {},
+};
 
 /** A program whose reads answer at once until `hang` is called, and never after. */
 const fakeProgram = (connection: FakeConnection) => {
@@ -85,8 +97,12 @@ const fakeProgram = (connection: FakeConnection) => {
     },
     tape: () => answer(NO_TAPE),
     stats: () => answer(NO_STATS),
+    market: () => answer({}),
+    exchange: () => answer(OPEN_EXCHANGE),
     subscribePrice: subscribe,
     subscribeTape: subscribe,
+    subscribeMarket: subscribe,
+    subscribeExchange: subscribe,
     subscribeStats: subscribe,
   } as unknown as Program;
   return { program, reads, hang: () => (hanging = true) };
@@ -95,13 +111,7 @@ const fakeProgram = (connection: FakeConnection) => {
 const startedFeed = async () => {
   const connection = new FakeConnection();
   const { program, reads, hang } = fakeProgram(connection);
-  const feed = new ChainFeed(program, () => connection.asConnection, [0, 1], {
-    onPrice: () => {},
-    onTape: () => {},
-    onStats: () => {},
-    onError: () => {},
-    onRecovered: () => {},
-  });
+  const feed = new ChainFeed(program, () => connection.asConnection, [0, 1], quietHandlers);
   await feed.follow();
   return { connection, feed, reads, hang };
 };
@@ -130,7 +140,7 @@ describe("stopping", () => {
 
   it("closes the chain feed's socket, ends its timers and asks for no unsubscribe", async () => {
     const { connection, feed, reads } = await startedFeed();
-    expect(connection.subscriptions).toBe(5);
+    expect(connection.subscriptions).toBe(8);
 
     feed.stop();
 
@@ -173,13 +183,7 @@ describe("stopping", () => {
     const connection = new FakeConnection();
     const { program, reads, hang } = fakeProgram(connection);
     hang();
-    const feed = new ChainFeed(program, () => connection.asConnection, [0], {
-      onPrice: () => {},
-      onTape: () => {},
-      onStats: () => {},
-      onError: () => {},
-      onRecovered: () => {},
-    });
+    const feed = new ChainFeed(program, () => connection.asConnection, [0], quietHandlers);
     void feed.follow();
 
     feed.stop();
@@ -198,8 +202,12 @@ describe("stopping", () => {
       },
       tape: async () => NO_TAPE,
       stats: async () => NO_STATS,
+      market: async () => ({}),
+      exchange: async () => OPEN_EXCHANGE,
       subscribePrice: () => () => {},
       subscribeTape: () => () => {},
+      subscribeMarket: () => () => {},
+      subscribeExchange: () => () => {},
       subscribeStats: () => () => {},
     } as unknown as Program;
     const feed = new ChainFeed(
@@ -210,13 +218,7 @@ describe("stopping", () => {
         return connection.asConnection;
       },
       [0],
-      {
-        onPrice: () => {},
-        onTape: () => {},
-        onStats: () => {},
-        onError: () => {},
-        onRecovered: () => {},
-      },
+      quietHandlers,
     );
 
     await expect(feed.follow()).rejects.toThrow("403 Forbidden");

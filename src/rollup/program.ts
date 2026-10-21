@@ -10,7 +10,9 @@ import {
   Instructions,
   LIQUIDATION_STATUS,
   MARKET_KIND,
+  MARKET_STATUS,
   MarketReader,
+  ORACLE_HEALTH,
   ORDER_TYPE,
   OrderInvalid,
   OrderKeyManager,
@@ -22,6 +24,7 @@ import {
   TransactionFailed,
   associatedTokenAddress,
   clockOf,
+  decodeExchange,
   decodeMarket,
   decodeView,
   globalSocket,
@@ -29,6 +32,8 @@ import {
   randomSecret,
   sendAndConfirm,
   websocketUrl,
+  type Exchange,
+  type MarketParams,
   type OrderResult,
   type PriceFeed,
   type Stats,
@@ -38,8 +43,11 @@ import {
   type View,
 } from "@noirwire/orderbook";
 import type {
+  ChainExchange,
   ChainFill,
   ChainMarket,
+  ChainMarketStatus,
+  ChainOracleHealth,
   ChainOrder,
   ChainOrderType,
   ChainPrice,
@@ -57,10 +65,11 @@ import type {
 import { backedOffSockets } from "./bot-socket.js";
 import { Session, connectionTo } from "./connections.js";
 import type { Generation } from "./generation.js";
+import { MAKER_NOT_LISTED_ERROR, programErrorLabel } from "./program-errors.js";
 import { fetchWithin } from "./timeouts.js";
-import { sendDepositAndConfirm, sendInstructionsWithin } from "./transactions.js";
+import { sendDepositAndConfirm } from "./transactions.js";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.5.1";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.6.0";
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 /** The fee and insurance seats come first; traders sit from here up. */
@@ -71,8 +80,6 @@ const ORDER_KEY_SEARCH_WINDOW = 4_096;
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const LIQUIDATE_UP_TO_LOTS = 1_000_000_000n;
 const SIGN_IN_TIMEOUT_MS = 10_000;
-/** A price is stale on chain after ten seconds: a publish that takes longer is given up for the next. */
-const PUBLISH_WITHIN_MS = 8_000;
 const NO_RESTING_EXPIRY = 0n;
 
 const sideOf = (code: number): ChainSide => (code === SIDE.bid ? "buy" : "sell");
@@ -130,6 +137,44 @@ const chainTapeOf = (tape: Tape): ChainTape => ({
 const chainPriceOf = (feed: PriceFeed): ChainPrice => ({
   price: feed.price,
   publishTimeSeconds: Number(feed.publishTime),
+});
+
+const MARKET_STATUS_OF: Record<number, ChainMarketStatus> = {
+  [MARKET_STATUS.active]: "active",
+  [MARKET_STATUS.paused]: "paused",
+  [MARKET_STATUS.reduceOnly]: "reduceOnly",
+};
+
+const ORACLE_HEALTH_OF: Record<number, ChainOracleHealth> = {
+  [ORACLE_HEALTH.healthy]: "healthy",
+  [ORACLE_HEALTH.dislocated]: "dislocated",
+  [ORACLE_HEALTH.settling]: "settling",
+};
+
+/** A status this release does not know is taken as the strictest: no new exposure. */
+const chainMarketOf = (params: MarketParams): ChainMarket => ({
+  marketId: params.marketId,
+  kind: params.kind === MARKET_KIND.perp ? "perp" : "spot",
+  tick: params.tick,
+  baseLot: params.baseLot,
+  minNotional: params.minNotional,
+  bandBps: params.bandBps,
+  initialMarginBps: params.imBps,
+  maxMoveBps: params.maxMoveBps,
+  maxPriceAgeSeconds: Number(params.maxPriceAge),
+  fundingIntervalSeconds: Number(params.fundingInterval),
+  baseToken: params.baseToken,
+  quoteToken: params.quoteToken,
+  positionCap: params.positionCap,
+  status: MARKET_STATUS_OF[params.status] ?? "paused",
+  oracleHealth: ORACLE_HEALTH_OF[params.oracleHealth] ?? "dislocated",
+});
+
+const chainExchangeOf = (exchange: Exchange): ChainExchange => ({
+  paused: exchange.paused,
+  quoteGuardOkUntilSeconds: exchange.quote.account.equals(PublicKey.default)
+    ? null
+    : Number(exchange.quote.okUntil),
 });
 
 const chainStatsOf = ({ orders, fills, openInterest }: Stats): ChainStats => ({
@@ -254,12 +299,24 @@ export const fillRoles = (
   };
 };
 
+/** A deployed token as a deposit names it: its mint and the nonce of its custody authority. */
+export interface CustodyTokenRef {
+  mint: string;
+  /** Decimal text, as the deployment description records it. */
+  custodyNonce: string;
+}
+
+const custodyTokenOf = ({ mint, custodyNonce }: CustodyTokenRef) => ({
+  mint: new PublicKey(mint),
+  custodyNonce: BigInt(custodyNonce),
+});
+
 export interface OpenAndFundRequest {
   gate: PublicKey;
   faucet: PublicKey;
   owner: PublicKey;
   orderKeys: PublicKey[];
-  mint: string;
+  token: CustodyTokenRef;
   amount: bigint;
 }
 
@@ -296,21 +353,43 @@ export class Program {
   async market(connection: Connection, marketId: number): Promise<ChainMarket> {
     const account = await connection.getAccountInfo(this.instructions.addresses.market(marketId));
     if (!account) throw new Error(`market ${marketId} is not on this network`);
-    const { params } = decodeMarket(account.data);
-    return {
-      marketId: params.marketId,
-      kind: params.kind === MARKET_KIND.perp ? "perp" : "spot",
-      tick: params.tick,
-      baseLot: params.baseLot,
-      minNotional: params.minNotional,
-      bandBps: params.bandBps,
-      initialMarginBps: params.imBps,
-      maxMoveBps: params.maxMoveBps,
-      maxPriceAgeSeconds: Number(params.maxPriceAge),
-      fundingIntervalSeconds: Number(params.fundingInterval),
-      baseToken: params.baseToken,
-      quoteToken: params.quoteToken,
-    };
+    return chainMarketOf(decodeMarket(account.data).params);
+  }
+
+  async exchange(connection: Connection): Promise<ChainExchange> {
+    const account = await connection.getAccountInfo(this.instructions.addresses.exchange);
+    if (!account) throw new Error("the exchange is not on this network");
+    return chainExchangeOf(decodeExchange(account.data));
+  }
+
+  subscribeMarket(
+    connection: Connection,
+    marketId: number,
+    onChange: (market: ChainMarket) => void,
+  ): Unsubscribe {
+    return this.subscribeAccount(connection, this.instructions.addresses.market(marketId), (data) =>
+      onChange(chainMarketOf(decodeMarket(data).params)),
+    );
+  }
+
+  subscribeExchange(
+    connection: Connection,
+    onChange: (exchange: ChainExchange) => void,
+  ): Unsubscribe {
+    return this.subscribeAccount(connection, this.instructions.addresses.exchange, (data) =>
+      onChange(chainExchangeOf(decodeExchange(data))),
+    );
+  }
+
+  private subscribeAccount(
+    connection: Connection,
+    address: PublicKey,
+    onChange: (data: Uint8Array) => void,
+  ): Unsubscribe {
+    const id = connection.onAccountChange(address, (account) => onChange(account.data), {
+      commitment: "confirmed",
+    });
+    return () => connection.removeAccountChangeListener(id);
   }
 
   async price(connection: Connection, marketId: number): Promise<ChainPrice> {
@@ -347,55 +426,18 @@ export class Program {
     return this.reader(connection).subscribeStats((stats) => onChange(chainStatsOf(stats)));
   }
 
-  /**
-   * `publishTimeSeconds` is the rollup's own clock: the program refuses a
-   * time ahead of it, and one that is not after the feed's last.
-   */
-  async publishPrices(
-    connection: Connection,
-    oracle: Keypair,
-    prices: { marketId: number; price: bigint }[],
-    publishTimeSeconds: number,
-    /** The whole publish, send and confirmation, is given up after this long. */
-    timeoutMs: number,
-  ): Promise<void> {
-    await sendInstructionsWithin(
-      connection,
-      prices.map(({ marketId, price }) =>
-        this.instructions.publishPrice(
-          oracle.publicKey,
-          marketId,
-          price,
-          BigInt(publishTimeSeconds),
-        ),
-      ),
-      oracle,
-      timeoutMs,
-      true,
-    );
-  }
-
-  async updateFunding(connection: Connection, payer: Keypair, marketId: number): Promise<void> {
-    await sendInstructionsWithin(
-      connection,
-      [this.instructions.updateFunding(marketId)],
-      payer,
-      PUBLISH_WITHIN_MS,
-    );
-  }
-
   /** Credits the seat of `owner` from the faucet. The program finds the seat through the owner's view. */
   async deposit(
     connection: Connection,
     faucet: Keypair,
-    mint: string,
+    token: CustodyTokenRef,
     owner: string,
     target: DepositTarget,
     amount: bigint,
   ): Promise<string> {
     const latest = await connection.getLatestBlockhash("confirmed");
     const transaction = new Transaction({ feePayer: faucet.publicKey, ...latest }).add(
-      this.depositInstruction(faucet.publicKey, mint, new PublicKey(owner), target, amount),
+      this.depositInstruction(faucet.publicKey, token, new PublicKey(owner), target, amount),
     );
     transaction.sign(faucet);
     return sendDepositAndConfirm(connection, transaction);
@@ -403,16 +445,16 @@ export class Program {
 
   private depositInstruction(
     faucet: PublicKey,
-    mint: string,
+    token: CustodyTokenRef,
     owner: PublicKey,
     target: DepositTarget,
     amount: bigint,
   ) {
-    const mintKey = new PublicKey(mint);
+    const custodyToken = custodyTokenOf(token);
     return this.instructions.deposit(
       faucet,
-      associatedTokenAddress(faucet, mintKey),
-      mintKey,
+      associatedTokenAddress(faucet, custodyToken.mint),
+      custodyToken,
       owner,
       target === "collateral" ? { collateral: true } : { spot: target.spotToken },
       amount,
@@ -427,11 +469,11 @@ export class Program {
     connection: Connection,
     request: OpenAndFundRequest,
   ): Promise<Transaction> {
-    const { gate, faucet, owner, orderKeys, mint, amount } = request;
+    const { gate, faucet, owner, orderKeys, token, amount } = request;
     const latest = await connection.getLatestBlockhash("confirmed");
     return new Transaction({ feePayer: gate, ...latest }).add(
       this.instructions.openTrader(gate, owner, orderKeys),
-      this.depositInstruction(faucet, mint, owner, "collateral", amount),
+      this.depositInstruction(faucet, token, owner, "collateral", amount),
     );
   }
 
@@ -662,24 +704,21 @@ export class ProgramTrader {
     return this.run(async (client) => seatViewOf(await client.view()), false);
   }
 
-  place(marketId: number, order: ChainOrder, riskMarkets: number[]): Promise<PlaceOutcome> {
+  /** The client names every perp market the exchange has in each order, for the margin check. */
+  place(marketId: number, order: ChainOrder): Promise<PlaceOutcome> {
     return this.run(async (client): Promise<PlaceOutcome> => {
-      const placed = await client.placeOrder(
-        marketId,
-        {
-          side: sideCode(order.side),
-          orderType: ORDER_TYPE_CODE[order.type],
-          price: order.price,
-          size: order.size,
-          reduceOnly: order.reduceOnly,
-          secret: order.secret,
-          expiry:
-            order.restingExpirySeconds === undefined
-              ? NO_RESTING_EXPIRY
-              : BigInt(order.restingExpirySeconds),
-        },
-        { riskMarkets },
-      );
+      const placed = await client.placeOrder(marketId, {
+        side: sideCode(order.side),
+        orderType: ORDER_TYPE_CODE[order.type],
+        price: order.price,
+        size: order.size,
+        reduceOnly: order.reduceOnly,
+        secret: order.secret,
+        expiry:
+          order.restingExpirySeconds === undefined
+            ? NO_RESTING_EXPIRY
+            : BigInt(order.restingExpirySeconds),
+      });
       if (placed.outcome === "expired") return EXPIRED;
       if (placed.outcome === "placed") return placedAs(placed.result, placed);
       return this.unknownUntil(
@@ -698,10 +737,16 @@ export class ProgramTrader {
         return { status: "invalid", ...NOTHING_PLACED, reason: error.reason };
       }
       if (error instanceof TransactionFailed) {
+        const { code } = error;
+        const label = code === null ? "program error, unnumbered" : programErrorLabel(code);
         return {
           status: "failed",
           ...NOTHING_PLACED,
-          reason: `program error ${error.code ?? "unknown"}`,
+          reason:
+            code === MAKER_NOT_LISTED_ERROR
+              ? `${label}: the seat is not listed as a maker on this market`
+              : label,
+          programError: code ?? undefined,
         };
       }
       throw error;
@@ -729,15 +774,10 @@ export class ProgramTrader {
    * all answer the same. `worstPrice` set to the mark accepts a liquidation
    * in either direction: below the mark from a long, above it from a short.
    */
-  liquidate(
-    marketId: number,
-    seat: number,
-    worstPrice: bigint,
-    riskMarkets: number[],
-  ): Promise<boolean> {
+  liquidate(marketId: number, seat: number, worstPrice: bigint): Promise<boolean> {
     return this.run(async (client) => {
       const result = await this.resultOf(
-        client.liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice, riskMarkets),
+        client.liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice),
       );
       return result?.status === LIQUIDATION_STATUS.liquidated;
     }).catch((error: unknown) => {
