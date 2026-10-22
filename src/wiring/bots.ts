@@ -1,4 +1,5 @@
 import { FundingUpdater } from "../bots/funding-updater.js";
+import { healthPing } from "../bots/health-ping.js";
 import { HouseMaker } from "../bots/house-maker.js";
 import { Liquidator } from "../bots/liquidator.js";
 import { MakerControl, controlPath } from "../bots/maker-control.js";
@@ -61,7 +62,7 @@ const houseMaker = (
   config: Config,
   market: MarketConfig,
   sizes: BotSizes,
-  extras: { safety?: MakerSafety; ledger?: MakerLedger },
+  extras: { safety?: MakerSafety; ledger?: MakerLedger; afterRequote?: () => void },
 ): HouseMaker =>
   new HouseMaker({
     market: market.id,
@@ -129,8 +130,11 @@ export const openBots = async (
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
   const rules = config.HOUSE_MAKER_RISK_RULES;
-  const reference = rules ? new ReferencePrice(referenceSources(systemClock), systemClock) : null;
+  const reference = rules ? new ReferencePrice(referenceSources(), systemClock) : null;
   const control = new MakerControl(controlPath(config.DATA_DIR));
+  const afterRequote = config.HEALTHCHECK_URL
+    ? healthPing(config.HEALTHCHECK_URL, problems)
+    : undefined;
   for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
     // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.
@@ -140,7 +144,7 @@ export const openBots = async (
         : undefined;
     const safety =
       reference && ledger ? makerSafety(market, ledger, reference, control, problems) : undefined;
-    const maker = houseMaker(config, market, sizes, { safety, ledger });
+    const maker = houseMaker(config, market, sizes, { safety, ledger, afterRequote });
     await maker.ensureOpen(botVenue);
     makers.push(maker);
     if (config.NOISE_TAKERS_ENABLED) takers.push(noiseTaker(config, market, sizes, random));

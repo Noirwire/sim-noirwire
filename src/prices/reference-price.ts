@@ -57,10 +57,13 @@ const pythBody = z.object({
 });
 
 const coinbaseBody = z.object({ price: z.string(), time: z.string() });
+/** The answer holds the pair's trades as a list, beside a plain-text `last` cursor. */
 const krakenBody = z.object({
   error: z.array(z.string()),
-  result: z.record(z.string(), z.object({ c: z.array(z.string()).min(1) })),
+  result: z.record(z.string(), z.unknown()),
 });
+/** A trade: price, volume, then the time it happened in seconds, then fields this does not read. */
+const krakenTrade = z.tuple([z.string(), z.string(), z.number()]).rest(z.unknown());
 const okxBody = z.object({
   data: z.array(z.object({ last: z.string(), ts: z.string().regex(/^\d+$/) })).min(1),
 });
@@ -71,10 +74,7 @@ const okxBody = z.object({
  * exchanges are the public SOL tickers of Coinbase, Kraken and OKX. No call
  * carries a key.
  */
-export const referenceSources = (
-  clock: Clock,
-  getJson: FetchJson = fetchJson,
-): ReferenceSource[] => [
+export const referenceSources = (getJson: FetchJson = fetchJson): ReferenceSource[] => [
   {
     name: "Pyth",
     exchange: false,
@@ -107,16 +107,18 @@ export const referenceSources = (
     exchange: true,
     read: async () => {
       const body = krakenBody.parse(
-        await getJson("https://api.kraken.com/0/public/Ticker?pair=SOLUSD"),
+        await getJson("https://api.kraken.com/0/public/Trades?pair=SOLUSD&count=1"),
       );
       if (body.error.length > 0) throw new Error(body.error.join(", "));
-      const ticker = Object.values(body.result)[0];
-      if (!ticker) throw new Error("no ticker in the answer");
+      const trades = Object.values(body.result).find(Array.isArray);
+      const trade = trades ? krakenTrade.safeParse(trades[trades.length - 1]) : null;
+      if (!trade?.success) throw new Error("no trade in the answer");
+      const [price, , seconds] = trade.data;
       return {
         source: "Kraken",
         exchange: true,
-        price: dollars(ticker.c[0]),
-        atMs: clock.nowMs(),
+        price: dollars(price),
+        atMs: Math.round(seconds * MS_PER_SECOND),
       };
     },
   },

@@ -72,6 +72,8 @@ const envSchema = z.object({
   HOUSE_MAKER_MAX_SKEW_BPS: positiveInt(20),
   /** The maker follows the risk rules (`bots/maker-safety.ts`). Always on, and not switchable off, on mainnet. */
   HOUSE_MAKER_RISK_RULES: boolFlag("0"),
+  /** Pinged after each good requote of the house maker, so an outside monitor notices when the pings stop. */
+  HEALTHCHECK_URL: z.url().optional(),
 
   /** The noise takers trade at all. Off, none is opened, funded or started. */
   NOISE_TAKERS_ENABLED: boolFlag("1"),
@@ -106,6 +108,12 @@ const envSchema = z.object({
   FAUCET_SECRET_KEY_FILE: z.string().optional(),
   BOT_TRADER_SEEDS: z.string().optional(),
   BOT_TRADER_SEEDS_FILE: z.string().optional(),
+  /** Mainnet: the file of invited owner keys and invite codes the gate signs for. Required there. */
+  GATE_INVITES_FILE: z.string().optional(),
+  /** Mainnet: accounts the gate opens in a UTC day. The program's own `max_seats_per_day` caps it from above. */
+  GATE_SEATS_PER_DAY: positiveInt(3),
+  /** Mainnet: accounts the gate opens in a UTC day for one network address. */
+  GATE_SEATS_PER_IP_PER_DAY: positiveInt(1),
   PUBLIC_SOLANA_RPC_URL: z.url().optional(),
   PUBLIC_ROLLUP_RPC_URL: z.url().optional(),
   PUBLIC_ROLLUP_WS_URL: z.url().optional(),

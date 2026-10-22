@@ -141,6 +141,21 @@ const proxyHops = (config: Config): string[] =>
       ]
     : [];
 
+const gateSettings = (config: Config, env: Env): string[] => [
+  ...(isSet(env, "GATE_INVITES_FILE")
+    ? []
+    : [
+        "GATE_INVITES_FILE is not set. On mainnet the gate signs only for the people on an invite list, " +
+          "read from a file mounted into the service. Set it to the file's path (an empty file admits nobody).",
+      ]),
+  ...(config.GATE_SEATS_PER_IP_PER_DAY > config.GATE_SEATS_PER_DAY
+    ? [
+        "GATE_SEATS_PER_IP_PER_DAY is more than GATE_SEATS_PER_DAY, so the per-address limit could never be reached. " +
+          "Lower it to GATE_SEATS_PER_DAY or less.",
+      ]
+    : []),
+];
+
 /**
  * What the house maker uses on mainnet when its setting is not given: small
  * enough for a maker of about 1,000 USDC. The testnet defaults would quote
@@ -206,6 +221,7 @@ export const mainnetConfig = (config: Config, env: Env): Config => {
     ...testMachinery(sized, env),
     ...makerLimits(sized, env),
     ...secretsFromFiles(env),
+    ...gateSettings(sized, env),
     ...publicUrls(env),
     ...proxyHops(sized),
   ];

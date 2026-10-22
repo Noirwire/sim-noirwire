@@ -18,6 +18,8 @@ export const signOf = (value: bigint): bigint => (value > 0n ? 1n : value < 0n ?
 
 export const minBigInt = (a: bigint, b: bigint): bigint => (a < b ? a : b);
 
+export const maxBigInt = (a: bigint, b: bigint): bigint => (a > b ? a : b);
+
 /** Rounds a price to its tick, or a size to its lot. */
 export const roundUpToStep = (value: bigint, step: bigint): bigint => {
   const remainder = value % step;

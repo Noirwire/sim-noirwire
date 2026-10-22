@@ -243,11 +243,13 @@ describe("the service started on mainnet", () => {
     writeFileSync(gatePath, keyOf(gate));
     const seedsPath = join(dir, "seeds");
     writeFileSync(seedsPath, "33".repeat(32));
-    return { dir, deploymentPath, gatePath, seedsPath };
+    const invitesPath = join(dir, "invites.txt");
+    writeFileSync(invitesPath, "");
+    return { dir, deploymentPath, gatePath, seedsPath, invitesPath };
   };
 
   const configFor = (name: string) => {
-    const { dir, deploymentPath, gatePath, seedsPath } = files(name);
+    const { dir, deploymentPath, gatePath, seedsPath, invitesPath } = files(name);
     return {
       ...loadConfig({
         NETWORK: "mainnet",
@@ -264,6 +266,7 @@ describe("the service started on mainnet", () => {
         DEPLOYMENT_PATH: deploymentPath,
         GATE_SECRET_KEY_FILE: gatePath,
         BOT_TRADER_SEEDS_FILE: seedsPath,
+        GATE_INVITES_FILE: invitesPath,
       } as NodeJS.ProcessEnv),
       PORT: 0,
     };

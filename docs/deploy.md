@@ -272,6 +272,9 @@ steps above do not apply to it. The files and variables it takes, and what each 
 | `BOT_TRADER_SEEDS_FILE`                                                  | The maker's seed in hex. It is the maker's seat: back it up offline, never rotate it casually, since a new seed is a new seat and strands the old balance |
 | `SOLANA_RPC_URL`, `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                      | Private endpoints, which may carry an API key. Never served and never logged                                                                              |
 | `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | What browsers are told. Separate from the private ones, no key in them                                                                                    |
+| `GATE_INVITES_FILE`                                                      | The invite list: a text file in a folder mounted read-only, edited by the operator on the host. The service reads it again when it changes                |
+| `GATE_SEATS_PER_DAY`, `GATE_SEATS_PER_IP_PER_DAY`                        | The day's limits on new accounts (defaults 3 and 1). Always kept below the exchange's `max_seats_per_day`                                                 |
+| `DATA_DIR`                                                               | A writable folder that survives restarts and redeploys. Holds `gate-seats.json`, the gate's record of every seat it signed for                            |
 | `TRUSTED_PROXY_HOPS`                                                     | Reverse proxies in front of the service (`0` for none)                                                                                                    |
 | `ALLOWED_ORIGINS`                                                        | The production terminal's origin only                                                                                                                     |
 
@@ -283,6 +286,35 @@ anything, and a `DATA_DIR` that holds a snapshot from another network.
 Check it with `GET /v1/health` (the container probe): 200 once the maker is open and its
 seat funded and, as the service is never put to sleep on mainnet, the chain is connected
 and the mark is fresh; 503 with a `reason` otherwise.
+
+### The gate on mainnet: invites and seats
+
+The rules are in the README ("The gate: who gets an account on mainnet"). What an operator
+does:
+
+- **Invite someone:** add their owner public key on a line of the invite list on the host,
+  or a line `<code> <owner public key>` and give them the code. Save. It takes effect on the
+  next request; no restart. Remove the line to withdraw an invite that is not used yet.
+- **The folder is mounted, not the file.** The deployment mounts the folder that holds the
+  list into the container read-only, and `GATE_INVITES_FILE` names the file in it. A
+  one-file mount follows the file, not its name, so an editor that saves by replacing it
+  would leave the service reading the old list.
+- **Watch the log** for lines that start `sim-noirwire: gate:`. Each decision is one line
+  with the owner's public key. A line about the invite list that "cannot be used" names the
+  line number; fix it and save. The list file "cannot be read" line means nobody is being
+  admitted until it can be.
+- **`gate-seats.json` in `DATA_DIR`** is the record of every seat the gate signed for. Back
+  it up with `DATA_DIR`; never delete it to "reset" a day, since it also stops an invite
+  from opening a second account. If it is damaged the service stops at start and says so:
+  restore it from a backup. Beside it, `gate-seats.json.key` holds the key its address hashes
+  are made with; if it is damaged the service stops at start and says to delete it, which only
+  restarts the day's count per address.
+- **Raising the day's limit** takes two changes, in this order: the exchange's admin raises
+  `max_seats_per_day` with `update_exchange`, then `GATE_SEATS_PER_DAY` is raised and the
+  service restarted. The gate always stays one seat under the program's limit.
+- **A person who says their account did not open** after an error that said it "may have
+  been opened": check the chain for their owner key before anything else. If the seat is
+  there they are done; if not they can try again with the same invite.
 
 ### The maker on mainnet: risk rules, alerts, kill switch
 
@@ -296,6 +328,12 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   log for the word `ALERT`. Lines saying it `pulled its quotes` are not alerts: the price
   sources disagreed, a price was old, or the market moved fast, and it quotes again by
   itself after 10 quiet seconds.
+- **A heartbeat for an outside monitor.** Set `HEALTHCHECK_URL` to a ping address (for
+  example a healthchecks.io check) and the maker calls it after each good requote, about
+  every 10 s. Set the monitor's period to 1 minute with a short grace, and have it message
+  you when the calls stop. That also fires when the maker is deliberately stopped or the
+  prices are pulled for long, which is the point. The address is never logged; if a call
+  fails the log says `health check ping failing` with what to check, and quoting goes on.
 - **The kill switch** is a command on the machine the service runs on, with the service's
   `DATA_DIR`: `docker exec <container> node dist/kill-switch.js reduce`, or `stop`, or
   `resume`. It writes a small file the maker reads every second, so it works while the API

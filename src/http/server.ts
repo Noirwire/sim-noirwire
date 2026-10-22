@@ -9,6 +9,7 @@ import { registerCandlesRoute } from "./routes/candles.js";
 import { registerDevTradingRoutes } from "./routes/dev-trading.js";
 import { registerFundRoute } from "./routes/fund.js";
 import { registerRollupFundRoutes } from "./routes/fund-rollup.js";
+import { registerOpenRoutes } from "./routes/open-rollup.js";
 import { registerDeploymentRoute } from "./routes/deployment.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerMarketsRoute } from "./routes/markets.js";
@@ -24,9 +25,10 @@ declare module "fastify" {
 }
 
 /**
- * Mainnet serves the read-only market data and nothing that creates an
- * account or moves funds: no fund routes and no test trading. Every address
- * is limited in requests per minute and in open stream sockets.
+ * Mainnet serves the read-only market data and one write: opening an account
+ * for an invited person (`/v1/open`). It has no fund routes and no test
+ * trading. Every address is limited in requests per minute and in open
+ * stream sockets.
  */
 export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => {
   const { config } = ctx;
@@ -69,10 +71,10 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   registerTapeRoute(app, ctx);
   registerCandlesRoute(app, ctx);
   registerStatsRoute(app, ctx);
-  if (!mainnet) {
-    if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
-    else registerFundRoute(app, ctx);
-  }
+  if (mainnet) {
+    if (ctx.openDesk) registerOpenRoutes(app, ctx, ctx.openDesk);
+  } else if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
+  else registerFundRoute(app, ctx);
   registerStreamRoute(
     app,
     ctx,

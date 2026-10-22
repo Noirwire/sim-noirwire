@@ -16,6 +16,7 @@ const mainnetEnv = (over: Record<string, string | undefined> = {}): NodeJS.Proce
     PUBLIC_ROLLUP_WS_URL: "wss://rollup-public.example",
     DEPLOYMENT_PATH: "/run/secrets/deployment.json",
     GATE_SECRET_KEY_FILE: "/run/secrets/gate.json",
+    GATE_INVITES_FILE: "/run/gate/invites.txt",
     BOT_TRADER_SEEDS_FILE: "/run/secrets/maker-seeds",
     ...over,
   };
@@ -118,6 +119,21 @@ describe("NETWORK=mainnet", () => {
       expect.stringContaining("BOT_TRADER_SEEDS_FILE is not set"),
       expect.stringContaining("DEPLOYMENT_PATH is not set"),
     ]);
+  });
+
+  it("asks for the invite list, and keeps the per-address limit within the daily one", () => {
+    expect(problemsOf(mainnetEnv({ GATE_INVITES_FILE: undefined }))).toEqual([
+      expect.stringContaining("GATE_INVITES_FILE is not set"),
+    ]);
+    expect(
+      problemsOf(mainnetEnv({ GATE_SEATS_PER_DAY: "2", GATE_SEATS_PER_IP_PER_DAY: "3" })),
+    ).toEqual([
+      expect.stringContaining("GATE_SEATS_PER_IP_PER_DAY is more than GATE_SEATS_PER_DAY"),
+    ]);
+
+    const config = loadConfig(mainnetEnv());
+    expect(config.GATE_SEATS_PER_DAY).toBe(3);
+    expect(config.GATE_SEATS_PER_IP_PER_DAY).toBe(1);
   });
 
   it("requires a public address for each of the three a browser is told, with no fallback", () => {

@@ -48,7 +48,7 @@ describe("pausing the chain feed", () => {
         return { orders: 0n, fills: 0n, openInterest: [] };
       },
       market: async () => ({}),
-      exchange: async () => ({ paused: false, quoteGuardOkUntilSeconds: null }),
+      exchange: async () => ({ paused: false, quoteGuardOkUntilSeconds: null, maxSeatsPerDay: 5 }),
       subscribePrice: () => () => {},
       subscribeTape: () => () => {},
       subscribeMarket: () => () => {},
@@ -89,7 +89,7 @@ describe("a rollup that stops answering the chain feed", () => {
       tape: () => answer({ lastSequence: 0n, fills: [] }),
       stats: () => answer({ orders: 0n, fills: 0n, openInterest: [] }),
       market: () => answer({}),
-      exchange: () => answer({ paused: false, quoteGuardOkUntilSeconds: null }),
+      exchange: () => answer({ paused: false, quoteGuardOkUntilSeconds: null, maxSeatsPerDay: 5 }),
       subscribePrice: () => () => {},
       subscribeTape: () => () => {},
       subscribeMarket: () => () => {},

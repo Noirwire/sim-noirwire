@@ -67,7 +67,7 @@ class FakeConnection {
 const NO_PRICE = { price: 0n, publishTimeSeconds: 0 };
 const NO_TAPE = { lastSequence: 0n, fills: [] };
 const NO_STATS = { orders: 0n, fills: 0n, openInterest: [] };
-const OPEN_EXCHANGE = { paused: false, quoteGuardOkUntilSeconds: null };
+const OPEN_EXCHANGE = { paused: false, quoteGuardOkUntilSeconds: null, maxSeatsPerDay: 5 };
 
 const quietHandlers = {
   onPrice: () => {},

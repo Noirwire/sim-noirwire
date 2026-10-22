@@ -1,8 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { STILL_STARTING } from "../../engine/venue-not-ready.js";
 import type { FundRequests } from "../../rollup/fund-desk.js";
 import type { AppContext } from "../context.js";
+import { deskUnavailable } from "./desk-availability.js";
 import { base58Address } from "../schemas.js";
 import { money } from "../serialize.js";
 
@@ -39,22 +39,6 @@ export const registerRollupFundRoutes = (
   ctx: AppContext,
   fundDesk: FundRequests,
 ): void => {
-  /**
-   * Why the desk cannot be asked right now, or null. The request that got
-   * here already asked for activity, so a service that is asleep is waking.
-   */
-  const unavailable = (): string | null => {
-    const readiness = ctx.readiness?.();
-    if (ctx.startUp && !ctx.startUp.ready) return STILL_STARTING;
-    if (readiness && !readiness.botsFunded) return STILL_STARTING;
-    if (ctx.activity.phase !== "awake")
-      return "the service is waking up, try again in a few seconds";
-    if (readiness && !readiness.connected) {
-      return "the rollup cannot be reached right now, try again";
-    }
-    return null;
-  };
-
   /** When the rollup last failed the desk: nobody is sent to it again for a few seconds, whoever they are. */
   let deskFailedAtMs = -Infinity;
   /** The desk takes one call at a time, so a burst cannot all pass the gate before the first fails. */
@@ -67,7 +51,7 @@ export const registerRollupFundRoutes = (
    */
   const refusal = (owner: string, ip: string, submitting: boolean) => {
     const reason =
-      unavailable() ??
+      deskUnavailable(ctx) ??
       (deskBusy ? DESK_BUSY : null) ??
       (Date.now() - deskFailedAtMs < DESK_COOLDOWN_MS ? DESK_COOLING_DOWN : null);
     if (reason) return { status: 503 as const, reason };

@@ -123,6 +123,7 @@ start when a required one is missing or a key is not the one the deployment name
 | `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)          |
 | `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
 | `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
+| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after each good requote, for an outside monitor               |
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                              |
 | `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
 
@@ -150,15 +151,116 @@ What mainnet requires (the service says which is missing):
   never served. They are also hidden from every logged or served error text.
 - `TRUSTED_PROXY_HOPS`: how many reverse proxies sit in front (`0` if none), so the
   per-IP limits see the caller and not the proxy.
+- `GATE_INVITES_FILE`: the invite list the gate signs for (see "The gate" below). An
+  empty file is valid and admits nobody.
 - An empty `DATA_DIR`, or one a mainnet run saved: a snapshot from another network is
-  refused.
+  refused. It must be a disk that survives restarts, because the gate's record of the
+  seats it signed for lives in it.
 
 While it runs: the service is never put to sleep (the maker quotes whether or not anyone is
-watching); `/v1/fund/*` and `/v1/dev/*` answer 404; markets, tape and candles carry
+watching); `/v1/fund/*` and `/v1/dev/*` answer 404, and `/v1/open/*` is the only route that
+writes; markets, tape and candles carry
 `simulated: false` and the quote is `USDC`; each address is limited to
 `PUBLIC_RATE_LIMIT_PER_MINUTE` requests a minute (429 with `retry-after`) and
 `PUBLIC_SOCKETS_PER_IP` open stream sockets; and `GET /v1/health` is the container's
 health probe (the image's `HEALTHCHECK` already calls it).
+
+#### The gate: who gets an account on mainnet
+
+The gate co-signs `open_trader`, the transaction that gives a person a seat on the
+exchange. On mainnet it signs only for invited people. Devnet is unchanged: it keeps the
+fund routes and signs for anyone, within its per-IP limit.
+
+A person opens an account in two requests, like the devnet fund button but with no grant
+(they deposit their own USDC in a transaction of their own):
+
+1. `POST /v1/open/prepare` with `{ owner, orderKeys: [4 keys], invite? }`. If the rules
+   below say yes, the answer is `{ transaction, expiresAtMs }`: one unsigned transaction
+   whose only instruction is `open_trader`, with the gate as fee payer.
+2. `POST /v1/open/submit` with `{ owner, transaction }`, the same transaction signed by
+   the owner. The gate checks it is byte for byte the one it prepared, checks the rules
+   again, writes the seat down on disk, and only then signs and sends it. The answer is
+   `{ reference }`.
+
+The rules, in the order they are checked. A refusal says why in `error` and what to do:
+
+| Status | Why                                                                                                  |
+| ------ | ---------------------------------------------------------------------------------------------------- |
+| 403    | The owner key is not on the invite list, the invite needs its code and none was sent, or it is wrong |
+| 409    | The invite was used already (an invite opens one account), or the owner key already has an account   |
+| 503    | The day's seats are all given out, the service is still starting, or the seat could not be recorded  |
+| 429    | This network address has opened its account for the day                                              |
+
+**The invite list** is a text file the operator edits, named by `GATE_INVITES_FILE`. It is
+read again whenever its size or modified time changes, so adding or removing a line needs
+no restart and takes effect on the next request. One entry per line, `#` starts a comment:
+
+```
+# an owner key invited by address
+<owner public key>
+# an invite code (12 to 64 letters, digits, - or _), good only for the key after it
+launch-friends-0001 <owner public key>
+```
+
+A line that cannot be used is logged with its line number and left out, and a code given
+to two keys is left out entirely, so a typo admits nobody rather than the wrong person. If
+the file cannot be read after it once could, nobody is admitted until it can be again. A
+missing file stops the start. A code is a secret the person must send as `invite`; a key
+line needs nothing but the key.
+
+**At most one seat per invite.** Each seat the gate signs for is written to `gate-seats.json`
+in `DATA_DIR` before the signature goes on, under its invite (the key, or a hash of the
+code). That file is what makes an invite single use and what the limits count, so a restart
+does not reset them. If it exists and cannot be read, the service does not start, because
+starting would forget who already has a seat. Back it up with the rest of `DATA_DIR`. A seat
+the rollup refused, or that never left the gate, is taken out again and the invite works
+again; a seat that was sent and never confirmed stays on record, can be tried again, and
+counts once however many times it is tried. If the rollup then answers that the account exists
+already, the earlier try did open it, and the seat is kept. It keeps no network address, only a
+short keyed hash of one, and drops even that once its UTC day is over. The key is
+`gate-seats.json.key`, created on the first seat with mode 0600 and read by this service alone.
+If the key file is lost or damaged, delete it: the day's count per address then starts over.
+
+**Limits per day** (a UTC day, like the program's own):
+
+- `GATE_SEATS_PER_DAY` (default 3): accounts the gate signs for. The limit that applies is
+  the smaller of this and one under the exchange's `max_seats_per_day`, which the service
+  reads from the chain, so the program's own limit is never the first to refuse and one
+  seat stays free for the operator. Until the service has read the exchange it signs
+  nothing.
+- `GATE_SEATS_PER_IP_PER_DAY` (default 1, not more than the one above): accounts for one
+  network address. With `TRUSTED_PROXY_HOPS` set right, that is the caller's address.
+
+Seats opened by the operator's own keys count in the program's limit but not in these;
+leave room for them when you set `max_seats_per_day`.
+
+**What is logged.** One line per decision, to the service's log, with the owner's public
+key and nothing else about the person: no invite code, no network address.
+
+```
+sim-noirwire: gate: <owner public key> prepare admitted
+sim-noirwire: gate: <owner public key> submit admitted, signing
+sim-noirwire: gate: <owner public key> account opened
+sim-noirwire: gate: <owner public key> prepare refused: this address is not on the invite list. Ask for an invite, then try again
+```
+
+**The files and settings the gate needs on mainnet,** and how the deployment provides them:
+
+| What                                                | Where it comes from                                                                                                                                                                                 |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GATE_SECRET_KEY_FILE`                              | A keypair file mounted read-only. It must be the gate key the exchange names, and the service user must be able to read it                                                                          |
+| `GATE_INVITES_FILE`                                 | The invite list. Mount the folder that holds it, read-only, not the single file: an editor that saves by replacing the file leaves a one-file mount looking at the old copy, and edits never arrive |
+| `DATA_DIR`                                          | A writable folder that survives restarts and redeploys. Holds `gate-seats.json` and the maker's files. Wiping it forgets who has a seat                                                             |
+| `GATE_SEATS_PER_DAY`                                | Environment variable, optional                                                                                                                                                                      |
+| `GATE_SEATS_PER_IP_PER_DAY`                         | Environment variable, optional                                                                                                                                                                      |
+| `TRUSTED_PROXY_HOPS`                                | Environment variable, required: without the right number the per-address limit counts the proxy as the one caller                                                                                   |
+| `ALLOWED_ORIGINS`                                   | Environment variable: the terminal's origin, so a browser may call `/v1/open`                                                                                                                       |
+| `SOLANA_RPC_URL`, `ROLLUP_RPC_URL`, `ROLLUP_WS_URL` | Environment variables as for the rest of mainnet. The gate sends the opening through the rollup endpoint as the gate key, signed in the same way as the maker                                       |
+
+The gate key needs no funds; it co-signs only `open_trader`, and the program bounds a
+stolen one to `max_seats_per_day` seats a day. To change which key is
+the gate, the exchange's admin sends `update_exchange`, then the file is replaced and the
+service restarted.
 
 #### The maker's risk rules
 
@@ -192,6 +294,12 @@ dist/kill-switch.js ...` in the container) writes a request into `DATA_DIR` that
 - **Errors it does not understand.** While sending orders, any failure other than the
   rollup being away stops the maker for good (an `ALERT` line, quotes cancelled) until an
   operator resumes it. A failed cancel is tried again on the next tick.
+- **A heartbeat.** With `HEALTHCHECK_URL` set, the maker calls that address after each
+  requote that sent every order, about every 10 s on mainnet. An outside monitor then
+  alerts when the calls stop: the maker is stopped, pulled, stuck or the machine is down. A
+  failed call is logged without the address and never stops the maker.
+- **The edge holds under skew.** No quote sits closer than 15 bps to the reference price,
+  even at the full skew, so the side that shrinks the position is still sold at an edge.
 
 The risk rules cover SOL perpetuals only; the service refuses to start the maker on any
 other market with them on.
@@ -260,6 +368,9 @@ ones:
 | `DATA_DIR`                                      | `./data`                | Where candles and fund grants are snapshotted                                        |
 | `FUND_AMOUNT_NUSD`                              | `5000`                  | One-time grant size                                                                  |
 | `FUND_IP_RATE_LIMIT` / `FUND_IP_RATE_WINDOW_MS` | `20` / `3600000`        | Per-IP cap on fund grants                                                            |
+| `GATE_INVITES_FILE`                             | none                    | Mainnet, required: the invite list the gate signs for (see "The gate")               |
+| `GATE_SEATS_PER_DAY`                            | `3`                     | Mainnet: accounts opened a UTC day, always below the program's own limit             |
+| `GATE_SEATS_PER_IP_PER_DAY`                     | `1`                     | Mainnet: accounts opened a UTC day for one network address                           |
 | `JUPITER_POLL_INTERVAL_MS`                      | `4000`                  | How often every market's price is fetched, in one request                            |
 | `HOUSE_MAKER_*`                                 | see file                | Ladder depth, spread, requote thresholds, position limit, skew                       |
 | `NOISE_TAKER_*`                                 | see file                | How many bot traders, how often, how big                                             |
@@ -280,6 +391,7 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 | `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at. With `VENUE=rollup` also `botOrdersOutcomeUnknown`: bot orders whose outcome was not known in time, and how many of them settled as executed late or as expired                            |
 | `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                                                                                                                                                                                                                     |
 | `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only, not on mainnet. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                                                                         |
+| `POST /open/prepare`, `POST /open/submit`                | `NETWORK=mainnet` only. Opens an account for an invited person, no funds, in two steps signed by the user (see "The gate: who gets an account on mainnet")                                                                                                                                                                   |
 | `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                                                                                                                                                                                                                |
 | `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                                                                                                                                                                                                                |
 

@@ -4,6 +4,7 @@ import {
   absBigInt,
   bpsOf,
   divScale,
+  maxBigInt,
   minBigInt,
   roundDownToStep,
   roundUpToStep,
@@ -44,6 +45,8 @@ export interface HouseMakerOptions {
   safety?: MakerSafety;
   /** What the maker keeps across a restart. Without it, it remembers nothing. */
   ledger?: MakerLedger;
+  /** Called after each requote that sent every order. It must not throw or wait: a heartbeat to an outside monitor. */
+  afterRequote?: () => void;
 }
 
 /** The skew is applied in thousandths of a basis point, so a small inventory still moves the centre. */
@@ -61,6 +64,11 @@ export interface Ladder {
    * orders there and a new order together may not pass it.
    */
   positionCap?: bigint;
+  /**
+   * The least any quote may sit away from `mark`, skew included. Without it a
+   * strong skew can carry the reducing side through the price it centres on.
+   */
+  minEdgeBps?: number;
 }
 
 type LadderShape = Pick<
@@ -76,6 +84,17 @@ export class QuotesHeld extends Error {
   }
 }
 
+/** The venue answered an order with a refusal the maker does not recognise as routine. */
+export class OrderRefused extends Error {
+  constructor(market: MarketId, reason: string | undefined) {
+    super(`${market} order refused by the venue: ${reason || "no reason given"}`);
+    this.name = "OrderRefused";
+  }
+}
+
+/** A post-only order that would have taken from the book: the one refusal a quoting maker expects now and then. */
+const ROUTINE_REFUSAL = /would (match|cross)/;
+
 /** `size` where a side that already reaches `reach` has room for a whole level under the cap, else nothing. */
 const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigint): bigint =>
   positionCap === undefined || positionCap - reach >= size ? size : 0n;
@@ -89,21 +108,33 @@ const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigin
  * that fits under that cap.
  */
 export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => {
-  const { mark, tickSize, position, positionLimit, positionCap } = ladder;
+  const { mark, tickSize, position, positionLimit, positionCap, minEdgeBps } = ladder;
   const inventoryShare = positionLimit > 0n ? Number(position) / Number(positionLimit) : 0;
   const skewBps = Math.max(-1, Math.min(1, inventoryShare)) * shape.maxSkewBps;
   const center =
     mark -
     (mark * BigInt(Math.round(skewBps * SKEW_PRECISION))) /
       (BPS_PER_WHOLE * BigInt(SKEW_PRECISION));
-  const quote = (side: NewOrder["side"], price: bigint, size: bigint): NewOrder => ({
-    market: shape.market,
-    side,
-    type: "postOnly",
-    // A price off the tick moves away from the market, so the spread is never narrower than asked.
-    price: side === "buy" ? roundDownToStep(price, tickSize) : roundUpToStep(price, tickSize),
-    size,
-  });
+  // Rounded up, so the edge is never a unit short of what was asked.
+  const minEdge =
+    minEdgeBps === undefined
+      ? null
+      : (mark * BigInt(minEdgeBps) + BPS_PER_WHOLE - 1n) / BPS_PER_WHOLE;
+  const withEdge = (side: NewOrder["side"], price: bigint): bigint => {
+    if (minEdge === null) return price;
+    return side === "buy" ? minBigInt(price, mark - minEdge) : maxBigInt(price, mark + minEdge);
+  };
+  const quote = (side: NewOrder["side"], price: bigint, size: bigint): NewOrder => {
+    const edged = withEdge(side, price);
+    return {
+      market: shape.market,
+      side,
+      type: "postOnly",
+      // A price off the tick moves away from the market, so the spread is never narrower than asked.
+      price: side === "buy" ? roundDownToStep(edged, tickSize) : roundUpToStep(edged, tickSize),
+      size,
+    };
+  };
 
   const orders: NewOrder[] = [];
   let bidReach = position > 0n ? position : 0n;
@@ -201,8 +232,9 @@ export class HouseMaker {
   async withdraw(venue: Venue): Promise<void> {
     this.epoch += 1;
     this.lastQuoted = null;
-    this.standing = false;
     await venue.cancelAll(this.trader, this.options.market);
+    // Only once the venue has taken them off: a cancel that failed is tried again on the next tick.
+    this.standing = false;
   }
 
   private dueForRequote(next: Quoting, nowMs: number): boolean {
@@ -230,7 +262,10 @@ export class HouseMaker {
    * refuse the quotes: cancelling and sending a ladder it refuses would only
    * empty the book. Its next tick after the venue takes quotes again requotes.
    * With the risk rules, a failure while sending orders that it does not
-   * understand stops the maker (see `stopAfter`) and is thrown on.
+   * understand stops the maker (see `stopAfter`) and is thrown on. So does an
+   * order the venue answers with a refusal, unless it is a post-only order that
+   * would have crossed: that leaves a gap in the ladder, so the maker sends no
+   * heartbeat and sends the whole ladder again on its next tick.
    */
   async tick(venue: Venue): Promise<void> {
     const epoch = this.epoch;
@@ -266,22 +301,38 @@ export class HouseMaker {
         position,
         positionLimit: divScale(this.options.positionLimitNotional, plan.centre),
         positionCap: market.positionCap,
+        minEdgeBps: safety ? MAKER_LIMITS.minHalfSpreadBps : undefined,
       },
     );
     const orders = plan.reduceOnly ? onlyReducing(ladder, position, this.options.lotSize) : ladder;
     this.standing = true;
+    let leftOut = 0;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) return;
-        await venue.placeOrder(this.trader, { ...order, expiresInSeconds: this.expiresInSeconds });
+        const placed = await venue.placeOrder(this.trader, {
+          ...order,
+          expiresInSeconds: this.expiresInSeconds,
+        });
+        if (!safety || placed.status !== "rejected") continue;
+        if (!ROUTINE_REFUSAL.test(placed.reason ?? "")) {
+          throw new OrderRefused(this.options.market, placed.reason);
+        }
+        leftOut += 1;
       }
     } catch (error) {
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
 
+    // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
+    if (leftOut > 0) {
+      this.lastQuoted = null;
+      return;
+    }
     this.lastQuoted = plan;
     this.lastQuotedAtMs = now;
+    this.options.afterRequote?.();
   }
 
   /** What the risk rules measure the maker's loss by: the seat's equity at the venue's mark. */

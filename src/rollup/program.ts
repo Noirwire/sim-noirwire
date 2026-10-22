@@ -175,6 +175,7 @@ const chainExchangeOf = (exchange: Exchange): ChainExchange => ({
   quoteGuardOkUntilSeconds: exchange.quote.account.equals(PublicKey.default)
     ? null
     : Number(exchange.quote.okUntil),
+  maxSeatsPerDay: exchange.maxSeatsPerDay,
 });
 
 const chainStatsOf = ({ orders, fills, openInterest }: Stats): ChainStats => ({
@@ -474,6 +475,21 @@ export class Program {
     return new Transaction({ feePayer: gate, ...latest }).add(
       this.instructions.openTrader(gate, owner, orderKeys),
       this.depositInstruction(faucet, token, owner, "collateral", amount),
+    );
+  }
+
+  /**
+   * One transaction that opens a seat for `owner` and nothing else, with the
+   * gate paying. It carries no signature yet: the owner's and the gate's come later.
+   */
+  async openTransaction(
+    connection: Connection,
+    request: Pick<OpenAndFundRequest, "gate" | "owner" | "orderKeys">,
+  ): Promise<Transaction> {
+    const { gate, owner, orderKeys } = request;
+    const latest = await connection.getLatestBlockhash("confirmed");
+    return new Transaction({ feePayer: gate, ...latest }).add(
+      this.instructions.openTrader(gate, owner, orderKeys),
     );
   }
 

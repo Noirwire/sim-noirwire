@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { liquidatorTraderKey, makerTraderKey, takerTraderKey } from "../bots/bot-traders.js";
 import { type Config, isMainnet } from "../config/config.js";
 import type { SnapshotData } from "../data/snapshot.js";
@@ -7,6 +8,9 @@ import { divScale, roundUpToStep } from "../engine/money.js";
 import type { Venue } from "../engine/types.js";
 import { placingOrdersThrough } from "../engine/venue-orders.js";
 import { STILL_STARTING, VenueNotReady } from "../engine/venue-not-ready.js";
+import { Admission } from "../gate/admission.js";
+import { InviteList } from "../gate/invite-list.js";
+import { SeatLedger } from "../gate/seat-ledger.js";
 import { hideAddresses } from "../logging/first-line.js";
 import { type PublicDeployment, browserUrlsFor } from "../rollup/public-deployment.js";
 import type { BotSpec } from "../rollup/bot-accounts.js";
@@ -14,6 +18,7 @@ import { executed } from "../rollup/chain-types.js";
 import { requireNetwork } from "../rollup/connections.js";
 import type { FundRequests } from "../rollup/fund-desk.js";
 import { requireMainnetDeployment } from "../rollup/mainnet-deployment.js";
+import type { OpenRequest, OpenRequests } from "../rollup/open-desk.js";
 import { Program } from "../rollup/program.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
 import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
@@ -49,6 +54,19 @@ const NO_FAUCET = {
 const refusedWhileStarting = (error: unknown) => {
   if (!(error instanceof VenueNotReady)) throw error;
   return { ok: false, status: 503, reason: error.reason } as const;
+};
+
+const SEAT_RECORD_FILE = "gate-seats.json";
+
+/** The mainnet gate's rules: its invite list, the record of the seats it signed for, and the day's limits. */
+const gateAdmission = (config: Config, onError: RollupWiringOptions["onError"]): Admission => {
+  if (!config.GATE_INVITES_FILE) throw new Error("GATE_INVITES_FILE is not set");
+  return new Admission(
+    new InviteList(config.GATE_INVITES_FILE, (line) => onError(`gate: ${line}`, null)),
+    new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock),
+    { perDay: config.GATE_SEATS_PER_DAY, perAskerPerDay: config.GATE_SEATS_PER_IP_PER_DAY },
+    systemClock,
+  );
 };
 
 /**
@@ -214,6 +232,18 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     for (const { key } of roles) data.stats.recordTrader(key);
   };
 
+  const admission = mainnet ? gateAdmission(config, onError) : null;
+  let openDesk: OpenRequests | null = null;
+  const viaOpenDesk = async <T>(ask: (desk: OpenRequests) => Promise<T>) => {
+    try {
+      if (!admission) throw new Error("only mainnet opens accounts through an invite list");
+      openDesk ??= connected().openDesk(admission, (line) => onError(line, null), systemClock);
+      return await ask(openDesk);
+    } catch (error) {
+      return refusedWhileStarting(error);
+    }
+  };
+
   let fundDesk: FundRequests | null = null;
   const viaDesk = async <T>(ask: (desk: FundRequests) => Promise<T>) => {
     try {
@@ -230,9 +260,15 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     botVenue,
     botMarkets: markets,
     rollupRoutes: {
-      // Mainnet hands out no funds: it has no fund routes, and so no desk.
+      // Mainnet hands out no funds. It opens accounts for the invited, and nobody else.
       ...(mainnet
-        ? {}
+        ? {
+            openDesk: {
+              prepare: (request: OpenRequest) => viaOpenDesk((desk) => desk.prepare(request)),
+              submit: (owner: string, transaction: string, ip: string) =>
+                viaOpenDesk((desk) => desk.submit(owner, transaction, ip)),
+            },
+          }
         : {
             fundDesk: {
               prepare: (owner: string, orderKeys: string[]) =>

@@ -1,6 +1,7 @@
 import type { FillOrigin } from "../data/stats.js";
 import type { Clock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
+import type { Admission } from "../gate/admission.js";
 import type {
   Fill,
   MarketId,
@@ -30,6 +31,7 @@ import { Session, connectionTo } from "./connections.js";
 import { FundDesk } from "./fund-desk.js";
 import { Generation } from "./generation.js";
 import { noteMakerQuote } from "./maker-quotes.js";
+import { OpenDesk } from "./open-desk.js";
 import {
   FIRST_TRADER_SEAT,
   SEAT_COUNT,
@@ -115,6 +117,8 @@ export class RollupVenue implements Venue {
   private readonly sweep: SeatSweep;
   /** Null on a deployment without a faucet. */
   private readonly faucet: Session | null;
+  /** The gate key's connection. */
+  private readonly gateSession: Session;
   /** Every key's connection, opened again after a rest. */
   private readonly sessions: Session[] = [];
   private stopped = false;
@@ -152,6 +156,7 @@ export class RollupVenue implements Venue {
         : Session.of(connectionTo(settings.depositRpcUrl));
 
     const gate = signedInSession(settings.rollupRpcUrl, settings.gate, () => this.life);
+    this.gateSession = gate;
     this.sessions.push(gate);
     if (this.faucet) this.sessions.push(this.faucet);
 
@@ -495,6 +500,21 @@ export class RollupVenue implements Venue {
       token: collateral,
       amountAtoms: toChainAmount(amount, collateral.decimals),
       clock,
+      onError: handlers.onError,
+    });
+  }
+
+  /** The desk that opens accounts for invited users and funds none of them. */
+  openDesk(admission: Admission, log: (line: string) => void, clock: Clock): OpenDesk {
+    const { settings, program, handlers } = this.options;
+    return new OpenDesk({
+      program,
+      session: this.gateSession,
+      gate: settings.gate,
+      admission,
+      exchange: () => this.exchange,
+      clock,
+      log,
       onError: handlers.onError,
     });
   }

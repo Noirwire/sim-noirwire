@@ -115,23 +115,28 @@ describe("the reference price", () => {
   });
 
   it("reads the public answers of Pyth, Coinbase, Kraken and OKX", async () => {
-    const clock = new ManualClock(now);
     const answers: Record<string, unknown> = {
       "hermes.pyth.network": {
         parsed: [{ price: { price: "15012345678", expo: -8, publish_time: now / 1_000 - 2 } }],
       },
       "api.exchange.coinbase.com": { price: "150.11", time: new Date(now - 500).toISOString() },
-      "api.kraken.com": { error: [], result: { SOLUSD: { c: ["150.12", "0.4"] } } },
+      "api.kraken.com": {
+        error: [],
+        result: {
+          SOLUSD: [["150.12", "0.4", now / 1_000 - 1.5, "b", "l", "", 1234]],
+          last: "1790000000000000000",
+        },
+      },
       "www.okx.com": { data: [{ last: "150.13", ts: String(now - 300) }] },
     };
-    const sources = referenceSources(clock, async (url) => answers[new URL(url).host]);
+    const sources = referenceSources(async (url) => answers[new URL(url).host]);
 
     const readings = await Promise.all(sources.map((source) => source.read()));
 
     expect(readings).toEqual([
       { source: "Pyth", exchange: false, price: dollars(150.123456), atMs: now - 2_000 },
       { source: "Coinbase", exchange: true, price: dollars(150.11), atMs: now - 500 },
-      { source: "Kraken", exchange: true, price: dollars(150.12), atMs: now },
+      { source: "Kraken", exchange: true, price: dollars(150.12), atMs: now - 1_500 },
       { source: "OKX", exchange: true, price: dollars(150.13), atMs: now - 300 },
     ]);
   });
@@ -147,8 +152,8 @@ class Book {
   cancels = 0;
   failPlacing: Error | null = null;
   failCancelling: Error | null = null;
-  /** The venue answers every order with a refusal. */
-  rejecting = false;
+  /** The venue answers every order with a refusal, giving this reason. */
+  rejecting: string | null = null;
   rejectedCount = 0;
   beforePlacing: (() => Promise<void>) | null = null;
 
@@ -163,7 +168,7 @@ class Book {
       placeOrder: async (_trader: string, order: NewOrder) => {
         await this.beforePlacing?.();
         if (this.failPlacing) throw this.failPlacing;
-        if (this.rejecting) {
+        if (this.rejecting !== null) {
           this.rejectedCount += 1;
           return {
             orderId: "",
@@ -171,6 +176,7 @@ class Book {
             status: "rejected",
             filledSize: 0n,
             remainingSize: order.size,
+            reason: this.rejecting,
           };
         }
         this.orders.push(order);
@@ -471,6 +477,7 @@ describe("the mainnet settings of the maker", () => {
     PUBLIC_ROLLUP_WS_URL: "wss://rollup-public.example",
     DEPLOYMENT_PATH: "/run/secrets/deployment.json",
     GATE_SECRET_KEY_FILE: "/run/secrets/gate.json",
+    GATE_INVITES_FILE: "/run/gate/invites.txt",
     BOT_TRADER_SEEDS_FILE: "/run/secrets/maker-seeds",
     ...over,
   });
@@ -916,15 +923,58 @@ describe("a house maker that stops or fails", () => {
     expect(ledger.state.mode).toBe("run");
   });
 
-  it("does not stop for a refused order, which the venue answers and which the log already reports", async () => {
-    const { warmUp, book, tick, ledger } = await rig("refused-order");
-    book.rejecting = true;
+  it("does not stop for a post-only order that would have crossed, but sends no heartbeat and tries again", async () => {
+    let beats = 0;
+    const { warmUp, book, tick, ledger } = await rig("refused-crossing", {
+      afterRequote: () => (beats += 1),
+    });
+    book.rejecting = "post-only order would match";
     await warmUp();
 
     await tick(11);
 
     expect(book.rejectedCount).toBeGreaterThan(0);
     expect(ledger.state.mode).toBe("run");
+    expect(beats).toBe(0);
+
+    book.rejecting = null;
+    await tick();
+    expect(book.orders.length).toBeGreaterThan(0);
+    expect(beats).toBe(1);
+  });
+
+  it("stops for good when the venue refuses an order for a reason it does not know, and sends no heartbeat", async () => {
+    let beats = 0;
+    const { warmUp, book, tick, ledger, said } = await rig("refused-unknown", {
+      afterRequote: () => (beats += 1),
+    });
+    await warmUp();
+    book.take();
+    const beatsBefore = beats;
+    const cancelsBefore = book.cancels;
+
+    book.rejecting = "the program answered something new";
+    await expect(tick(11)).rejects.toThrow("order refused by the venue");
+    book.rejecting = null;
+    await tick(30);
+    await tick(30);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.reason).toContain("something new");
+    expect(said.alerts).toHaveLength(1);
+    expect(book.orders).toHaveLength(0);
+    expect(book.cancels).toBe(cancelsBefore + 2);
+    expect(beats).toBe(beatsBefore);
+  });
+
+  it("stops when the venue gives no reason for a refusal", async () => {
+    const { warmUp, book, tick, ledger } = await rig("refused-no-reason");
+    await warmUp();
+
+    book.rejecting = "";
+    await expect(tick(11)).rejects.toThrow("order refused by the venue");
+
+    expect(ledger.state.mode).toBe("stopped");
   });
 
   it("tries a failed cancel again on the next tick instead of stopping, since a cancel only removes risk", async () => {

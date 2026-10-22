@@ -301,7 +301,11 @@ const PERP_ON_CHAIN: ChainMarket = {
   oracleHealth: "healthy",
 };
 const PUBLISHED_AT_S = 1_000_000;
-const OPEN: ChainExchange = { paused: false, quoteGuardOkUntilSeconds: PUBLISHED_AT_S + 180 };
+const OPEN: ChainExchange = {
+  paused: false,
+  quoteGuardOkUntilSeconds: PUBLISHED_AT_S + 180,
+  maxSeatsPerDay: 5,
+};
 
 const marketWith = (over: Partial<ChainMarket> = {}): RollupMarket => {
   const market = new RollupMarket(MARKETS[0], { ...PERP_ON_CHAIN, ...over }, 9);
