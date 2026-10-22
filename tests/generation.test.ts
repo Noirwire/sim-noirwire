@@ -1,5 +1,5 @@
 import { createPublicKey, verify } from "node:crypto";
-import { Keypair, SystemProgram } from "@solana/web3.js";
+import { Keypair } from "@solana/web3.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotAccounts } from "../src/rollup/bot-accounts.js";
 import type { KeyCheckpoint } from "../src/rollup/chain-types.js";
@@ -7,7 +7,7 @@ import { Session, connectionTo } from "../src/rollup/connections.js";
 import { Generation } from "../src/rollup/generation.js";
 import { type Program, ProgramTrader, signedInConnection } from "../src/rollup/program.js";
 import type { RollupSettings } from "../src/rollup/settings.js";
-import { sendInstructionsWithin } from "../src/rollup/transactions.js";
+import { confirmedWithin } from "../src/rollup/transactions.js";
 
 describe("a generation", () => {
   it("rejects work the moment it ends, and passes work that finished first", async () => {
@@ -23,7 +23,7 @@ describe("a generation", () => {
   });
 });
 
-describe("a publish that times out", () => {
+describe("a confirmation that never comes", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => {
     vi.useRealTimers();
@@ -54,40 +54,29 @@ describe("a publish that times out", () => {
     return methods;
   };
 
-  it("stops polling for its confirmation when the time is up, not a send later", async () => {
+  it("stops polling for its confirmation when the time is up", async () => {
     const methods = silentRollup();
-    const payer = Keypair.generate();
     const connection = connectionTo("http://rollup.example");
-    const instruction = SystemProgram.transfer({
-      fromPubkey: payer.publicKey,
-      toPubkey: Keypair.generate().publicKey,
-      lamports: 1,
-    });
 
-    const outcome = sendInstructionsWithin(connection, [instruction], payer, 1_000).catch(
+    const outcome = confirmedWithin(connection, "signature", 1_000).catch(
       (error: Error) => error.message,
     );
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(await outcome).toContain("got no answer");
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(await outcome).toContain("not confirmed");
     const atTheEnd = methods.length;
     await vi.advanceTimersByTimeAsync(10_000);
 
+    expect(atTheEnd).toBeGreaterThan(0);
     expect(methods.length).toBe(atTheEnd);
   });
 
-  it("stops polling when the generation ends, though the session that opened the connection was reset by the timeout", async () => {
+  it("stops polling when the generation ends, though the session that opened the connection was reset", async () => {
     const methods = silentRollup();
-    const payer = Keypair.generate();
     const life = new Generation();
     const session = new Session(async () => connectionTo("http://rollup.example", undefined, life));
-    const instruction = SystemProgram.transfer({
-      fromPubkey: payer.publicKey,
-      toPubkey: Keypair.generate().publicKey,
-      lamports: 1,
-    });
 
     const outcome = session
-      .use((connection) => sendInstructionsWithin(connection, [instruction], payer, 8_000))
+      .use((connection) => confirmedWithin(connection, "signature", 8_000))
       .catch((error: Error) => error.message);
     await vi.advanceTimersByTimeAsync(500);
     session.renew();

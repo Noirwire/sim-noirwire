@@ -47,11 +47,10 @@ afterEach(async () => {
 const keyOf = (keypair: Keypair): string => JSON.stringify([...keypair.secretKey]);
 
 const configRefusedBy = (port: number) => {
-  const [oracle, gate, faucet] = [Keypair.generate(), Keypair.generate(), Keypair.generate()];
+  const [gate, faucet] = [Keypair.generate(), Keypair.generate()];
   const deployment = {
     network: "devnet",
     programId: Keypair.generate().publicKey.toBase58(),
-    oracle: oracle.publicKey.toBase58(),
     gate: gate.publicKey.toBase58(),
     faucet: faucet.publicKey.toBase58(),
     depositUrl: `http://127.0.0.1:${port}`,
@@ -72,7 +71,6 @@ const configRefusedBy = (port: number) => {
       ROLLUP_RPC_URL: `http://127.0.0.1:${port}`,
       ROLLUP_WS_URL: `ws://127.0.0.1:${port}`,
       DEPLOYMENT_JSON: JSON.stringify(deployment),
-      ORACLE_SECRET_KEY: keyOf(oracle),
       GATE_SECRET_KEY: keyOf(gate),
       FAUCET_SECRET_KEY: keyOf(faucet),
       BOT_TRADER_SEEDS: Array.from({ length: BOT_COUNT }, () =>

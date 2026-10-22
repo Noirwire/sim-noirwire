@@ -18,7 +18,6 @@ const READY: Readiness = {
   connected: true,
   pricesFresh: true,
   botsFunded: true,
-  fundingUpdates: {},
 };
 const KEY_COUNT = 4;
 

@@ -9,8 +9,9 @@ Full design: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What it does
 
-1. **Prices in.** Polls Jupiter's price API v3 (no key) for SOL and NVDAx every couple of
-   seconds and publishes them to the order book.
+1. **Prices in.** With `VENUE=memory`, polls Jupiter's price API v3 (no key) for SOL and
+   NVDAx every couple of seconds and publishes them to the in-process order book. With
+   `VENUE=rollup` the mark is the program's own, read from chain.
 2. **Markets.** `NSOL-PERP` and `NNVDA-PERP` (perpetuals, cross-margined, 10% initial / 5%
    maintenance margin, funding, liquidation) and `NSOL-NUSD` (spot). All three trade against
    `MemoryVenue`, an in-process matching engine with price-time priority and integer
@@ -54,9 +55,9 @@ curl -X POST http://localhost:4100/v1/dev/orders -H 'content-type: application/j
 ## Run on the real program
 
 `VENUE=rollup` runs the same service on the on-chain order book program instead of the
-in-process engine: the oracle key publishes prices, every bot is an ordinary trader with
-its own seat and one-time order keys, and the tape, marks and counters are read back from
-the chain. How it works: [docs/DESIGN.md](docs/DESIGN.md), "The rollup venue".
+in-process engine: every bot is an ordinary trader with its own seat and one-time order
+keys, and the tape, marks and counters are read back from the chain. The marks and
+funding are the program's own; this service publishes no price. How it works: [docs/DESIGN.md](docs/DESIGN.md), "The rollup venue".
 
 It needs the order book repository beside this one (`../orderbook-noirwire`, or set
 `ORDERBOOK_REPO`), built, with its own tools installed (see its README).
@@ -107,35 +108,35 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                                   | Required | What it is                                                                               |
-| -------------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                                           | yes      | Solana. Checked once at start: the service stops if it is mainnet                        |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                          | yes      | The rollup's private endpoint through the query filter, and its websocket                |
-| `DEPOSIT_RPC_URL`                                                          | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`              |
-| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL`   | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own        |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                     | yes      | The deployment description the order book repository's set-up prints                     |
-| `ORACLE_SECRET_KEY`, `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                | yes      | Secret keys as JSON arrays of 64 bytes: publish prices, co-sign openings, deposit        |
-| `ORACLE_SECRET_KEY_FILE`, `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE` | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine |
-| `BOT_TRADER_SEEDS`                                                         | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
-| `SERVICE_LOCATION`                                                         | no       | Where the service runs; labels the latency figure                                        |
-| `PRICE_PUBLISH_INTERVAL_MS`, `ROLLUP_QUOTE_EXPIRY_SECONDS`                 | no       | Publish cadence (5 s) and how long a resting bot quote stays valid by itself (180 s)     |
-| `IDLE_AFTER_MS`                                                            | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
-| `IDLE_AFTER_LAST_SOCKET_MS`                                                | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`               | no       | Bot order sizes as notional                                                              |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                      | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
+| Variable                                                                 | Required | What it is                                                                               |
+| ------------------------------------------------------------------------ | -------- | ---------------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start: the service stops if it is mainnet                        |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                |
+| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`              |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own        |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                     |
+| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)  |
+| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine |
+| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
+| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)  |
+| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                        |
+| `ROLLUP_QUOTE_EXPIRY_SECONDS`                                            | no       | How long a resting bot quote stays valid by itself (180 s)                               |
+| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                              |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
 
 ### Awake and asleep
 
 A hosted rollup endpoint rate-limits a client that never stops asking, so with
 `VENUE=rollup` the service only works while somebody wants it to. After its one-time
-start-up work (connect, open and fund the bots) it is **asleep**: no price publishing, no
-bot loops, no reads of the chain, no websocket to the rollup, and Jupiter is polled once a
-minute. Snapshots keep being saved.
+start-up work (connect, open and fund the bots) it is **asleep**: no bot loops, no reads of
+the chain, no websocket to the rollup. Snapshots keep being saved.
 
 - **Wakes** on any request to the public API (markets, tape, candles, stats, deployment, fund)
   and on an open `/v1/stream` socket. `/v1/health` and paths that match no route do not wake it.
   The request that wakes it does not wait: `/v1/markets` reports every market as `warmingUp`
-  until a fresh price is on chain and the loops run.
+  until the chain is followed again and the loops run.
 - **Stays awake** while any stream socket is open, and for `IDLE_AFTER_MS` (10 minutes) after
   the last request. When the last socket closes (the page was closed) it sleeps after
   `IDLE_AFTER_LAST_SOCKET_MS` (15 seconds, enough for a reload), whatever requests came before.
@@ -202,7 +203,7 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 | Route                                                    | Returns                                                                                                                                                                                                                                                                                                                      |
 | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /health`                                            | `{ ok, venue, network, awake }`. With `VENUE=rollup` also `connected`, `pricesFresh`, `botsFunded` and, while it is failing, `reason`. 503 until start-up is done and the bots are funded, and while awake also until `connected` and `pricesFresh`. An asleep service is healthy with stale prices. Never wakes the service |
-| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, and `warmingUp` (true with `VENUE=rollup` until the chain's price first reaches the real one; nothing is charted or traded by the bots before)                                                                      |
+| `GET /markets`                                           | Per market: id, kind, names, tick, lot, max leverage, mark price, 24h change, 24h volume, open interest, and `warmingUp` (true with `VENUE=rollup` while the service wakes, until it follows the chain again)                                                                                                                |
 | `GET /deployment`                                        | `VENUE=rollup` only, public, cacheable. Program id, the URLs a browser should use, exchange and stats addresses, and per market its on-chain id, addresses, token mints, decimals, lot size and tick. No key. Fields: [docs/DESIGN.md](docs/DESIGN.md)                                                                       |
 | `GET /tape?market=&limit=`                               | Latest fills: price, size, taker side, time, sequence, both tags - never a trader identity. With `VENUE=rollup` `makerTag` and `takerTag` are the chain's 8-byte receipts as big-endian unsigned decimal text                                                                                                                |
 | `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                                                                                                                                                                                                                |
@@ -224,13 +225,13 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 
 ## Development
 
-| Command            | What it covers                                                                                                                                                                                                                                                                                 |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `make test`        | The vitest suite: matching engine, perp margin/funding/liquidation, a 3,000-operation property test, the house maker, candle bucketing, the HTTP API, and the rollup venue's logic without a network (price walk and publish times, tape tracking, order translation, the fund desk, settings) |
-| `make check`       | `eslint`, `tsc --noEmit`, `prettier --check`                                                                                                                                                                                                                                                   |
-| `make build`       | Compiles `src/` to `dist/`                                                                                                                                                                                                                                                                     |
-| `make loadtest`    | Drives `MemoryVenue` with `LOADTEST_TRADERS` concurrent traders for `LOADTEST_SECONDS`, writes `loadtest-reports/latest.{json,md}`                                                                                                                                                             |
-| `make test-rollup` | Starts the local network, sets it up, runs the service on it and asserts prices, fills, the fund flow, the websocket and the bot/user split                                                                                                                                                    |
+| Command            | What it covers                                                                                                                                                                                                                                                   |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make test`        | The vitest suite: matching engine, perp margin/funding/liquidation, a 3,000-operation property test, the house maker, candle bucketing, the HTTP API, and the rollup venue's logic without a network (tape tracking, order translation, the fund desk, settings) |
+| `make check`       | `eslint`, `tsc --noEmit`, `prettier --check`                                                                                                                                                                                                                     |
+| `make build`       | Compiles `src/` to `dist/`                                                                                                                                                                                                                                       |
+| `make loadtest`    | Drives `MemoryVenue` with `LOADTEST_TRADERS` concurrent traders for `LOADTEST_SECONDS`, writes `loadtest-reports/latest.{json,md}`                                                                                                                               |
+| `make test-rollup` | Starts the local network, sets it up, runs the service on it and asserts prices, fills, the fund flow, the websocket and the bot/user split                                                                                                                      |
 
 `make loadtest VENUE=rollup` sends real orders instead: `LOADTEST_TRADERS` traders, each
 opened and funded through a running service's fund routes like any user (raise that
@@ -266,8 +267,8 @@ src/
   config/      Environment schema (zod), validated once at start
   scheduling/  The one repeating-task helper every loop runs on: no overlapping runs, failures reported
   rollup/      RollupVenue and its parts: program.ts (the one importer of the client), chain types,
-               connections and timeouts, transactions, one market's state, the price publisher and
-               price walk, chain feed, tape tracker, bot accounts and order secrets, translation
+               connections and timeouts, transactions, one market's state, the chain feed,
+               tape tracker, bot accounts and order secrets, translation
                between the program's units and the service's, seat sweep, fund desk, settings
   wiring/      What differs between the two venues at start, and the bots' loops
   http/        Fastify server, routes, the websocket hub

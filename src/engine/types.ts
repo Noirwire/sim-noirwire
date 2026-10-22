@@ -19,6 +19,14 @@ export interface MarketInfo {
   change24h: number | null;
   volume24h: bigint;
   openInterest: bigint | null;
+  /** Set while the venue would refuse a resting order that adds exposure: why. */
+  quotesRefusedBecause?: string;
+  /**
+   * In base units, where the venue has one: the most a trader may reach on
+   * one side, its position on that side, its open orders there and a new
+   * order together.
+   */
+  positionCap?: bigint;
 }
 
 export interface NewOrder {

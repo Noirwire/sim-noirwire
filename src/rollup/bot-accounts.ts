@@ -25,7 +25,8 @@ export interface BotAccountsOptions {
   settings: RollupSettings;
   bots: BotSpec[];
   gate: Session;
-  faucet: Session;
+  /** Null on a deployment without a faucet: the bots are then funded by whoever runs the deployment. */
+  faucet: Session | null;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
   keyCheckpoints: Record<string, KeyCheckpoint>;
   /** Any market: a sync on it brings a bot's own view of its balances up to date. */
@@ -109,10 +110,14 @@ export class BotAccounts {
    * Brings a bot's balance up to `amount` from the faucet, never above it, so
    * a restart does not pay the bots again. A bot's nUSD is held as
    * perpetuals collateral, as a spot balance, or both, by what it trades.
+   *
+   * Without a faucet nothing is deposited: a bot that holds some of each
+   * balance counts as funded, and one that holds none of one throws, naming
+   * the owner key a deposit has to credit.
    */
   async topUp(key: TraderKey, token: string, amount: bigint): Promise<void> {
     if (amount <= 0n) return;
-    const { program, settings, faucet, syncMarketId } = this.options;
+    const { program, settings, syncMarketId } = this.options;
     const bot = this.spec(key);
     const chainToken = deployedToken(settings.deployment, token);
     if (!bot || !chainToken) throw new Error(`no deposit of ${token} for ${key} on this venue`);
@@ -130,17 +135,19 @@ export class BotAccounts {
     }
 
     const wanted = toChainAmount(amount, chainToken.decimals);
+    const { faucet } = this.options;
     for (const { target, amount: has } of held) {
       if (has >= wanted) continue;
+      if (!faucet || !settings.faucet) {
+        if (has > 0n) continue;
+        throw new Error(
+          `${key} holds no ${token} ${target === "collateral" ? "collateral" : "spot balance"} and this deployment has no faucet: ` +
+            `deposit ${chainToken.symbol} to the seat of owner ${trader.address}`,
+        );
+      }
+      const faucetKey = settings.faucet;
       await faucet.use((connection) =>
-        program.deposit(
-          connection,
-          settings.faucet,
-          chainToken.mint,
-          trader.address,
-          target,
-          wanted - has,
-        ),
+        program.deposit(connection, faucetKey, chainToken, trader.address, target, wanted - has),
       );
     }
     this.funded.add(key);

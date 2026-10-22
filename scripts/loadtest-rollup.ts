@@ -136,7 +136,7 @@ const openWithTheKeys = async (
     faucet: faucet.publicKey,
     owner: owner.publicKey,
     orderKeys: firstOrderKeys(owner),
-    mint: collateral.mint,
+    token: collateral,
     amount: toChainAmount(GRANT_NUSD, collateral.decimals),
   });
   transaction.sign(gate, owner, faucet);
@@ -262,7 +262,6 @@ interface Target {
   program: Program;
   chain: Connection;
   marketId: number;
-  perpMarketIds: number[];
 }
 
 /** Sends immediate-or-cancel orders from every trader until the time is up. */
@@ -272,7 +271,7 @@ const sendOrders = async (
   traders: LoadTrader[],
   counters: Counters,
 ): Promise<{ elapsedSeconds: number; health: { samples: number; ready: number } }> => {
-  const { program, chain, marketId, perpMarketIds } = target;
+  const { program, chain, marketId } = target;
   const { tick, minNotional } = await program.market(chain, marketId);
   const random = new SeededRandom(RANDOM_SEED);
   const startedAt = Date.now();
@@ -309,11 +308,7 @@ const sendOrders = async (
       counters.sent += 1;
       try {
         const order = { side, type: "ioc", price, size, reduceOnly: false } as const;
-        const outcome = await trader.place(
-          marketId,
-          { ...order, secret: newOrderSecret() },
-          perpMarketIds,
-        );
+        const outcome = await trader.place(marketId, { ...order, secret: newOrderSecret() });
         countOutcome(counters, outcome, options.lateMs);
       } catch (error) {
         counters.failed += 1;
@@ -335,9 +330,8 @@ const sendOrders = async (
 export async function main(): Promise<void> {
   const options = optionsFromFlags();
   const { symbol, rollupRpcUrl, simUrl } = options;
-  const deployment = loadDeployment(process.env, [symbol]);
+  const deployment = loadDeployment(process.env);
   const marketId = deployedMarket(deployment, symbol).id;
-  const perpMarketIds = deployment.markets.filter((m) => m.kind === "perp").map((m) => m.id);
   const program = new Program(deployment.programId);
   const chain = connectionTo(rollupRpcUrl, options.rollupWsUrl);
 
@@ -346,7 +340,7 @@ export async function main(): Promise<void> {
   const fillsBefore = (await program.stats(chain)).fills;
   const { elapsedSeconds, health } = await sendOrders(
     options,
-    { program, chain, marketId, perpMarketIds },
+    { program, chain, marketId },
     traders,
     counters,
   );

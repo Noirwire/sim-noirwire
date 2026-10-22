@@ -19,7 +19,6 @@ const READY: Readiness = {
   connected: true,
   pricesFresh: true,
   botsFunded: true,
-  fundingUpdates: {},
 };
 
 interface Setup {
@@ -258,7 +257,6 @@ describe("/v1/health", () => {
       connected: false,
       pricesFresh: false,
       botsFunded: false,
-      fundingUpdates: {},
     };
 
     const response = await app?.inject({ url: "/v1/health" });

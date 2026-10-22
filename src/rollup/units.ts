@@ -1,4 +1,4 @@
-import { SCALE, SCALE_DECIMALS, roundDownToStep } from "../engine/money.js";
+import { SCALE, SCALE_DECIMALS } from "../engine/money.js";
 
 /**
  * Converts between this service's numbers (a price per whole base unit and a
@@ -35,9 +35,6 @@ export const toChainPrice = (units: MarketUnits, simPrice: bigint): bigint | nul
 /** Null when the size is not a whole number of lots. */
 export const toChainSize = (units: MarketUnits, simSize: bigint): bigint | null =>
   simSize % units.sizePerLot === 0n ? simSize / units.sizePerLot : null;
-
-export const roundDownToChainPrice = (units: MarketUnits, simPrice: bigint, tick: bigint): bigint =>
-  roundDownToStep(simPrice / units.lotsPerUnit, tick);
 
 export const toSimAmount = (atoms: bigint, decimals: number): bigint =>
   decimals >= SCALE_DECIMALS

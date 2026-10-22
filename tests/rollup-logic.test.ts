@@ -4,15 +4,21 @@ import { describe, expect, it } from "vitest";
 import { prepareRequest, submitRequest } from "../scripts/fund-client.js";
 import { requireAllowedRpc } from "../scripts/rpc-allow-list.js";
 import { ManualClock } from "../src/engine/clock.js";
+import { MARKETS } from "../src/engine/markets.js";
 import { BotOrderSecrets, originOf } from "../src/rollup/bot-orders.js";
 import type { ChainFill, ChainMarket, ChainTape } from "../src/rollup/chain-types.js";
 import { Session } from "../src/rollup/connections.js";
 import { FundDesk, type Funded } from "../src/rollup/fund-desk.js";
-import { nextPublishPrice, withinOneStep } from "../src/rollup/price-walk.js";
 import { Program, fillRoles } from "../src/rollup/program.js";
 import { publicDeployment } from "../src/rollup/public-deployment.js";
 import { SeatSweep } from "../src/rollup/seat-sweep.js";
-import { loadRollupSettings } from "../src/rollup/settings.js";
+import {
+  deployedMarket,
+  deployedMarkets,
+  loadDeployment,
+  loadRollupSettings,
+} from "../src/rollup/settings.js";
+import { COLLATERAL_TOKEN, deployedToken, simTokenOf } from "../src/rollup/tokens.js";
 import { checkSubmitted } from "../src/rollup/submitted-transaction.js";
 import { TapeTracker } from "../src/rollup/tape-tracker.js";
 import { fetchWithin, within } from "../src/rollup/timeouts.js";
@@ -33,47 +39,6 @@ const fill = (sequence: number, over: Partial<ChainFill> = {}): ChainFill => ({
 const tapeOf = (...sequences: number[]): ChainTape => ({
   lastSequence: BigInt(Math.max(0, ...sequences)),
   fills: sequences.sort((a, b) => b - a).map((sequence) => fill(sequence)),
-});
-
-describe("walking the price under the move limit", () => {
-  const step = (current: bigint, target: bigint) =>
-    nextPublishPrice({ current, target, maxMoveBps: 250, tick: 100n });
-
-  it("publishes a target inside the limit as it is, on the tick", () => {
-    expect(step(150_000n, 151_234n)).toBe(151_200n);
-  });
-
-  it("stops at the limit on the way up and on the way down, never past it", () => {
-    expect(step(150_000n, 220_000n)).toBe(153_700n);
-    expect(step(150_000n, 100_000n)).toBe(146_300n);
-  });
-
-  it("reaches a far target in steps the program accepts one by one", () => {
-    let price = 150_000n;
-    let steps = 0;
-    while (price !== 220_000n) {
-      const next = step(price, 220_000n);
-      expect((next - price) * 10_000n).toBeLessThanOrEqual(price * 250n);
-      expect(next).toBeGreaterThan(price);
-      price = next;
-      steps += 1;
-    }
-    expect(steps).toBe(16);
-  });
-
-  it("gives an empty feed the target at once", () => {
-    expect(step(0n, 220_050n)).toBe(220_000n);
-  });
-
-  it("is still warming up while the real price is more than one allowed step away", () => {
-    const near = (current: bigint, target: bigint) =>
-      withinOneStep({ current, target, maxMoveBps: 250, tick: 100n });
-    expect(near(150_000n, 139_000n)).toBe(false);
-    expect(near(142_500n, 139_000n)).toBe(true);
-    expect(near(150_000n, 153_700n)).toBe(true);
-    expect(near(150_000n, 153_800n)).toBe(false);
-    expect(near(0n, 139_000n)).toBe(false);
-  });
 });
 
 describe("the prepared transaction coming back", () => {
@@ -296,7 +261,7 @@ describe("the funding desk when the transaction does not go through", () => {
       session: Session.of(connection),
       gate,
       faucet,
-      mint: Keypair.generate().publicKey.toBase58(),
+      token: { mint: Keypair.generate().publicKey.toBase58(), custodyNonce: "7" },
       amountAtoms: 5_000_000_000n,
       clock: new ManualClock(1_000),
       onError: () => {},
@@ -378,8 +343,8 @@ describe("the public deployment description", () => {
     ...roles,
     depositUrl: "http://internal-rollup:7799",
     tokens: [
-      { index: 0, symbol: "nUSD", decimals: 6, mint: address() },
-      { index: 1, symbol: "nSOL", decimals: 9, mint: address() },
+      { index: 0, symbol: "nUSD", decimals: 6, mint: address(), custodyNonce: "11" },
+      { index: 1, symbol: "nSOL", decimals: 9, mint: address(), custodyNonce: "12" },
     ],
     markets: [
       { id: 0, symbol: "NSOL-PERP", kind: "perp" as const, baseDecimals: 9 },
@@ -403,6 +368,9 @@ describe("the public deployment description", () => {
     fundingIntervalSeconds: 60,
     baseToken,
     quoteToken: 0,
+    positionCap: 1_000_000n,
+    status: "active",
+    oracleHealth: "healthy",
   });
   const addresses = () => ({
     exchange: "exchange-address",
@@ -419,8 +387,8 @@ describe("the public deployment description", () => {
       rollupWsUrl: "wss://rollup.example",
     },
     [
-      { chain: chainMarket(0, "perp", 0), addresses: addresses() },
-      { chain: chainMarket(2, "spot", 1), addresses: addresses() },
+      { chain: chainMarket(0, "perp", 0), symbol: "NSOL-PERP", addresses: addresses() },
+      { chain: chainMarket(2, "spot", 1), symbol: "NSOL-NUSD", addresses: addresses() },
     ],
   );
 
@@ -445,56 +413,107 @@ describe("the public deployment description", () => {
 
 describe("the rollup settings", () => {
   const key = () => Keypair.generate();
-  const oracle = key();
   const gate = key();
   const faucet = key();
   const secret = (pair: Keypair) => JSON.stringify(Array.from(pair.secretKey));
-  const env = (over: Record<string, string | undefined> = {}) => ({
-    SOLANA_RPC_URL: "http://127.0.0.1:8899",
-    ROLLUP_RPC_URL: "http://127.0.0.1:6699",
-    ROLLUP_WS_URL: "ws://127.0.0.1:6700",
-    DEPLOYMENT_JSON: JSON.stringify({
+  const described = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({
       network: "localnet",
       programId: key().publicKey.toBase58(),
       gate: gate.publicKey.toBase58(),
-      oracle: oracle.publicKey.toBase58(),
       faucet: faucet.publicKey.toBase58(),
       tokens: [],
       depositUrl: "http://127.0.0.1:7799",
       markets: [{ id: 0, symbol: "NSOL-PERP", kind: "perp", baseDecimals: 9 }],
-    }),
-    ORACLE_SECRET_KEY: secret(oracle),
+      ...over,
+    });
+  const env = (over: Record<string, string | undefined> = {}) => ({
+    SOLANA_RPC_URL: "http://127.0.0.1:8899",
+    ROLLUP_RPC_URL: "http://127.0.0.1:6699",
+    ROLLUP_WS_URL: "ws://127.0.0.1:6700",
+    DEPLOYMENT_JSON: described(),
     GATE_SECRET_KEY: secret(gate),
     FAUCET_SECRET_KEY: secret(faucet),
     BOT_TRADER_SEEDS: `${"11".repeat(32)},${"22".repeat(32)}`,
     ...over,
   });
+  const settingsOf = (values: ReturnType<typeof env>, bots: number) =>
+    loadRollupSettings(values, loadDeployment(values), bots);
 
   it("names what is missing and refuses to start", () => {
-    expect(() => loadRollupSettings(env({ GATE_SECRET_KEY: undefined }), 2, ["NSOL-PERP"])).toThrow(
-      "GATE_SECRET_KEY",
-    );
+    expect(() => settingsOf(env({ GATE_SECRET_KEY: undefined }), 2)).toThrow("GATE_SECRET_KEY");
+    expect(() => settingsOf(env({ FAUCET_SECRET_KEY: undefined }), 2)).toThrow("FAUCET_SECRET_KEY");
   });
 
   it("refuses a key that is not the one the deployment names, without echoing it", () => {
     const wrong = secret(key());
     let message = "";
     try {
-      loadRollupSettings(env({ ORACLE_SECRET_KEY: wrong }), 2, ["NSOL-PERP"]);
+      settingsOf(env({ GATE_SECRET_KEY: wrong }), 2);
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toContain("oracle");
+    expect(message).toContain("gate");
     expect(message).not.toContain(wrong.slice(0, 12));
   });
 
-  it("refuses fewer seeds than bots, and a market the deployment lacks", () => {
-    expect(() => loadRollupSettings(env(), 3, ["NSOL-PERP"])).toThrow("BOT_TRADER_SEEDS");
-    expect(() => loadRollupSettings(env(), 2, ["NSOL-NUSD"])).toThrow("NSOL-NUSD");
+  it("refuses fewer seeds than bots", () => {
+    expect(() => settingsOf(env(), 3)).toThrow("BOT_TRADER_SEEDS");
   });
 
   it("gives each bot its own owner key from its own seed", () => {
-    const settings = loadRollupSettings(env(), 2, ["NSOL-PERP"]);
+    const settings = settingsOf(env(), 2);
     expect(settings.botOwners[0]!.publicKey.equals(settings.botOwners[1]!.publicKey)).toBe(false);
+  });
+
+  it("needs no faucet key on a deployment without a faucet, and then holds none", () => {
+    const values = env({
+      DEPLOYMENT_JSON: described({ faucet: undefined }),
+      FAUCET_SECRET_KEY: undefined,
+    });
+    expect(settingsOf(values, 2).faucet).toBeNull();
+  });
+
+  it("follows the markets the deployment has, under a test network's symbol or the mainnet profile's", () => {
+    const testNetwork = loadDeployment(env());
+    expect(deployedMarkets(testNetwork, MARKETS).map((market) => market.id)).toEqual(["NSOL-PERP"]);
+    const mainnetProfile = loadDeployment({
+      DEPLOYMENT_JSON: described({
+        markets: [{ id: 0, symbol: "SOL-PERP", kind: "perp", baseDecimals: 9 }],
+      }),
+    });
+    expect(deployedMarket(mainnetProfile, "NSOL-PERP").id).toBe(0);
+    expect(() => deployedMarket(mainnetProfile, "NSOL-NUSD")).toThrow("NSOL-NUSD");
+    expect(() =>
+      deployedMarkets(loadDeployment({ DEPLOYMENT_JSON: described({ markets: [] }) }), MARKETS),
+    ).toThrow("none of the markets");
+  });
+
+  it("takes the mainnet profile's USDC as this service's collateral token", () => {
+    const deployment = loadDeployment({
+      DEPLOYMENT_JSON: described({
+        tokens: [
+          {
+            index: 0,
+            symbol: "USDC",
+            decimals: 6,
+            mint: key().publicKey.toBase58(),
+            custodyNonce: "9",
+          },
+        ],
+      }),
+    });
+    expect(deployedToken(deployment, COLLATERAL_TOKEN)?.index).toBe(0);
+    expect(simTokenOf("USDC")).toBe(COLLATERAL_TOKEN);
+  });
+
+  it("refuses a token without the custody nonce every deposit names", () => {
+    expect(() =>
+      loadDeployment({
+        DEPLOYMENT_JSON: described({
+          tokens: [{ index: 0, symbol: "nUSD", decimals: 6, mint: key().publicKey.toBase58() }],
+        }),
+      }),
+    ).toThrow();
   });
 });

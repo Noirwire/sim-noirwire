@@ -36,7 +36,6 @@ export const chainPriceAndSize = (
   order: NewOrder,
 ): { price: bigint; size: bigint } | string => {
   if (market.mark === 0n) return "no mark price yet";
-  if (market.warmingUp) return "the market is warming up";
   const price =
     order.price === undefined
       ? bandEdge(market.chain, market.mark, order.side)

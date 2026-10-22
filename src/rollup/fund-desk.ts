@@ -1,7 +1,7 @@
 import { type Keypair, PublicKey } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
 import type { Session } from "./connections.js";
-import { DAILY_SEAT_LIMIT_ERROR, type Program } from "./program.js";
+import { type CustodyTokenRef, DAILY_SEAT_LIMIT_ERROR, type Program } from "./program.js";
 import { checkSubmitted } from "./submitted-transaction.js";
 import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
 
@@ -25,7 +25,8 @@ export interface FundDeskOptions {
   session: Session;
   gate: Keypair;
   faucet: Keypair;
-  mint: string;
+  /** The collateral token the grant is paid in. */
+  token: CustodyTokenRef;
   amountAtoms: bigint;
   clock: Clock;
   onError(what: string, error: unknown): void;
@@ -89,7 +90,7 @@ export class FundDesk implements FundRequests {
   }
 
   async prepare(owner: string, orderKeys: string[]): Promise<Prepared> {
-    const { program, session, gate, faucet, mint, amountAtoms, clock } = this.options;
+    const { program, session, gate, faucet, token, amountAtoms, clock } = this.options;
     const ownerKey = publicKeyOf(owner);
     const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
     if (!ownerKey || keys.length !== orderKeys.length) {
@@ -110,7 +111,7 @@ export class FundDesk implements FundRequests {
         faucet: faucet.publicKey,
         owner: ownerKey,
         orderKeys: keys,
-        mint,
+        token,
         amount: amountAtoms,
       }),
     );
