@@ -41,6 +41,8 @@ export interface ChainExchange {
    * build lets pass and a mainnet build does not, so it is left to the program.
    */
   quoteGuardOkUntilSeconds: number | null;
+  /** The most seats the program opens in one UTC day, whoever asks the gate. */
+  maxSeatsPerDay: number;
 }
 
 export interface PublicAddresses {

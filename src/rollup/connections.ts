@@ -102,18 +102,34 @@ export const hangUp = (connection: Connection): void => {
 
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
-/** Solana is mainnet. No wait cures it: the service does not start. */
-export class MainnetRefused extends Error {
-  constructor() {
-    super("SOLANA_RPC_URL is mainnet. This service never runs there.");
-    this.name = "MainnetRefused";
+/** Solana is not the network the service was told to run on. No wait cures it: the service does not start. */
+export class NetworkMismatch extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NetworkMismatch";
   }
 }
 
-/** This service moves test tokens only. It stops before sending anything if Solana is mainnet. */
-export const refuseMainnet = async (solanaRpcUrl: string): Promise<void> => {
+/**
+ * Stops the service before it sends anything if Solana is not the network
+ * it was told to run on. NETWORK=mainnet needs mainnet; any other network
+ * moves test tokens only and must not be mainnet.
+ */
+export const requireNetwork = async (mainnet: boolean, solanaRpcUrl: string): Promise<void> => {
   const genesis = await connectionTo(solanaRpcUrl).getGenesisHash();
-  if (genesis === MAINNET_GENESIS) throw new MainnetRefused();
+  const isMainnet = genesis === MAINNET_GENESIS;
+  if (mainnet && !isMainnet) {
+    throw new NetworkMismatch(
+      `NETWORK=mainnet, but SOLANA_RPC_URL is not Solana mainnet (its genesis hash is ${genesis}). ` +
+        "Point SOLANA_RPC_URL at a mainnet endpoint, or change NETWORK.",
+    );
+  }
+  if (!mainnet && isMainnet) {
+    throw new NetworkMismatch(
+      "SOLANA_RPC_URL is Solana mainnet, but NETWORK is not mainnet, and without it this service " +
+        "moves test tokens only. Set NETWORK=mainnet to run the mainnet mode, or point SOLANA_RPC_URL at a test network.",
+    );
+  }
 };
 
 /**

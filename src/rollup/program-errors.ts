@@ -122,6 +122,12 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
  */
 export const MAKER_NOT_LISTED_ERROR = 6091;
 
+/** `SeatAlreadyOpen`: the owner key already holds a trader seat. */
+export const SEAT_ALREADY_OPEN_ERROR = 6014;
+
+/** `AccountExists`: the account the transaction creates is there already. */
+export const ACCOUNT_EXISTS_ERROR = 6113;
+
 /** The program's name for error number `code`, or a plain description when it has none here. */
 export const programErrorName = (code: number): string =>
   PROGRAM_ERROR_NAMES[code] ?? "unnamed program error";

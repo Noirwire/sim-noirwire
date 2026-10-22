@@ -53,6 +53,7 @@ export type RollupEnv = Pick<
   | "DEPLOYMENT_JSON"
   | "DEPLOYMENT_PATH"
   | "BOT_TRADER_SEEDS"
+  | "BOT_TRADER_SEEDS_FILE"
 >;
 
 export interface RollupSettings {
@@ -96,9 +97,22 @@ export const roleKey = (
   }
 };
 
+/** The bot seeds: the value itself, or the file `BOT_TRADER_SEEDS_FILE` points at. Security: the value is never echoed. */
+const botSeedsText = (
+  env: Pick<RollupEnv, "BOT_TRADER_SEEDS" | "BOT_TRADER_SEEDS_FILE">,
+): string => {
+  if (env.BOT_TRADER_SEEDS) return env.BOT_TRADER_SEEDS;
+  if (!env.BOT_TRADER_SEEDS_FILE) return "";
+  try {
+    return readFileSync(env.BOT_TRADER_SEEDS_FILE, "utf8");
+  } catch {
+    throw new Error("BOT_TRADER_SEEDS_FILE must be a readable file of hex seeds");
+  }
+};
+
 const botOwnersFrom = (value: string, needed: number): Keypair[] => {
   const seeds = value
-    .split(",")
+    .split(/[\s,]+/)
     .map((seed) => seed.trim())
     .filter(Boolean);
   if (seeds.some((seed) => !/^[0-9a-fA-F]{64}$/.test(seed))) {
@@ -196,7 +210,7 @@ export const loadRollupSettings = (
   botCount: number,
 ): RollupSettings => {
   const [solanaRpcUrl, rollupRpcUrl, rollupWsUrl] = URLS.map((name) => env[name] ?? "");
-  const botSeeds = env.BOT_TRADER_SEEDS ?? "";
+  const botSeeds = botSeedsText(env);
   const neededKeys = deployment.faucet ? ROLE_KEYS : (["GATE_SECRET_KEY"] as const);
   const missing = [
     ...URLS.filter((name) => !env[name]),

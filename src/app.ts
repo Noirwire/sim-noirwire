@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { Activity, type Lifecycle } from "./activity/activity.js";
-import type { Config } from "./config/config.js";
+import { type Config, isMainnet } from "./config/config.js";
 import { CandleAggregator } from "./data/candles.js";
 import { FundLedger } from "./data/fund-ledger.js";
 import { SnapshotStore } from "./data/snapshot.js";
@@ -14,16 +14,18 @@ import { ProblemLog } from "./logging/problem-log.js";
 import { JupiterPriceSource } from "./prices/jupiter-price-source.js";
 import { MARKETS_PRICED_BY, NVDAX_MINT, SOL_MINT } from "./prices/mints.js";
 import type { PriceSource } from "./prices/price-source.js";
-import { MainnetRefused } from "./rollup/connections.js";
+import { NetworkMismatch } from "./rollup/connections.js";
 import { waitFor } from "./scheduling/backoff.js";
 import { type Repeating, every, idleWithin } from "./scheduling/repeating.js";
 import { StartUp } from "./scheduling/start-up.js";
-import { openBots } from "./wiring/bots.js";
+import { type OpenedBots, openBots } from "./wiring/bots.js";
 import { memoryWiring } from "./wiring/memory-wiring.js";
 import { rollupWiring } from "./wiring/rollup-wiring.js";
 
 const STATS_BROADCAST_INTERVAL_MS = 2_000;
 const WAIT_FOR_LOOPS_ON_CLOSE_MS = 2_000;
+/** A stop waits this long for the makers' quotes to come off the venue; they expire by themselves anyway. */
+const WAIT_FOR_QUOTES_OFF_MS = 4_000;
 /** Jupiter is not the rollup, but there is no reason to ask it for prices nobody is using. */
 const ASLEEP_PRICE_POLL_INTERVAL_MS = 60_000;
 /** A wake waits this long for the price source's answer before it publishes. */
@@ -56,7 +58,8 @@ const latencyLabel = (config: Config): string | undefined =>
  * With VENUE=rollup the service is busy only while somebody wants it to be:
  * after its one-time start-up work it sleeps, sending nothing to the rollup,
  * until a request or a stream socket wakes it (see `Activity`). With
- * VENUE=memory nothing leaves the process, so it never sleeps.
+ * VENUE=memory nothing leaves the process, so it never sleeps. NETWORK=mainnet
+ * never sleeps either: the maker is the only liquidity there.
  */
 export const startApp = async (
   config: Config,
@@ -76,6 +79,12 @@ export const startApp = async (
 
   const snapshotStore = new SnapshotStore(config.DATA_DIR);
   const snapshot = await snapshotStore.load();
+  if (snapshot && isMainnet(config) && snapshot.network !== "mainnet") {
+    throw new Error(
+      `DATA_DIR (${config.DATA_DIR}) holds a snapshot saved on ${snapshot.network ?? "a test network"}, ` +
+        "and its candles and order key positions are not mainnet's. Point DATA_DIR at an empty folder.",
+    );
+  }
   if (snapshot) {
     data.candles.loadSnapshot(snapshot.candles);
     fundLedger.loadSnapshot(snapshot.fundedAddresses);
@@ -117,6 +126,7 @@ export const startApp = async (
   const saveSnapshot = (): Promise<void> =>
     snapshotStore.save({
       savedAtMs: Date.now(),
+      network: config.NETWORK,
       candles: data.candles.exportSnapshot(),
       fundedAddresses: fundLedger.exportSnapshot(),
       ...wiring.snapshotExtras(),
@@ -149,19 +159,24 @@ export const startApp = async (
 
   let closed = false;
   let closing: Promise<void> | null = null;
-  let startBotLoops: (() => Repeating[]) | null = null;
+  let bots: OpenedBots | null = null;
+
+  /** Once the loops have stopped, the makers' quotes come off the venue: a stopped service leaves none standing. */
+  const takeQuotesOff = async (): Promise<void> => {
+    await Promise.race([bots?.withdrawQuotes(), waitFor(WAIT_FOR_QUOTES_OFF_MS)]);
+  };
 
   const startUp = new StartUp({
     work: async () => {
       await wiring.prepare();
-      startBotLoops = await openBots(config, wiring, {
+      bots = await openBots(config, wiring, {
         onError: logError,
         onRecovered: logRecovered,
       });
     },
     wanted: () => activity.wanted(),
     cleanup: () => wiring.rest(),
-    isFatal: (error) => error instanceof MainnetRefused,
+    isFatal: (error) => error instanceof NetworkMismatch,
     onFailure: (error, failures, retryInMs) =>
       console.error(
         `sim-noirwire: start-up failed (try ${failures}), trying again in ${Math.round(retryInMs / 1_000)} s: ${firstLine(error)}`,
@@ -171,7 +186,7 @@ export const startApp = async (
   const lifecycle: Lifecycle = {
     wake: async () => {
       await startUp.attemptEnded();
-      if (!startUp.ready || closed || !startBotLoops) {
+      if (!startUp.ready || closed || !bots) {
         throw new Error(startUp.problem ?? "the service has not finished starting");
       }
       try {
@@ -190,11 +205,12 @@ export const startApp = async (
         await wiring.rest();
         throw error;
       }
-      if (!closed && awakeLoops.length === 0) awakeLoops = startBotLoops();
+      if (!closed && awakeLoops.length === 0) awakeLoops = bots.start();
       console.log("sim-noirwire: awake");
     },
     sleep: async () => {
       await stopAwakeLoops();
+      await takeQuotesOff();
       priceSource?.setPace("slow");
       await wiring.rest();
       console.log(
@@ -220,7 +236,8 @@ export const startApp = async (
     },
     () => {},
   );
-  if (config.VENUE === "memory") activity.holdAwake();
+  // On mainnet the maker is the only liquidity, so it quotes whether or not anybody is watching.
+  if (config.VENUE === "memory" || isMainnet(config)) activity.holdAwake();
 
   const server = await buildServer({
     config,
@@ -235,6 +252,11 @@ export const startApp = async (
   const address = server.server.address();
   const port = typeof address === "object" && address ? address.port : config.PORT;
   console.log(`sim-noirwire: listening on http://${config.HOST}:${port} (venue=${config.VENUE})`);
+  if (isMainnet(config)) {
+    console.log(
+      "sim-noirwire: mainnet mode: running the house maker, the gate and the market data only",
+    );
+  }
 
   priceSource?.start((point) => {
     for (const market of MARKETS_PRICED_BY[point.id] ?? []) {
@@ -257,6 +279,7 @@ export const startApp = async (
         // moment is abandoned, and a restart finds keys that moved past their
         // checkpoint by search.
         await Promise.all([idleWithin(loops, WAIT_FOR_LOOPS_ON_CLOSE_MS), stopAwakeLoops()]);
+        await takeQuotesOff();
         await wiring.stop();
         await saveSnapshot();
         await server.close();

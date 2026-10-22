@@ -47,7 +47,7 @@ const publicKeyOf = (value: string): PublicKey | null => {
 
 const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
 
-const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
+export const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
   if (error instanceof ProgramRefused && error.code === DAILY_SEAT_LIMIT_ERROR) {
     return {
       ok: false,

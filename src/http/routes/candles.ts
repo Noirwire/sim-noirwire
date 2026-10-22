@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { isMainnet } from "../../config/config.js";
 import type { AppContext } from "../context.js";
 import { marketId } from "../schemas.js";
 import { serializeCandle } from "../serialize.js";
@@ -22,7 +23,7 @@ export const registerCandlesRoute = (app: FastifyInstance, ctx: AppContext): voi
     const { market, interval, limit } = parsed.data;
     return {
       network: ctx.config.NETWORK,
-      simulated: true,
+      simulated: !isMainnet(ctx.config),
       candles: ctx.candles.candles(market, interval, limit).map(serializeCandle),
     };
   });
