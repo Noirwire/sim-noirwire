@@ -1,8 +1,9 @@
 import type { Clock } from "../engine/clock.js";
-import { absBigInt } from "../engine/money.js";
+import { absBigInt, mulDivScale } from "../engine/money.js";
+import { firstLine } from "../logging/first-line.js";
 import type { Reference } from "../prices/reference-price.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
-import type { MakerControl } from "./maker-control.js";
+import type { ControlCommand, MakerControl } from "./maker-control.js";
 import type { MakerRisk, MakerVoice } from "./maker-risk.js";
 
 /** What the maker does this tick. */
@@ -19,6 +20,8 @@ export type Plan =
       extraSpreadBps: number;
       /** Quote only the side that shrinks the position. */
       reduceOnly: boolean;
+      /** Work the position down to flat with reduce-only orders at a bounded price through `centre`. */
+      flatten?: boolean;
     };
 
 interface PricePoint {
@@ -65,6 +68,21 @@ export class PriceHistory {
 export const bpsApart = (price: bigint, against: bigint): number =>
   Number((absBigInt(price - against) * SCALE_OF_BPS) / against) / 1_000;
 
+/**
+ * The seat's equity at the venue's mark, or at the reference price when that
+ * is worse for the maker. The mark may lag the reference, and a loss counted
+ * at a lagging mark would be counted late.
+ */
+export const worstEquity = (
+  equity: bigint,
+  position: bigint,
+  mark: bigint,
+  reference: bigint,
+): bigint => {
+  const atReference = equity + mulDivScale(position, reference - mark);
+  return atReference < equity ? atReference : equity;
+};
+
 export interface MakerSafetyOptions {
   reference: { read(): Promise<Reference> };
   risk: MakerRisk;
@@ -86,17 +104,23 @@ export class MakerSafety {
 
   constructor(private readonly options: MakerSafetyOptions) {}
 
-  async assess(mark: bigint, equity: bigint): Promise<Plan> {
-    const { risk, control, clock } = this.options;
-    await risk.follow(await control.read(), equity);
-    await risk.check(equity);
-    if (risk.mode === "stopped") {
-      this.history.clear();
-      return { action: "stop" };
-    }
-    if (equity <= 0n) return this.pull("its seat holds no equity to quote with");
+  /**
+   * `equity` and `position` are the seat's, at the venue's `mark`. The loss
+   * limits are counted at the worse of that mark and the reference price.
+   */
+  async assess(mark: bigint, equity: bigint, position: bigint): Promise<Plan> {
+    const { risk, clock } = this.options;
+    await risk.follow(await this.command(), equity);
+    if (this.isStopped()) return this.stop();
 
     const reference = await this.options.reference.read();
+    await risk.check(
+      reference.ok ? worstEquity(equity, position, mark, reference.price) : equity,
+      position,
+    );
+    if (this.isStopped()) return this.stop();
+    if (equity <= 0n) return this.pull("its seat holds no equity to quote with");
+
     if (!reference.ok) {
       this.history.clear();
       return this.pull(reference.reason);
@@ -125,13 +149,40 @@ export class MakerSafety {
       action: "quote",
       centre: reference.price,
       extraSpreadBps: volatility * MAKER_LIMITS.volatilityShare + widenForLag,
-      reduceOnly: risk.mode === "reduce",
+      reduceOnly: risk.mode !== "run",
+      flatten: risk.mode === "flatten",
     };
   }
 
-  /** Stops the maker for good, until an operator resumes it. */
+  /**
+   * The maker met an error it does not understand: it falls back to the soft
+   * stop, or stops altogether if it was already not quoting freely. Either
+   * lasts until an operator resumes it.
+   */
   stopFor(reason: string): Promise<void> {
     return this.options.risk.stopFor(reason);
+  }
+
+  /**
+   * The operator's newest command. A control file that cannot be read holds
+   * the maker at the soft stop and is not a command.
+   */
+  private async command(): Promise<ControlCommand | null> {
+    try {
+      return await this.options.control.read();
+    } catch (error) {
+      await this.options.risk.holdFor(firstLine(error));
+      return null;
+    }
+  }
+
+  private isStopped(): boolean {
+    return this.options.risk.mode === "stopped";
+  }
+
+  private stop(): Plan {
+    this.history.clear();
+    return { action: "stop" };
   }
 
   private pull(reason: string): Plan {

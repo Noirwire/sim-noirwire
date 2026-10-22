@@ -22,6 +22,12 @@ export interface MarketInfo {
   /** Set while the venue would refuse a resting order that adds exposure: why. */
   quotesRefusedBecause?: string;
   /**
+   * Set together with `quotesRefusedBecause` when the only thing wrong is that
+   * the market is reduce-only: it still takes orders flagged reduce-only, so
+   * a maker can go on quoting the side that shrinks its position.
+   */
+  takesReduceOnlyOrders?: boolean;
+  /**
    * In base units, where the venue has one: the most a trader may reach on
    * one side, its position on that side, its open orders there and a new
    * order together.
