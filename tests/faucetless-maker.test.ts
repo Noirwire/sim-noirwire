@@ -353,6 +353,23 @@ describe("whether the program would take a house maker's quote", () => {
     expect(marketWith().info(at(5), null, OPEN).quotesRefusedBecause).toBeUndefined();
   });
 
+  it("says a reduce-only market still takes reduce-only orders, and nothing else that is wrong does", () => {
+    const reduceOnly = (over: Partial<ChainMarket> = {}, exchange = OPEN, seconds = 5) =>
+      marketWith({ status: "reduceOnly", ...over }).info(at(seconds), null, exchange);
+
+    const plain = reduceOnly();
+    expect(plain.quotesRefusedBecause).toContain("6032");
+    expect(plain.takesReduceOnlyOrders).toBe(true);
+
+    expect(reduceOnly({ oracleHealth: "dislocated" }).takesReduceOnlyOrders).toBeUndefined();
+    expect(reduceOnly({}, OPEN, 95).takesReduceOnlyOrders).toBeUndefined();
+    expect(reduceOnly({}, { ...OPEN, paused: true }).takesReduceOnlyOrders).toBeUndefined();
+    expect(
+      marketWith({ status: "paused" }).info(at(5), null, OPEN).takesReduceOnlyOrders,
+    ).toBeUndefined();
+    expect(marketWith().info(at(5), null, OPEN).takesReduceOnlyOrders).toBeUndefined();
+  });
+
   it("follows a fresh reading of the market account", () => {
     const market = marketWith();
     market.acceptMarket({ ...PERP_ON_CHAIN, status: "reduceOnly" });

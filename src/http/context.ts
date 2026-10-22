@@ -24,8 +24,16 @@ export interface RollupRoutes {
   deployment: () => PublicDeployment | null;
 }
 
+/** Where a route reports what went wrong that its caller is not told. */
+export interface RouteProblems {
+  onError(what: string, error: unknown): void;
+  onRecovered(what: string): void;
+}
+
 export interface AppContext extends Partial<RollupRoutes> {
   config: Config;
+  /** The service's problem log. Without it a route's unexpected failures are not logged. */
+  problems?: RouteProblems;
   venue: Venue;
   tape: TapeStore;
   candles: CandleAggregator;

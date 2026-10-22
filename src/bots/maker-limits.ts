@@ -32,9 +32,19 @@ export const MAKER_LIMITS = {
   volatilityWindowMs: 60_000,
   volatilityShare: 0.5,
 
-  /** Stop growing after losing this much of the day's starting equity, or of the peak. */
+  /** Past this loss of the day's starting equity, or of the peak, the maker starts reducing its position to flat. */
   dailyLossBps: 300,
   drawdownBps: 500,
+  /** Past these, while it is still reducing, the maker stops quoting altogether. */
+  dailyLossStopBps: 600,
+  drawdownStopBps: 1_000,
+  /**
+   * How far through the reference price a reducing order may sit: the most the
+   * maker pays, per unit, to get out. It never chases beyond it.
+   */
+  flattenGiveBps: 25,
+  /** A maker still holding a position this long after it began to reduce it stops quoting altogether. */
+  flattenDeadlineMs: 600_000,
 
   /** A resting quote lives at most the requote interval plus this long. */
   expiryMarginSeconds: 10,

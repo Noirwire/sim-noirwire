@@ -92,10 +92,26 @@ export class RollupMarket {
    * `exchange` is null until the exchange has been read.
    */
   quotesRefusedBecause(nowMs: number, exchange: ChainExchange | null): string | null {
+    return this.refusal(nowMs, exchange, false);
+  }
+
+  /**
+   * Whether the market is reduce-only and nothing else stands in the way of a
+   * reduce-only order: not paused, its mark fresh and in line with the oracle.
+   */
+  takesReduceOnlyOrders(nowMs: number, exchange: ChainExchange | null): boolean {
+    return this.chain.status === "reduceOnly" && this.refusal(nowMs, exchange, true) === null;
+  }
+
+  private refusal(
+    nowMs: number,
+    exchange: ChainExchange | null,
+    allowReduceOnly: boolean,
+  ): string | null {
     const { chain } = this;
     if (exchange?.paused) return "the exchange is paused (ExchangePaused, 6030)";
     if (chain.status === "paused") return "the market is paused (MarketPaused, 6031)";
-    if (chain.status === "reduceOnly") {
+    if (chain.status === "reduceOnly" && !allowReduceOnly) {
       return "the market takes reduce-only orders alone (MarketReduceOnly, 6032)";
     }
     if (chain.oracleHealth === "dislocated") {
@@ -140,6 +156,7 @@ export class RollupMarket {
       volume24h: this.volume.total(nowMs),
       openInterest: isPerp && openInterestLots !== null ? toSimSize(units, openInterestLots) : null,
       ...(refused === null ? {} : { quotesRefusedBecause: refused }),
+      ...(this.takesReduceOnlyOrders(nowMs, exchange) ? { takesReduceOnlyOrders: true } : {}),
       ...(isPerp ? { positionCap: toSimSize(units, chain.positionCap) } : {}),
     };
   }

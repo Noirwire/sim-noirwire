@@ -282,22 +282,57 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   3 levels of 50 nUSD, a position limit of 250 nUSD, a requote at 6 bps or every 10 s.
   Larger than 500 nUSD a level, 250 nUSD of position, a 15 bps floor or a 30 s requote
   interval stops the start.
-- **Loss limits.** Losing 3% of the equity the UTC day started with, or 5% from the peak,
-  stops it growing: it keeps quoting only the side that shrinks its position, and logs a
-  line that starts with `ALERT`. The state is kept in `DATA_DIR`, so a restart does not
-  reset it, and only an operator ends it.
-- **Kill switch.** `npm run kill-switch -- reduce | stop | resume` (or `node
-dist/kill-switch.js ...` in the container) writes a request into `DATA_DIR` that the
-  maker follows within a second. `reduce` cancels the quotes that would grow the position
-  and keeps the reducing side; `stop` cancels everything; `resume` starts again with the
-  loss limits counting from the equity then.
+- **Loss limits flatten the position.** Losing 3% of the equity the UTC day started with,
+  or 5% from the peak (both counted at the worse of the venue's mark and the reference
+  price), makes it stop growing and work its position down to flat. It places one
+  reduce-only order for the whole position, at most 25 bps through the fresh reference
+  price, and replaces it at every requote. It never chases: with a stale or disagreeing
+  reference, a mark far from it or a fast move, it pulls the order like any other quote.
+  It logs a line that starts with `ALERT`. If an order fails, the loss reaches 6% of the
+  day's start or 10% from the peak, or it still holds a position ten minutes after it
+  began, it stops quoting altogether (the hard stop below), with another `ALERT`. The
+  state is kept in `DATA_DIR`, so a restart does not reset it, and only an operator ends
+  it.
+- **Reduce-only markets.** When the program has set the market to reduce-only, the maker
+  cancels what it has and keeps quoting the side that shrinks its own position, flagged
+  reduce-only: that is the side users need to close theirs. Flat, it quotes nothing. For
+  any other reason the program would refuse its quotes (paused, a stale mark, a tripped
+  guard, a dislocation) it sends nothing. A reduce-only order carries no program expiry,
+  so the maker's own cancels (at every requote and at a stop of the service) are what
+  remove it.
+- **Kill switch, two stops.** `npm run kill-switch -- reduce | resume | stop
+--confirm-strands-users` (or `node dist/kill-switch.js ...` in the container) writes a
+  request into `DATA_DIR` that the maker follows within a second.
+  - `reduce` is the soft stop. It cancels the quotes that would grow the position and
+    keeps quoting the side that shrinks it, so users can still close.
+  - `stop` is the hard stop. It cancels everything and quotes nothing, so **users cannot
+    close a position until the maker is resumed**. The exchange admin can pause the market
+    in the meantime. A restart does not resume it, since the stop is kept in `DATA_DIR`.
+    The command refuses to run without `--confirm-strands-users`, and logs an `ALERT` that
+    says what it does to users.
+  - `resume` starts again with the loss limits counting from the equity then.
+- **No liquidator here on mainnet, on purpose.** This service never runs a liquidator on
+  mainnet (`LIQUIDATOR_ENABLED=1` is refused at start). Liquidation of under-margined
+  seats is the order book repository's keeper, which runs separately and which this
+  service neither starts nor checks. A stopped maker does not stop that keeper, but users
+  cannot close against a stopped maker, so a hard stop leaves them to be liquidated or to
+  wait.
 - **Errors it does not understand.** While sending orders, any failure other than the
-  rollup being away stops the maker for good (an `ALERT` line, quotes cancelled) until an
-  operator resumes it. A failed cancel is tried again on the next tick.
+  rollup being away makes the maker fall back to the soft stop (an `ALERT` line, quotes
+  cancelled, the reducing side quoted again on the next tick). If it meets another while
+  it is already reducing, flattening or stopped from growing, it stops altogether. Either
+  lasts until an operator resumes it. A failed cancel is tried again on the next tick.
+- **An unreadable control file.** A control file that cannot be read holds the maker at the
+  soft stop (an `ALERT` line). It stays there after the file parses again, until a newer
+  `resume` is written. A hard stop or a flattening already in force is not loosened.
 - **A heartbeat.** With `HEALTHCHECK_URL` set, the maker calls that address after each
-  requote that sent every order, about every 10 s on mainnet. An outside monitor then
-  alerts when the calls stop: the maker is stopped, pulled, stuck or the machine is down. A
-  failed call is logged without the address and never stops the maker.
+  requote of both sides, about every 10 s on mainnet. It sends none while a loss limit,
+  the kill switch or a reduce-only market has it reducing only, so the outside monitor
+  alerts when the calls stop: the maker is stopped, reducing, pulled, stuck or the machine
+  is down. A failed call is logged without the address and never stops the maker.
+- **The position limit counts everything.** The position and a side's resting levels
+  together never pass the limit: the level that would is cut to what is left and later ones
+  are left out.
 - **The edge holds under skew.** No quote sits closer than 15 bps to the reference price,
   even at the full skew, so the side that shrinks the position is still sold at an edge.
 

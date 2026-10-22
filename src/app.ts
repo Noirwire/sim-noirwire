@@ -243,6 +243,7 @@ export const startApp = async (
     config,
     venue: wiring.venue,
     ...data,
+    problems: { onError: logError, onRecovered: logRecovered },
     fundLedger,
     ...wiring.rollupRoutes,
     activity,

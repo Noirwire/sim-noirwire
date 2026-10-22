@@ -1,10 +1,23 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { HouseMaker, type HouseMakerOptions, onlyReducing } from "../src/bots/house-maker.js";
-import { MakerControl, controlPath, requestMode } from "../src/bots/maker-control.js";
+import {
+  HouseMaker,
+  type HouseMakerOptions,
+  QuotesHeld,
+  flattenOrders,
+  ladderOrders,
+  onlyReducing,
+} from "../src/bots/house-maker.js";
+import {
+  CONFIRM_STOP_FLAG,
+  MakerControl,
+  controlPath,
+  killSwitchRequest,
+  requestMode,
+} from "../src/bots/maker-control.js";
 import { MakerRisk } from "../src/bots/maker-risk.js";
-import { MakerSafety } from "../src/bots/maker-safety.js";
+import { MakerSafety, worstEquity } from "../src/bots/maker-safety.js";
 import { MakerLedger, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
@@ -156,6 +169,9 @@ class Book {
   rejecting: string | null = null;
   rejectedCount = 0;
   beforePlacing: (() => Promise<void>) | null = null;
+  /** Why the market would refuse a resting order, and whether it still takes reduce-only ones. */
+  refusedBecause: string | null = null;
+  takesReduceOnly = false;
 
   asVenue(): Venue {
     return {
@@ -206,6 +222,8 @@ class Book {
       change24h: null,
       volume24h: 0n,
       openInterest: null,
+      ...(this.refusedBecause === null ? {} : { quotesRefusedBecause: this.refusedBecause }),
+      ...(this.takesReduceOnly ? { takesReduceOnlyOrders: true } : {}),
     };
   }
 
@@ -586,14 +604,15 @@ describe("a house maker's loss limits", () => {
     await first.warmUp();
     first.book.equity = dollars(960);
     await first.tick();
-    expect(first.ledger.state.mode).toBe("reduce");
+    expect(first.ledger.state.mode).toBe("flatten");
 
     const { maker, ledger } = await first.open();
-    expect(ledger.state.mode).toBe("reduce");
+    expect(ledger.state.mode).toBe("flatten");
     expect(ledger.state.dayStartEquity).toBe(dollars(1_000));
     expect(ledger.state.peakEquity).toBe(dollars(1_000));
     expect(ledger.state.reason).toContain("it lost 40.00 nUSD today");
 
+    first.book.position = 0n;
     first.clock.advance(24 * 3_600_000);
     first.book.take();
     await maker.tick(first.venue);
@@ -601,10 +620,10 @@ describe("a house maker's loss limits", () => {
       first.clock.advance(1_000);
       await maker.tick(first.venue);
     }
-    expect(ledger.state.mode).toBe("reduce");
+    expect(ledger.state.mode).toBe("flatten");
     expect(ledger.state.day).toBe("2026-11-03");
     expect(ledger.state.dayStartEquity).toBe(dollars(960));
-    expect(new Set(first.book.take().map((order) => order.side))).toEqual(new Set(["sell"]));
+    expect(first.book.take()).toEqual([]);
   });
 
   it("refuses to start from a state file it cannot read, instead of starting the limits over", async () => {
@@ -628,7 +647,7 @@ describe("a house maker's loss limits", () => {
 
 describe("the kill switch", () => {
   it("cancels the quotes that would grow the position and keeps the reducing side, up to the position", async () => {
-    const { warmUp, book, dir, clock, tick } = await rig("kill-reduce");
+    const { warmUp, book, dir, clock, tick, said } = await rig("kill-reduce");
     book.position = dollars(0.5);
     await warmUp();
     expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
@@ -640,6 +659,7 @@ describe("the kill switch", () => {
     expect(orders.length).toBeGreaterThan(0);
     expect(new Set(orders.map((order) => order.side))).toEqual(new Set(["sell"]));
     expect(orders.reduce((sum, order) => sum + order.size, 0n)).toBeLessThanOrEqual(dollars(0.5));
+    expect(said.alerts[0]).toContain("users can still close");
   });
 
   it("keeps the buying side of a short position, and quotes nothing flat", () => {
@@ -675,6 +695,8 @@ describe("the kill switch", () => {
     expect(book.orders).toHaveLength(0);
     expect(said.alerts).toHaveLength(1);
     expect(said.alerts[0]).toContain("the kill switch stopped it");
+    expect(said.alerts[0]).toContain("nobody can close a position against it");
+    expect(said.alerts[0]).toContain("The exchange admin can pause the market");
 
     await requestMode(dir, "run", clock.nowMs() + 1);
     await tick();
@@ -712,25 +734,12 @@ describe("the kill switch", () => {
     expect(first.book.orders).toHaveLength(0);
   });
 
-  it("quotes nothing new while the control file cannot be read", async () => {
-    const { warmUp, book, dir, tick, maker, venue, clock } = await rig("kill-damaged");
-    await warmUp();
-    book.take();
-
-    await writeFile(controlPath(dir), "garbage");
-    clock.advance(30_000);
-
-    await expect(maker.tick(venue)).rejects.toThrow("maker control file");
-    await expect(tick()).rejects.toThrow("maker control file");
-    expect(book.orders).toHaveLength(0);
-  });
-
   it("resumes with its loss limits counting from the equity it has now", async () => {
     const { warmUp, book, dir, clock, tick, ledger } = await rig("kill-resume");
     await warmUp();
     book.equity = dollars(900);
     await tick();
-    expect(ledger.state.mode).toBe("reduce");
+    expect(ledger.state.mode).toBe("flatten");
 
     await requestMode(dir, "run", clock.nowMs() + 1);
     await tick();
@@ -892,7 +901,7 @@ describe("a house maker that stops or fails", () => {
     expect(book.orders.length).toBeLessThanOrEqual(1);
   });
 
-  it("stops for good on an error it does not understand, cancels, and never retries the order", async () => {
+  it("falls back to the soft stop on an error it does not understand, cancels, and never retries the order", async () => {
     const { warmUp, book, tick, said, ledger } = await rig("unknown-error");
     await warmUp();
     book.take();
@@ -904,12 +913,50 @@ describe("a house maker that stops or fails", () => {
     await tick(30);
     await tick(30);
 
-    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.mode).toBe("reduce");
     expect(ledger.state.reason).toBe("the program answered something new");
     expect(said.alerts).toHaveLength(1);
     expect(said.alerts[0]).toContain("does not understand");
+    expect(said.alerts[0]).toContain("soft stop");
     expect(book.orders).toHaveLength(0);
-    expect(book.cancels).toBe(cancelsBefore + 2);
+    expect(book.cancels).toBeGreaterThanOrEqual(cancelsBefore + 2);
+  });
+
+  it("keeps quoting the side that shrinks its position after such an error, so users can still close", async () => {
+    const { warmUp, book, tick, ledger } = await rig("unknown-error-position");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+
+    book.failPlacing = new Error("the program answered something new");
+    await expect(tick(11)).rejects.toThrow("something new");
+    book.failPlacing = null;
+    await tick();
+
+    expect(ledger.state.mode).toBe("reduce");
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(0);
+    expect(new Set(orders.map((order) => order.side))).toEqual(new Set(["sell"]));
+  });
+
+  it("stops altogether when the error comes again while it is only reducing, and says users cannot close", async () => {
+    const { warmUp, book, tick, said, ledger } = await rig("unknown-error-twice");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+
+    book.failPlacing = new Error("the program answered something new");
+    await expect(tick(11)).rejects.toThrow("something new");
+    expect(ledger.state.mode).toBe("reduce");
+    await expect(tick()).rejects.toThrow("something new");
+    book.failPlacing = null;
+    await tick(30);
+    await tick(30);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts).toHaveLength(2);
+    expect(said.alerts[1]).toContain("nobody can close a position against it");
+    expect(book.orders).toHaveLength(0);
   });
 
   it("does not stop when the venue is only still starting", async () => {
@@ -943,7 +990,7 @@ describe("a house maker that stops or fails", () => {
     expect(beats).toBe(1);
   });
 
-  it("stops for good when the venue refuses an order for a reason it does not know, and sends no heartbeat", async () => {
+  it("falls back to the soft stop when the venue refuses an order for a reason it does not know, and sends no heartbeat", async () => {
     let beats = 0;
     const { warmUp, book, tick, ledger, said } = await rig("refused-unknown", {
       afterRequote: () => (beats += 1),
@@ -959,22 +1006,22 @@ describe("a house maker that stops or fails", () => {
     await tick(30);
     await tick(30);
 
-    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.mode).toBe("reduce");
     expect(ledger.state.reason).toContain("something new");
     expect(said.alerts).toHaveLength(1);
     expect(book.orders).toHaveLength(0);
-    expect(book.cancels).toBe(cancelsBefore + 2);
+    expect(book.cancels).toBeGreaterThanOrEqual(cancelsBefore + 2);
     expect(beats).toBe(beatsBefore);
   });
 
-  it("stops when the venue gives no reason for a refusal", async () => {
+  it("falls back to the soft stop when the venue gives no reason for a refusal", async () => {
     const { warmUp, book, tick, ledger } = await rig("refused-no-reason");
     await warmUp();
 
     book.rejecting = "";
     await expect(tick(11)).rejects.toThrow("order refused by the venue");
 
-    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.mode).toBe("reduce");
   });
 
   it("tries a failed cancel again on the next tick instead of stopping, since a cancel only removes risk", async () => {
@@ -990,5 +1037,565 @@ describe("a house maker that stops or fails", () => {
     book.failCancelling = null;
     await tick();
     expect(book.orders.length).toBeGreaterThan(0);
+  });
+});
+
+const sidesOf = (orders: NewOrder[]): Set<string> => new Set(orders.map((order) => order.side));
+
+describe("a house maker past a loss limit flattens its position", () => {
+  /** A maker holding `position`, whose equity has just dropped 3.1% on the day. */
+  const breached = async (
+    name: string,
+    position: bigint,
+    over: Partial<HouseMakerOptions> = {},
+  ) => {
+    const made = await rig(name, over);
+    made.book.position = position;
+    await made.warmUp();
+    made.book.take();
+    made.book.equity = dollars(969);
+    await made.tick(11);
+    return made;
+  };
+
+  it("sells a long position with one reduce-only order, a bounded 25 bps through the reference", async () => {
+    const { book, ledger, said } = await breached("flatten-long", dollars(0.5));
+
+    expect(ledger.state.mode).toBe("flatten");
+    expect(book.take()).toEqual([
+      {
+        market: PERP,
+        side: "sell",
+        type: "limit",
+        price: dollars(149.63),
+        size: dollars(0.5),
+        reduceOnly: true,
+        expiresInSeconds: 20,
+      },
+    ]);
+    expect(said.alerts).toHaveLength(1);
+    expect(said.alerts[0]).toContain("reduces it toward flat with reduce-only orders");
+    expect(said.alerts[0]).toContain("it stops quoting altogether and users cannot close");
+  });
+
+  it("buys back a short position the same way", async () => {
+    const { book } = await breached("flatten-short", -dollars(0.5));
+
+    expect(book.take()).toEqual([
+      expect.objectContaining({
+        side: "buy",
+        type: "limit",
+        price: dollars(150.37),
+        size: dollars(0.5),
+        reduceOnly: true,
+      }),
+    ]);
+  });
+
+  it("builds the order from the whole position and never from a price further than the bound", () => {
+    const shape = { market: PERP, lotSize: dollars(0.001) };
+    const flat = { centre: dollars(150), tickSize: dollars(0.01), giveBps: 25 };
+
+    expect(flattenOrders(shape, { ...flat, position: 0n })).toEqual([]);
+    expect(flattenOrders(shape, { ...flat, position: dollars(0.0004) })).toEqual([]);
+    const [sell] = flattenOrders(shape, { ...flat, position: dollars(1.2345678) });
+    expect(sell.size).toBe(dollars(1.234));
+    expect(sell.price ?? 0n).toBeGreaterThanOrEqual(dollars(150 * (1 - 0.0025)));
+    const [buy] = flattenOrders(shape, { ...flat, position: -dollars(1) });
+    expect(buy.price ?? 0n).toBeLessThanOrEqual(dollars(150 * (1 + 0.0025)));
+  });
+
+  it("follows the fresh reference with each requote", async () => {
+    const { book, feed, tick } = await breached("flatten-follows", dollars(0.5));
+    book.take();
+
+    feed.reference = { ok: true, price: dollars(150.5) };
+    await tick(11);
+
+    expect(book.take()).toEqual([
+      expect.objectContaining({ side: "sell", price: dollars(150.13), reduceOnly: true }),
+    ]);
+  });
+
+  it("never chases a stale reference, disagreeing sources or a market that has run away", async () => {
+    const { book, feed, tick, said } = await breached("flatten-no-chase", dollars(0.5));
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    feed.reference = { ok: false, reason: "the price sources are 41.0 bps apart" };
+    await tick(11);
+    await tick(11);
+    expect(book.orders).toHaveLength(0);
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    expect(said.notices.join()).toContain("41.0 bps apart");
+
+    feed.reference = { ok: true, price: dollars(150) };
+    book.mark = dollars(150 * (1 - 0.012));
+    await tick(11);
+    await tick(11);
+    expect(book.orders).toHaveLength(0);
+
+    book.mark = dollars(150);
+    await tick(11);
+    expect(book.take()).toHaveLength(1);
+  });
+
+  it("stops altogether when the loss passes the second limit, and says users cannot close", async () => {
+    const { book, ledger, said, tick } = await breached("flatten-second-limit", dollars(0.5));
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.equity = dollars(939);
+    await tick();
+    await tick(30);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts).toHaveLength(2);
+    expect(said.alerts[1]).toContain(
+      "while it was reducing its position, it lost 61.00 nUSD today, 6% of the 1000.00",
+    );
+    expect(said.alerts[1]).toContain("nobody can close a position against it");
+    expect(book.orders).toHaveLength(0);
+    expect(book.cancels).toBe(cancelsBefore + 1);
+  });
+
+  it("stops altogether on a 10% drawdown from the peak while it is flattening", async () => {
+    const { warmUp, book, ledger, said, tick } = await rig("flatten-drawdown");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.equity = dollars(1_100);
+    await tick();
+
+    book.equity = dollars(1_040);
+    await tick();
+    expect(ledger.state.mode).toBe("flatten");
+
+    book.equity = dollars(989);
+    await tick();
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts[1]).toContain("it is 111.00 nUSD below its peak of 1100.00, 10% or more");
+  });
+
+  it("stops altogether when it still holds a position ten minutes after it began", async () => {
+    const { ledger, said, tick, book } = await breached("flatten-deadline", dollars(0.5));
+    book.take();
+
+    await tick(300);
+    expect(ledger.state.mode).toBe("flatten");
+    await tick(301);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts[1]).toContain("it still held a position 10 minutes after it began");
+    expect(said.alerts[1]).toContain("nobody can close a position against it");
+  });
+
+  it("does not stop for the deadline once the position is flat", async () => {
+    const { ledger, tick, book } = await breached("flatten-flat", dollars(0.5));
+    book.take();
+    book.position = 0n;
+
+    await tick(700);
+
+    expect(ledger.state.mode).toBe("flatten");
+    expect(book.take()).toEqual([]);
+  });
+
+  it("stops altogether when its order fails, which is a flattening that is not working", async () => {
+    const made = await rig("flatten-fails");
+    made.book.position = dollars(0.5);
+    await made.warmUp();
+    made.book.take();
+
+    made.book.equity = dollars(969);
+    made.book.failPlacing = new Error("the program answered something new");
+    await expect(made.tick(11)).rejects.toThrow("something new");
+
+    expect(made.ledger.state.mode).toBe("stopped");
+    expect(made.said.alerts).toHaveLength(2);
+    expect(made.said.alerts[1]).toContain("nobody can close a position against it");
+  });
+
+  it("carries on when a user filled the position first and the order has nothing left to reduce", async () => {
+    const made = await rig("flatten-race");
+    made.book.position = dollars(0.5);
+    await made.warmUp();
+    made.book.take();
+
+    made.book.equity = dollars(969);
+    made.book.rejecting = "reduce-only: no position to reduce";
+    await made.tick(11);
+
+    expect(made.ledger.state.mode).toBe("flatten");
+    expect(made.book.rejectedCount).toBe(1);
+  });
+
+  it("counts a loss at the reference price when the venue's mark lags behind it", async () => {
+    const { warmUp, book, feed, tick, ledger, said } = await rig("loss-at-reference");
+    book.position = dollars(20);
+    await warmUp();
+
+    feed.reference = { ok: true, price: dollars(148.4) };
+    await tick(11);
+
+    expect(ledger.state.mode).toBe("flatten");
+    expect(said.alerts[0]).toContain("it lost 32.00 nUSD today");
+  });
+
+  it("values the seat at the worse of the mark and the reference price", () => {
+    const equity = dollars(1_000);
+    const mark = dollars(150);
+
+    expect(worstEquity(equity, dollars(20), mark, dollars(148.4))).toBe(dollars(968));
+    expect(worstEquity(equity, dollars(20), mark, dollars(152))).toBe(equity);
+    expect(worstEquity(equity, -dollars(20), mark, dollars(151))).toBe(dollars(980));
+    expect(worstEquity(equity, 0n, mark, dollars(100))).toBe(equity);
+  });
+
+  it("is not stopped by the loss limit alone, so users can still trade against what it quotes", async () => {
+    const { ledger, book, tick } = await breached("flatten-not-stopped", dollars(0.5));
+    book.take();
+
+    await tick(11);
+
+    expect(ledger.state.mode).toBe("flatten");
+    expect(book.take().length).toBe(1);
+  });
+
+  it("keeps the first limit's alert to one line", async () => {
+    const { said, tick } = await breached("flatten-one-alert", dollars(0.5));
+
+    await tick(11);
+    await tick(11);
+
+    expect(said.alerts).toHaveLength(1);
+  });
+});
+
+describe("the heartbeat of a maker that is not quoting freely", () => {
+  it("is not sent while a loss limit, the soft stop or a reduce-only market has it reducing", async () => {
+    let beats = 0;
+    const { warmUp, book, dir, clock, tick } = await rig("beat-limited", {
+      afterRequote: () => (beats += 1),
+    });
+    book.position = dollars(0.5);
+    await warmUp();
+    expect(beats).toBe(1);
+
+    book.refusedBecause = "the market takes reduce-only orders alone (MarketReduceOnly, 6032)";
+    book.takesReduceOnly = true;
+    await tick(11);
+    book.refusedBecause = null;
+    book.takesReduceOnly = false;
+    expect(beats).toBe(1);
+
+    await tick(11);
+    expect(beats).toBe(2);
+
+    await requestMode(dir, "reduce", clock.nowMs() + 1);
+    await tick(11);
+    await tick(11);
+    expect(beats).toBe(2);
+
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    await tick(11);
+    expect(beats).toBe(3);
+
+    book.equity = dollars(960);
+    await tick(11);
+    await tick(11);
+    await tick(11);
+    expect(beats).toBe(3);
+  });
+});
+
+describe("the kill switch's two stops", () => {
+  it("refuses the hard stop unless it is confirmed, and says what it does", () => {
+    const refused = killSwitchRequest(["stop"]);
+
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.message).toContain("nobody can close a position against it");
+    expect(refused.message).toContain(CONFIRM_STOP_FLAG);
+    expect(refused.message).toContain('use "reduce"');
+  });
+
+  it("writes the hard stop when it is confirmed, and names the consequence", () => {
+    const request = killSwitchRequest(["stop", CONFIRM_STOP_FLAG]);
+
+    expect(request.ok).toBe(true);
+    if (!request.ok) return;
+    expect(request.mode).toBe("stopped");
+    expect(request.meaning).toContain("nobody can close a position against it");
+  });
+
+  it("takes the soft stop and the resume without a confirmation, and nothing else", () => {
+    expect(killSwitchRequest(["reduce"])).toMatchObject({ ok: true, mode: "reduce" });
+    expect(killSwitchRequest(["resume"])).toMatchObject({ ok: true, mode: "run" });
+    expect(killSwitchRequest(["reduce", CONFIRM_STOP_FLAG]).ok).toBe(false);
+    expect(killSwitchRequest(["stop", "--yes"]).ok).toBe(false);
+    expect(killSwitchRequest(["halt"]).ok).toBe(false);
+    expect(killSwitchRequest([]).ok).toBe(false);
+  });
+
+  it("does not accept a flatten request from the control file, which is the maker's own answer to a loss", async () => {
+    const { warmUp, dir, tick, ledger } = await rig("kill-flatten-request");
+    await warmUp();
+
+    await writeFile(controlPath(dir), JSON.stringify({ mode: "flatten", requestedAtMs: 1e15 }));
+    await tick();
+
+    expect(ledger.state.mode).toBe("reduce");
+  });
+});
+
+describe("a control file that cannot be read", () => {
+  it("holds the maker at the soft stop, and a file that parses again does not release it", async () => {
+    const { warmUp, book, dir, tick, ledger, said, clock } = await rig("control-damaged");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+
+    await writeFile(controlPath(dir), "garbage");
+    await tick(11);
+
+    expect(ledger.state.mode).toBe("reduce");
+    expect(said.alerts).toHaveLength(1);
+    expect(said.alerts[0]).toContain("maker control file");
+    expect(said.alerts[0]).toContain("soft stop");
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(0);
+    expect(sidesOf(orders)).toEqual(new Set(["sell"]));
+
+    await tick(11);
+    await tick(11);
+    expect(said.alerts).toHaveLength(1);
+
+    await writeFile(controlPath(dir), JSON.stringify({ mode: "run", requestedAtMs: 0 }));
+    await tick(11);
+    await tick(11);
+    expect(ledger.state.mode).toBe("reduce");
+    expect(sidesOf(book.take())).toEqual(new Set(["sell"]));
+
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    await tick();
+    expect(ledger.state.mode).toBe("run");
+  });
+
+  it("keeps the hard stop and the flattening it found, rather than loosening them", async () => {
+    const stopped = await rig("control-damaged-stopped");
+    await stopped.warmUp();
+    await requestMode(stopped.dir, "stopped", stopped.clock.nowMs() + 1);
+    await stopped.tick();
+    await writeFile(controlPath(stopped.dir), "garbage");
+    await stopped.tick(11);
+    expect(stopped.ledger.state.mode).toBe("stopped");
+    expect(stopped.said.alerts).toHaveLength(1);
+
+    const flattening = await rig("control-damaged-flatten");
+    flattening.book.position = dollars(0.5);
+    await flattening.warmUp();
+    flattening.book.equity = dollars(969);
+    await flattening.tick(11);
+    await writeFile(controlPath(flattening.dir), "garbage");
+    await flattening.tick(11);
+    expect(flattening.ledger.state.mode).toBe("flatten");
+    expect(flattening.said.alerts).toHaveLength(1);
+  });
+});
+
+describe("a maker whose market is reduce-only", () => {
+  const REDUCE_ONLY = "the market takes reduce-only orders alone (MarketReduceOnly, 6032)";
+
+  it("keeps quoting the side that shrinks its position, flagged reduce-only, and cancels what grows it", async () => {
+    const { warmUp, book, tick } = await rig("venue-reduce-only");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.refusedBecause = REDUCE_ONLY;
+    book.takesReduceOnly = true;
+    await tick();
+
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(0);
+    expect(sidesOf(orders)).toEqual(new Set(["sell"]));
+    expect(orders.every((order) => order.reduceOnly === true)).toBe(true);
+    expect(orders.reduce((sum, order) => sum + order.size, 0n)).toBeLessThanOrEqual(dollars(0.5));
+    expect(book.cancels).toBe(cancelsBefore + 1);
+  });
+
+  it("buys for a short position", async () => {
+    const { warmUp, book, tick } = await rig("venue-reduce-only-short");
+    book.position = -dollars(0.5);
+    await warmUp();
+    book.take();
+
+    book.refusedBecause = REDUCE_ONLY;
+    book.takesReduceOnly = true;
+    await tick();
+
+    const orders = book.take();
+    expect(sidesOf(orders)).toEqual(new Set(["buy"]));
+    expect(orders.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+
+  it("quotes nothing when it is flat, but takes its standing quotes off", async () => {
+    const { warmUp, book, tick } = await rig("venue-reduce-only-flat");
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.refusedBecause = REDUCE_ONLY;
+    book.takesReduceOnly = true;
+    await tick();
+
+    expect(book.orders).toHaveLength(0);
+    expect(book.cancels).toBe(cancelsBefore + 1);
+  });
+
+  it("goes back to both sides when the market opens again", async () => {
+    const { warmUp, book, tick } = await rig("venue-reopens");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.refusedBecause = REDUCE_ONLY;
+    book.takesReduceOnly = true;
+    await tick();
+    book.take();
+
+    book.refusedBecause = null;
+    book.takesReduceOnly = false;
+    await tick();
+
+    expect(sidesOf(book.take())).toEqual(new Set(["buy", "sell"]));
+  });
+
+  it("still holds back, sending nothing, when the market is refused for any other reason", async () => {
+    const { warmUp, book, tick } = await rig("venue-paused");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.refusedBecause = "the market is paused (MarketPaused, 6031)";
+    await expect(tick()).rejects.toThrow(QuotesHeld);
+
+    expect(book.orders).toHaveLength(0);
+    expect(book.cancels).toBe(cancelsBefore);
+  });
+
+  it("does the same without the risk rules", async () => {
+    const book = new Book();
+    book.position = dollars(0.5);
+    book.refusedBecause = REDUCE_ONLY;
+    book.takesReduceOnly = true;
+    const maker = new HouseMaker({
+      market: PERP,
+      kind: "perp",
+      baseToken: "SOL",
+      quoteToken: "nUSD",
+      levels: 2,
+      spreadBps: 15,
+      levelStepBps: 5,
+      baseSizePerLevel: dollars(0.3),
+      requoteThresholdBps: 6,
+      requoteIntervalMs: 10_000,
+      positionLimitNotional: dollars(250),
+      maxSkewBps: 20,
+      lotSize: dollars(0.001),
+      startingQuoteBalance: dollars(1_000),
+      startingBaseBalance: 0n,
+      clock: new ManualClock(START_MS),
+    });
+
+    await maker.tick(book.asVenue());
+
+    const orders = book.take();
+    expect(sidesOf(orders)).toEqual(new Set(["sell"]));
+    expect(orders.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+});
+
+describe("the position limit counts the position and every resting level together", () => {
+  const SHAPE = {
+    market: PERP,
+    levels: 3,
+    spreadBps: 15,
+    levelStepBps: 5,
+    baseSizePerLevel: dollars(0.3),
+    maxSkewBps: 20,
+    lotSize: dollars(0.001),
+  };
+  const sum = (orders: NewOrder[], side: NewOrder["side"]): bigint =>
+    orders.filter((order) => order.side === side).reduce((total, order) => total + order.size, 0n);
+  const at = (position: number, limit: number) => ({
+    mark: dollars(150),
+    tickSize: dollars(0.01),
+    position: dollars(position),
+    positionLimit: dollars(limit),
+  });
+
+  it("sends one cut level, not three whole ones, from a position just under the limit", () => {
+    const orders = ladderOrders(SHAPE, at(1.66, 1.667));
+
+    expect(orders.filter((order) => order.side === "buy").map((order) => order.size)).toEqual([
+      dollars(0.007),
+    ]);
+    expect(sum(orders, "sell")).toBe(dollars(0.9));
+  });
+
+  it("cuts the level that would pass the limit and leaves out the ones after it", () => {
+    const orders = ladderOrders(SHAPE, at(0, 0.5));
+
+    expect(orders.filter((order) => order.side === "buy").map((order) => order.size)).toEqual([
+      dollars(0.3),
+      dollars(0.2),
+    ]);
+    expect(orders.filter((order) => order.side === "sell").map((order) => order.size)).toEqual([
+      dollars(0.3),
+      dollars(0.2),
+    ]);
+  });
+
+  it("never lets the position plus a side's resting levels pass the limit, whatever the position", () => {
+    const limit = 1.667;
+    for (const position of [-2, -1.66, -0.4, 0, 0.4, 1.66, 1.667, 2]) {
+      const orders = ladderOrders(SHAPE, at(position, limit));
+      const grown = dollars(position) + sum(orders, "buy");
+      const shrunk = dollars(position) - sum(orders, "sell");
+      expect(grown).toBeLessThanOrEqual(dollars(Math.max(limit, position)));
+      expect(shrunk).toBeGreaterThanOrEqual(dollars(Math.min(-limit, position)));
+    }
+  });
+
+  it("quotes no more buying at the limit, and all three levels of selling", () => {
+    const orders = ladderOrders(SHAPE, at(1.667, 1.667));
+
+    expect(sidesOf(orders)).toEqual(new Set(["sell"]));
+    expect(orders).toHaveLength(3);
+  });
+});
+
+describe("the maker's state file from before the flattening existed", () => {
+  it("opens, with no flattening in progress", async () => {
+    const dir = join(ROOT, "old-state");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      makerStatePath(dir, PERP),
+      JSON.stringify({
+        mode: "reduce",
+        reason: "the kill switch stopped its growth",
+        day: "2026-11-02",
+        dayStartEquity: "1000000000",
+        peakEquity: "1000000000",
+        lastCommandAtMs: 5,
+        spotBaseAtStart: null,
+      }),
+    );
+
+    const ledger = await MakerLedger.open(makerStatePath(dir, PERP));
+
+    expect(ledger.state.mode).toBe("reduce");
+    expect(ledger.state.flattenStartedAtMs).toBeNull();
   });
 });

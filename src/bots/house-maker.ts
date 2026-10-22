@@ -11,6 +11,7 @@ import {
 } from "../engine/money.js";
 import type {
   MarketId,
+  MarketInfo,
   MarketKind,
   NewOrder,
   TraderKey,
@@ -95,6 +96,13 @@ export class OrderRefused extends Error {
 /** A post-only order that would have taken from the book: the one refusal a quoting maker expects now and then. */
 const ROUTINE_REFUSAL = /would (match|cross)/;
 
+/** A reduce-only order that found nothing to reduce: a user filled the position first, which is no problem. */
+const NOTHING_TO_REDUCE = /no position to reduce|ReduceOnlyWouldIncrease/;
+
+const isRoutineRefusal = (order: NewOrder, reason: string | undefined): boolean =>
+  ROUTINE_REFUSAL.test(reason ?? "") ||
+  (order.reduceOnly === true && NOTHING_TO_REDUCE.test(reason ?? ""));
+
 /** `size` where a side that already reaches `reach` has room for a whole level under the cap, else nothing. */
 const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigint): bigint =>
   positionCap === undefined || positionCap - reach >= size ? size : 0n;
@@ -102,10 +110,11 @@ const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigin
 /**
  * The quotes for one requote, nearest level first, bid before ask. Every level
  * holds `baseSizePerLevel`. The centre shifts away from the inventory by up to
- * `maxSkewBps` at the position limit, and the side that would grow the
- * inventory past the limit is left out. Where the venue caps a side's position
- * and open orders together, each side's levels stop at the last whole one
- * that fits under that cap.
+ * `maxSkewBps` at the position limit. The position and a side's resting
+ * levels together never pass the limit: a level that would is cut down to what
+ * is left, and later levels are left out. Where the venue caps a side's
+ * position and open orders together, each side's levels stop at the last whole
+ * one that fits under that cap.
  */
 export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => {
   const { mark, tickSize, position, positionLimit, positionCap, minEdgeBps } = ladder;
@@ -139,23 +148,65 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
   const orders: NewOrder[] = [];
   let bidReach = position > 0n ? position : 0n;
   let askReach = position < 0n ? -position : 0n;
+  // How much more each side may grow the position before it reaches the limit, resting orders counted.
+  let bidRoom = positionLimit - position;
+  let askRoom = positionLimit + position;
   for (let level = 0; level < shape.levels; level += 1) {
     const offset = bpsOf(center, shape.spreadBps + level * shape.levelStepBps);
     const size = roundDownToStep(shape.baseSizePerLevel, shape.lotSize);
     if (size <= 0n) continue;
-    const bidSize = fitUnderCap(positionCap, bidReach, size);
+    const bidSize = minBigInt(
+      fitUnderCap(positionCap, bidReach, size),
+      roundDownToStep(maxBigInt(bidRoom, 0n), shape.lotSize),
+    );
     const bid = quote("buy", center - offset, bidSize);
-    if (bidSize > 0n && position < positionLimit && bid.price !== undefined && bid.price > 0n) {
+    if (bidSize > 0n && bid.price !== undefined && bid.price > 0n) {
       orders.push(bid);
       bidReach += bidSize;
+      bidRoom -= bidSize;
     }
-    const askSize = fitUnderCap(positionCap, askReach, size);
-    if (askSize > 0n && position > -positionLimit) {
+    const askSize = minBigInt(
+      fitUnderCap(positionCap, askReach, size),
+      roundDownToStep(maxBigInt(askRoom, 0n), shape.lotSize),
+    );
+    if (askSize > 0n) {
       orders.push(quote("sell", center + offset, askSize));
       askReach += askSize;
+      askRoom -= askSize;
     }
   }
   return orders;
+};
+
+/**
+ * The one order that works `position` down to flat: reduce-only, for the whole
+ * position, at a price `giveBps` through `centre` and no further. It crosses
+ * whatever rests inside that price and waits for the rest, so the maker pays
+ * at most `giveBps` to get out and never chases a price beyond it.
+ */
+export const flattenOrders = (
+  shape: Pick<LadderShape, "market" | "lotSize">,
+  flat: { centre: bigint; tickSize: bigint; position: bigint; giveBps: number },
+): NewOrder[] => {
+  const { centre, tickSize, position, giveBps } = flat;
+  const size = roundDownToStep(absBigInt(position), shape.lotSize);
+  if (size <= 0n) return [];
+  const give = bpsOf(centre, giveBps);
+  const selling = position > 0n;
+  const price = selling
+    ? roundUpToStep(centre - give, tickSize)
+    : roundDownToStep(centre + give, tickSize);
+  if (price <= 0n) return [];
+  return [
+    {
+      market: shape.market,
+      side: selling ? "sell" : "buy",
+      type: "limit",
+      price,
+      size,
+      reduceOnly: true,
+    },
+  ];
 };
 
 /**
@@ -196,8 +247,9 @@ const aroundMark = (mark: bigint): Quoting => ({
  * on its first tick after the venue takes them again.
  *
  * With `safety` it follows the risk rules: it quotes around the reference
- * price, widens and pulls as the rules say, stops growing past its loss
- * limits, and stops for good on an error it does not understand.
+ * price, widens and pulls as the rules say, flattens its position past its
+ * loss limits, and falls back to the soft stop on an error it does not
+ * understand.
  */
 export class HouseMaker {
   readonly trader: TraderKey;
@@ -243,6 +295,7 @@ export class HouseMaker {
     if (nowMs - this.lastQuotedAtMs >= this.options.requoteIntervalMs) return true;
     const { requoteThresholdBps } = this.options;
     if (next.reduceOnly !== last.reduceOnly) return true;
+    if (Boolean(next.flatten) !== Boolean(last.flatten)) return true;
     if (Math.abs(next.extraSpreadBps - last.extraSpreadBps) >= requoteThresholdBps) return true;
     const movedBps =
       (Number(next.centre - last.centre) / Number(last.centre)) * Number(BPS_PER_WHOLE);
@@ -261,11 +314,18 @@ export class HouseMaker {
    * Throws `QuotesHeld`, having sent nothing, while the venue says it would
    * refuse the quotes: cancelling and sending a ladder it refuses would only
    * empty the book. Its next tick after the venue takes quotes again requotes.
+   * The exception is a market that is only reduce-only: the venue still takes
+   * orders flagged reduce-only there, so the maker cancels what it has and
+   * quotes the side that shrinks its position, flagged, which is the side
+   * users need to close theirs.
    * With the risk rules, a failure while sending orders that it does not
-   * understand stops the maker (see `stopAfter`) and is thrown on. So does an
-   * order the venue answers with a refusal, unless it is a post-only order that
-   * would have crossed: that leaves a gap in the ladder, so the maker sends no
-   * heartbeat and sends the whole ladder again on its next tick.
+   * understand makes the maker fall back (see `stopAfter`) and is thrown on. So
+   * does an order the venue answers with a refusal, unless it is a post-only
+   * order that would have crossed, or a reduce-only order with nothing left to
+   * reduce: that leaves a gap in the ladder, so the maker sends no heartbeat
+   * and sends the whole ladder again on its next tick. The heartbeat is sent
+   * only after a requote of both sides: never while a loss limit, the kill
+   * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
     const epoch = this.epoch;
@@ -273,22 +333,76 @@ export class HouseMaker {
     if (!market || market.markPrice === null) return;
     const mark = market.markPrice;
     const { safety } = this.options;
-    const plan = safety ? await safety.assess(mark, await this.equity(venue)) : aroundMark(mark);
+    const plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
     if (plan.action !== "quote") {
       this.lastQuoted = null;
       if (this.standing) await this.withdraw(venue);
       return;
     }
-    if (market.quotesRefusedBecause !== undefined) {
+    const refused = market.quotesRefusedBecause;
+    const venueReducesOnly = refused !== undefined && market.takesReduceOnlyOrders === true;
+    if (refused !== undefined && !venueReducesOnly) {
       this.lastQuoted = null;
-      throw new QuotesHeld(this.options.market, market.quotesRefusedBecause);
+      throw new QuotesHeld(this.options.market, refused);
     }
+    const next: Quoting = venueReducesOnly ? { ...plan, reduceOnly: true } : plan;
     const now = this.options.clock.nowMs();
-    if (!this.dueForRequote(plan, now)) return;
+    if (!this.dueForRequote(next, now)) return;
 
     await venue.cancelAll(this.trader, this.options.market);
     this.standing = false;
     const position = this.inventory(await venue.traderState(this.trader));
+    const orders = this.ordersFor(next, market, position);
+    const flagged = venueReducesOnly || next.flatten === true;
+    this.standing = true;
+    let leftOut = 0;
+    try {
+      for (const order of orders) {
+        if (epoch !== this.epoch) return;
+        const sent: NewOrder = {
+          ...order,
+          ...(flagged ? { reduceOnly: true } : {}),
+          expiresInSeconds: this.expiresInSeconds,
+        };
+        const placed = await venue.placeOrder(this.trader, sent);
+        if (!safety || placed.status !== "rejected") continue;
+        if (!isRoutineRefusal(sent, placed.reason)) {
+          throw new OrderRefused(this.options.market, placed.reason);
+        }
+        leftOut += 1;
+      }
+    } catch (error) {
+      await this.stopAfter(venue, error).catch(() => {});
+      throw error;
+    }
+
+    // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
+    if (leftOut > 0) {
+      this.lastQuoted = null;
+      return;
+    }
+    this.lastQuoted = next;
+    this.lastQuotedAtMs = now;
+    if (!next.reduceOnly) this.options.afterRequote?.();
+  }
+
+  /** The seat's equity and position are what the risk rules judge the maker by. */
+  private async assess(safety: MakerSafety, venue: Venue, mark: bigint): Promise<Plan> {
+    const seat = await venue.traderState(this.trader);
+    return safety.assess(mark, seat.equity, this.inventory(seat));
+  }
+
+  /** The orders `plan` asks for: the one that flattens the position, the side that shrinks it, or both sides. */
+  private ordersFor(plan: Quoting, market: MarketInfo, position: bigint): NewOrder[] {
+    const { safety, lotSize } = this.options;
+    if (plan.flatten) {
+      return flattenOrders(this.options, {
+        centre: plan.centre,
+        tickSize: market.tickSize,
+        position,
+        giveBps: MAKER_LIMITS.flattenGiveBps,
+      });
+    }
     const spreadBps = Math.ceil(
       Math.max(this.options.spreadBps, safety ? MAKER_LIMITS.minHalfSpreadBps : 0) +
         plan.extraSpreadBps,
@@ -304,48 +418,16 @@ export class HouseMaker {
         minEdgeBps: safety ? MAKER_LIMITS.minHalfSpreadBps : undefined,
       },
     );
-    const orders = plan.reduceOnly ? onlyReducing(ladder, position, this.options.lotSize) : ladder;
-    this.standing = true;
-    let leftOut = 0;
-    try {
-      for (const order of orders) {
-        if (epoch !== this.epoch) return;
-        const placed = await venue.placeOrder(this.trader, {
-          ...order,
-          expiresInSeconds: this.expiresInSeconds,
-        });
-        if (!safety || placed.status !== "rejected") continue;
-        if (!ROUTINE_REFUSAL.test(placed.reason ?? "")) {
-          throw new OrderRefused(this.options.market, placed.reason);
-        }
-        leftOut += 1;
-      }
-    } catch (error) {
-      await this.stopAfter(venue, error).catch(() => {});
-      throw error;
-    }
-
-    // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
-    if (leftOut > 0) {
-      this.lastQuoted = null;
-      return;
-    }
-    this.lastQuoted = plan;
-    this.lastQuotedAtMs = now;
-    this.options.afterRequote?.();
-  }
-
-  /** What the risk rules measure the maker's loss by: the seat's equity at the venue's mark. */
-  private async equity(venue: Venue): Promise<bigint> {
-    return (await venue.traderState(this.trader)).equity;
+    return plan.reduceOnly ? onlyReducing(ladder, position, lotSize) : ladder;
   }
 
   /**
    * An order failed for a reason that is not the venue being away. With the
-   * risk rules the maker does not guess: it stops for good, takes its quotes
-   * off if it can (they expire anyway), and an operator resumes it. A cancel
-   * that fails is not treated this way, since it only removes risk: the tick
-   * that follows tries it again.
+   * risk rules the maker does not guess: it falls back to the soft stop, or
+   * stops altogether if it was not quoting freely already (see
+   * `MakerRisk.stopFor`), takes its quotes off if it can, and an operator
+   * resumes it. A cancel that fails is not treated this way, since it only
+   * removes risk: the tick that follows tries it again.
    */
   private async stopAfter(venue: Venue, error: unknown): Promise<void> {
     const { safety } = this.options;

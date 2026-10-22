@@ -46,11 +46,15 @@ export const registerOpenRoutes = (
 
   const turnedAway = (): string | null => deskUnavailable(ctx) ?? (deskBusy ? DESK_BUSY : null);
 
-  const asked = async <T>(ask: () => Promise<T>): Promise<T | null> => {
+  /** The desk's answer, or null when it failed: the failure is logged, and the caller is only told to retry. */
+  const asked = async <T>(what: string, ask: () => Promise<T>): Promise<T | null> => {
     deskBusy = true;
     try {
-      return await ask();
-    } catch {
+      const answer = await ask();
+      ctx.problems?.onRecovered(what);
+      return answer;
+    } catch (error) {
+      ctx.problems?.onError(what, error);
       return null;
     } finally {
       deskBusy = false;
@@ -65,7 +69,9 @@ export const registerOpenRoutes = (
     const reason = turnedAway();
     if (reason) return reply.status(503).send({ error: reason });
 
-    const prepared = await asked(() => desk.prepare({ ...parsed.data, ip: request.ip }));
+    const prepared = await asked("opening an account (prepare)", () =>
+      desk.prepare({ ...parsed.data, ip: request.ip }),
+    );
     if (!prepared) return reply.status(502).send({ error: DESK_UNREACHABLE });
     if (!prepared.ok) return reply.status(prepared.status).send({ error: prepared.reason });
     return { transaction: prepared.transaction, expiresAtMs: prepared.expiresAtMs };
@@ -80,7 +86,9 @@ export const registerOpenRoutes = (
     const reason = turnedAway();
     if (reason) return reply.status(503).send({ error: reason });
 
-    const opened = await asked(() => desk.submit(owner, transaction, request.ip));
+    const opened = await asked("opening an account (submit)", () =>
+      desk.submit(owner, transaction, request.ip),
+    );
     if (!opened) return reply.status(502).send({ error: DESK_UNREACHABLE });
     if (!opened.ok) return reply.status(opened.status).send({ error: opened.reason });
     ctx.stats.recordTrader(owner);

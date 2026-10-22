@@ -3,16 +3,21 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 /**
- * run: quotes both sides. reduce: quotes only the side that shrinks its
- * position, so users can still close against it. stopped: quotes nothing.
+ * run: quotes both sides. reduce (the soft stop): quotes only the side that
+ * shrinks its position, so users can still close against it. flatten: a loss
+ * limit was passed, so it works its position down to flat with reduce-only
+ * orders around the reference price. stopped (the hard stop): quotes nothing,
+ * which leaves users unable to close against it.
  */
-export const MAKER_MODES = ["run", "reduce", "stopped"] as const;
+export const MAKER_MODES = ["run", "reduce", "flatten", "stopped"] as const;
 export type MakerMode = (typeof MAKER_MODES)[number];
 
 export interface MakerState {
   mode: MakerMode;
   /** Why the mode is not run: what happened, in words. */
   reason: string | null;
+  /** When it began to flatten, while it is flattening. */
+  flattenStartedAtMs: number | null;
   /** The UTC day the loss limit counts from, as YYYY-MM-DD. */
   day: string | null;
   dayStartEquity: bigint | null;
@@ -32,6 +37,7 @@ const amount = z
 const fileSchema = z.object({
   mode: z.enum(MAKER_MODES),
   reason: z.string().nullable(),
+  flattenStartedAtMs: z.number().nullable().default(null),
   day: z.string().nullable(),
   dayStartEquity: amount,
   peakEquity: amount,
@@ -42,6 +48,7 @@ const fileSchema = z.object({
 const FRESH: MakerState = {
   mode: "run",
   reason: null,
+  flattenStartedAtMs: null,
   day: null,
   dayStartEquity: null,
   peakEquity: null,

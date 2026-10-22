@@ -278,6 +278,21 @@ steps above do not apply to it. The files and variables it takes, and what each 
 | `TRUSTED_PROXY_HOPS`                                                     | Reverse proxies in front of the service (`0` for none)                                                                                                    |
 | `ALLOWED_ORIGINS`                                                        | The production terminal's origin only                                                                                                                     |
 
+**Where the service may be reached from.** The per-address limits (the gate's seats per
+address per day and the rate limit) read the caller's address from `X-Forwarded-For`, as
+many hops deep as `TRUSTED_PROXY_HOPS` says. So the service must sit behind the server's
+tunnel and local proxy and be reachable by nothing else: bind it to the private interface
+or firewall its port. If anyone can reach the port directly they can send their own
+`X-Forwarded-For` and get a fresh address on every request, which defeats both limits (the
+day's total of seats still holds). Set `TRUSTED_PROXY_HOPS` to the real number of proxies
+in the chain: too low and every user shares the proxy's address, so one person's seat uses
+up the address limit for everybody that day.
+
+**No liquidator runs here, on purpose.** Mainnet mode never starts one
+(`LIQUIDATOR_ENABLED=1` is refused at start). Liquidating under-margined seats is the
+order book repository's keeper, which runs separately and which this service neither
+starts nor checks: confirm it is running before the maker holds a position.
+
 Do not set the faucet, noise taker, liquidator, oracle or `DEV_TRADING` variables, nor an
 inline `GATE_SECRET_KEY`, `BOT_TRADER_SEEDS` or `DEPLOYMENT_JSON`: the service refuses to
 start and lists each one. It checks Solana's genesis hash against `NETWORK` before it sends
@@ -322,26 +337,53 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
 
 - **The host's clock must be right** (NTP running). Quote expiries are set against the
   host's clock, and a price source more than 10 s from it is not believed.
-- **Alerts are log lines** that start with `sim-noirwire: ALERT`. One means the maker has
-  stopped growing its position (a loss limit or the kill switch) or has stopped quoting
-  (an error it does not understand), and it stays that way until it is resumed. Watch the
-  log for the word `ALERT`. Lines saying it `pulled its quotes` are not alerts: the price
+- **Alerts are log lines** that start with `sim-noirwire: ALERT`. One means the maker is
+  no longer quoting freely: it is flattening after a loss limit, it is at the soft stop
+  (the kill switch, an error it does not understand, or a control file it cannot read), or
+  it has stopped quoting altogether. It stays that way until it is resumed. Watch the log
+  for the word `ALERT`. Lines saying it `pulled its quotes` are not alerts: the price
   sources disagreed, a price was old, or the market moved fast, and it quotes again by
   itself after 10 quiet seconds.
 - **A heartbeat for an outside monitor.** Set `HEALTHCHECK_URL` to a ping address (for
-  example a healthchecks.io check) and the maker calls it after each good requote, about
-  every 10 s. Set the monitor's period to 1 minute with a short grace, and have it message
-  you when the calls stop. That also fires when the maker is deliberately stopped or the
-  prices are pulled for long, which is the point. The address is never logged; if a call
-  fails the log says `health check ping failing` with what to check, and quoting goes on.
+  example a healthchecks.io check) and the maker calls it after each good requote of both
+  sides, about every 10 s. It sends none while a loss limit or the kill switch has the
+  maker reducing, or while the program's market is reduce-only. Set the monitor's period
+  to 1 minute with a short grace, and have it message you when the calls stop. That also
+  fires when the maker is stopped, flattening or reducing, or the prices are pulled for
+  long, which is the point. The address is never logged; if a call fails the log says
+  `health check ping failing` with what to check, and quoting goes on.
+- **Two stops, and what each does to users.** The soft stop keeps quoting the side that
+  shrinks the maker's position, so users can still close against it. The hard stop quotes
+  nothing, so **users cannot close their positions until the maker is resumed**; the
+  exchange admin can pause the market in the meantime, and a restart does not resume it,
+  since the stop is kept in `DATA_DIR`. Nothing starts the hard stop where the soft stop
+  would do. A loss limit flattens (below), an error it does not understand or a control
+  file it cannot read falls back to the soft stop, and the hard stop comes only from the
+  operator or from an escalation: a second failure while already reducing, the wider loss
+  limit, a flattening that fails or takes over ten minutes.
+- **A loss limit flattens.** Past 3% of the day's start or 5% from the peak (counted at the
+  worse of the venue's mark and the reference price) the maker works its position down
+  with one reduce-only order, at most 25 bps through the fresh reference price, replaced
+  at each requote. It pulls the order on a stale or disagreeing reference, a mark far from
+  it or a fast move, rather than chase. Past 6% or 10%, or when an order fails, or when a
+  position remains after ten minutes, it stops altogether. Reduce-only orders carry no
+  program expiry (the venue sends none for them), so they stand until the maker cancels
+  them at the next requote, at a stop of the service or at its next start.
+- **A reduce-only market.** If the exchange admin sets the market to reduce-only, the
+  maker keeps quoting the side that shrinks its position, flagged reduce-only, and
+  cancels the rest. No heartbeat is sent meanwhile. Any other reason the program refuses
+  quotes (paused, a stale mark, a dislocation, a tripped USDC guard) holds all quotes back.
 - **The kill switch** is a command on the machine the service runs on, with the service's
-  `DATA_DIR`: `docker exec <container> node dist/kill-switch.js reduce`, or `stop`, or
-  `resume`. It writes a small file the maker reads every second, so it works while the API
-  is busy, needs no network and no key, and a restart keeps what it set. Check the log
-  for the line that says the maker followed it.
+  `DATA_DIR`: `docker exec <container> node dist/kill-switch.js reduce`, `resume`, or
+  `stop --confirm-strands-users`. `stop` is the hard stop and is refused without the flag,
+  which names what it does. It writes a small file the maker reads every second, so it
+  works while the API is busy, needs no network and no key, and a restart keeps what it
+  set. Check the log for the line that says the maker followed it. If the file cannot be
+  read, the maker holds itself at the soft stop with an `ALERT` and stays there after the
+  file parses again, until a newer `resume` is written.
 - **Resuming** after a loss limit: check the position, the market and the seat's equity
-  first. `resume` makes the loss limits count from the equity then, so it accepts the loss
-  that stopped the maker.
+  first, and that the exchange's keeper is running. `resume` makes the loss limits count
+  from the equity then, so it accepts the loss that stopped the maker.
 - **Files in `DATA_DIR`:** `maker-NSOL-PERP.json` (mode, the equity the limits count from)
   and `maker-control.json` (the last kill switch request). If the first cannot be read, the
   service stops at start and says so: fix or move it away on purpose, since starting
