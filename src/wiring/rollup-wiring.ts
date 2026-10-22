@@ -1,5 +1,5 @@
 import { liquidatorTraderKey, makerTraderKey, takerTraderKey } from "../bots/bot-traders.js";
-import type { Config } from "../config/config.js";
+import { type Config, isMainnet } from "../config/config.js";
 import type { SnapshotData } from "../data/snapshot.js";
 import { systemClock } from "../engine/clock.js";
 import { MARKETS, type MarketConfig } from "../engine/markets.js";
@@ -7,11 +7,13 @@ import { divScale, roundUpToStep } from "../engine/money.js";
 import type { Venue } from "../engine/types.js";
 import { placingOrdersThrough } from "../engine/venue-orders.js";
 import { STILL_STARTING, VenueNotReady } from "../engine/venue-not-ready.js";
-import type { PublicDeployment } from "../rollup/public-deployment.js";
+import { hideAddresses } from "../logging/first-line.js";
+import { type PublicDeployment, browserUrlsFor } from "../rollup/public-deployment.js";
 import type { BotSpec } from "../rollup/bot-accounts.js";
 import { executed } from "../rollup/chain-types.js";
-import { refuseMainnet } from "../rollup/connections.js";
+import { requireNetwork } from "../rollup/connections.js";
 import type { FundRequests } from "../rollup/fund-desk.js";
+import { requireMainnetDeployment } from "../rollup/mainnet-deployment.js";
 import { Program } from "../rollup/program.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
 import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
@@ -79,7 +81,9 @@ const botRoles = (
  */
 export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const { config, data, snapshot, onError, onRecovered } = options;
+  const mainnet = isMainnet(config);
   const deployment = loadDeployment(config);
+  if (mainnet) requireMainnetDeployment(deployment);
   const markets = deployedMarkets(deployment, MARKETS);
   if (!deployment.faucet && (config.NOISE_TAKERS_ENABLED || config.LIQUIDATOR_ENABLED)) {
     throw new Error(
@@ -92,6 +96,15 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     : [];
   const roles = botRoles(markets, takerKeys, config.LIQUIDATOR_ENABLED);
   const settings = loadRollupSettings(config, deployment, roles.length);
+  // On mainnet the private endpoints may carry a key: no log line or answer repeats one.
+  if (mainnet) {
+    hideAddresses([
+      settings.solanaRpcUrl,
+      settings.rollupRpcUrl,
+      settings.rollupWsUrl,
+      settings.depositRpcUrl,
+    ]);
+  }
   for (const [at, market] of markets.entries()) {
     onError(
       `the ${market.id} maker's seat owner is ${settings.botOwners[at]?.publicKey.toBase58()}; ` +
@@ -105,7 +118,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const userOrders = new UserOrderCount();
 
   let rollup: RollupVenue | null = null;
-  let mainnetRefused = false;
+  let networkChecked = false;
 
   const connected = (): RollupVenue => {
     if (!rollup) throw new VenueNotReady(STILL_STARTING);
@@ -118,7 +131,6 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       settings,
       markets,
       bots: roles.map((role, at) => ({ ...role, owner: settings.botOwners[at] })),
-      quoteExpirySeconds: config.ROLLUP_QUOTE_EXPIRY_SECONDS,
       recordedThrough: snapshot?.tapeCursors ?? {},
       keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
       usersEverOpened: options.usersEverOpened,
@@ -218,25 +230,34 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     botVenue,
     botMarkets: markets,
     rollupRoutes: {
-      fundDesk: {
-        prepare: (owner, orderKeys) => viaDesk((desk) => desk.prepare(owner, orderKeys)),
-        submit: (owner, transaction) => viaDesk((desk) => desk.submit(owner, transaction)),
-      },
+      // Mainnet hands out no funds: it has no fund routes, and so no desk.
+      ...(mainnet
+        ? {}
+        : {
+            fundDesk: {
+              prepare: (owner: string, orderKeys: string[]) =>
+                viaDesk((desk) => desk.prepare(owner, orderKeys)),
+              submit: (owner: string, transaction: string) =>
+                viaDesk((desk) => desk.submit(owner, transaction)),
+            },
+          }),
       readiness: () => rollup?.readiness() ?? NOT_CONNECTED,
       deployment: () => {
         if (!rollup) return null;
-        publicDescription ??= rollup.publicDeployment({
-          solanaRpcUrl: config.PUBLIC_SOLANA_RPC_URL ?? settings.solanaRpcUrl,
-          rollupRpcUrl: config.PUBLIC_ROLLUP_RPC_URL ?? settings.rollupRpcUrl,
-          rollupWsUrl: config.PUBLIC_ROLLUP_WS_URL ?? settings.rollupWsUrl,
-        });
+        publicDescription ??= rollup.publicDeployment(
+          browserUrlsFor(config, {
+            solanaRpcUrl: settings.solanaRpcUrl,
+            rollupRpcUrl: settings.rollupRpcUrl,
+            rollupWsUrl: settings.rollupWsUrl,
+          }),
+        );
         return publicDescription;
       },
     },
     prepare: async () => {
-      if (!mainnetRefused) {
-        await refuseMainnet(settings.solanaRpcUrl);
-        mainnetRefused = true;
+      if (!networkChecked) {
+        await requireNetwork(mainnet, settings.solanaRpcUrl);
+        networkChecked = true;
       }
       rollup ??= await connect();
       await rollup.follow();

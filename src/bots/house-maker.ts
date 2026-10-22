@@ -1,7 +1,27 @@
 import type { Clock } from "../engine/clock.js";
-import { BPS_PER_WHOLE, bpsOf, divScale, roundDownToStep, roundUpToStep } from "../engine/money.js";
-import type { MarketId, MarketKind, NewOrder, TraderKey, Venue } from "../engine/types.js";
+import {
+  BPS_PER_WHOLE,
+  absBigInt,
+  bpsOf,
+  divScale,
+  minBigInt,
+  roundDownToStep,
+  roundUpToStep,
+} from "../engine/money.js";
+import type {
+  MarketId,
+  MarketKind,
+  NewOrder,
+  TraderKey,
+  TraderState,
+  Venue,
+} from "../engine/types.js";
+import { VenueNotReady } from "../engine/venue-not-ready.js";
+import { firstLine } from "../logging/first-line.js";
 import { makerTraderKey } from "./bot-traders.js";
+import { MAKER_LIMITS } from "./maker-limits.js";
+import type { MakerSafety, Plan } from "./maker-safety.js";
+import type { MakerLedger } from "./maker-state.js";
 
 export interface HouseMakerOptions {
   market: MarketId;
@@ -20,12 +40,17 @@ export interface HouseMakerOptions {
   startingQuoteBalance: bigint;
   startingBaseBalance: bigint;
   clock: Clock;
+  /** The risk rules. Without them the maker quotes around the venue's mark and never stops by itself. */
+  safety?: MakerSafety;
+  /** What the maker keeps across a restart. Without it, it remembers nothing. */
+  ledger?: MakerLedger;
 }
 
 /** The skew is applied in thousandths of a basis point, so a small inventory still moves the centre. */
 const SKEW_PRECISION = 1_000;
 
 export interface Ladder {
+  /** The price the ladder is centred on: the venue's mark, or the reference price where the maker has one. */
   mark: bigint;
   tickSize: bigint;
   /** Signed inventory in base units: positive when long. */
@@ -51,31 +76,17 @@ export class QuotesHeld extends Error {
   }
 }
 
-/**
- * How much of `size` fits under the cap on a side that already reaches
- * `reach`: all of it, the part that fits when that is at least a first
- * level, or nothing.
- */
-const fitUnderCap = (
-  shape: LadderShape,
-  positionCap: bigint | undefined,
-  reach: bigint,
-  size: bigint,
-): bigint => {
-  if (positionCap === undefined) return size;
-  const room = positionCap - reach;
-  if (room >= size) return size;
-  const trimmed = roundDownToStep(room, shape.lotSize);
-  const smallest = roundDownToStep(shape.baseSizePerLevel, shape.lotSize);
-  return trimmed > 0n && trimmed >= smallest ? trimmed : 0n;
-};
+/** `size` where a side that already reaches `reach` has room for a whole level under the cap, else nothing. */
+const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigint): bigint =>
+  positionCap === undefined || positionCap - reach >= size ? size : 0n;
 
 /**
- * The quotes for one requote, nearest level first, bid before ask. The
- * centre shifts away from the inventory by up to `maxSkewBps` at the position
- * limit, and the side that would grow the inventory past the limit is left out.
- * Where the venue caps a side's position and open orders together, each
- * side's levels stop at that cap, the last one trimmed to fit.
+ * The quotes for one requote, nearest level first, bid before ask. Every level
+ * holds `baseSizePerLevel`. The centre shifts away from the inventory by up to
+ * `maxSkewBps` at the position limit, and the side that would grow the
+ * inventory past the limit is left out. Where the venue caps a side's position
+ * and open orders together, each side's levels stop at the last whole one
+ * that fits under that cap.
  */
 export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => {
   const { mark, tickSize, position, positionLimit, positionCap } = ladder;
@@ -89,7 +100,8 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
     market: shape.market,
     side,
     type: "postOnly",
-    price: roundUpToStep(price, tickSize),
+    // A price off the tick moves away from the market, so the spread is never narrower than asked.
+    price: side === "buy" ? roundDownToStep(price, tickSize) : roundUpToStep(price, tickSize),
     size,
   });
 
@@ -98,15 +110,15 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
   let askReach = position < 0n ? -position : 0n;
   for (let level = 0; level < shape.levels; level += 1) {
     const offset = bpsOf(center, shape.spreadBps + level * shape.levelStepBps);
-    const size = roundDownToStep(shape.baseSizePerLevel * BigInt(level + 1), shape.lotSize);
+    const size = roundDownToStep(shape.baseSizePerLevel, shape.lotSize);
     if (size <= 0n) continue;
-    const bidSize = fitUnderCap(shape, positionCap, bidReach, size);
+    const bidSize = fitUnderCap(positionCap, bidReach, size);
     const bid = quote("buy", center - offset, bidSize);
     if (bidSize > 0n && position < positionLimit && bid.price !== undefined && bid.price > 0n) {
       orders.push(bid);
       bidReach += bidSize;
     }
-    const askSize = fitUnderCap(shape, positionCap, askReach, size);
+    const askSize = fitUnderCap(positionCap, askReach, size);
     if (askSize > 0n && position > -positionLimit) {
       orders.push(quote("sell", center + offset, askSize));
       askReach += askSize;
@@ -116,43 +128,98 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
 };
 
 /**
- * Keeps a ladder of post-only orders on both sides of the mark. It requotes
- * (cancel everything, then place a fresh ladder) only when the mark has moved
+ * The orders that shrink `position` and no others: the side opposite to it,
+ * nearest level first, together never more than the position itself, so
+ * filling them all brings the maker to flat and not past it.
+ */
+export const onlyReducing = (orders: NewOrder[], position: bigint, lotSize: bigint): NewOrder[] => {
+  const side: NewOrder["side"] | null = position > 0n ? "sell" : position < 0n ? "buy" : null;
+  let room = roundDownToStep(absBigInt(position), lotSize);
+  const kept: NewOrder[] = [];
+  for (const order of orders) {
+    if (order.side !== side || room <= 0n) continue;
+    const size = minBigInt(order.size, room);
+    kept.push({ ...order, size });
+    room -= size;
+  }
+  return kept;
+};
+
+type Quoting = Extract<Plan, { action: "quote" }>;
+
+/** With no risk rules the maker quotes around the venue's mark, as it always has. */
+const aroundMark = (mark: bigint): Quoting => ({
+  action: "quote",
+  centre: mark,
+  extraSpreadBps: 0,
+  reduceOnly: false,
+});
+
+/**
+ * Keeps a ladder of post-only orders on both sides of a price. It requotes
+ * (cancel everything, then place a fresh ladder) only when that price has moved
  * past the threshold or the requote interval has passed, so it does not churn
- * the book on every tick. While the venue would refuse its quotes it holds
- * them instead, and requotes on its first tick after the venue takes them again.
+ * the book on every tick. Every quote expires on the venue by itself a little
+ * after the requote interval, so a maker that dies leaves nothing standing.
+ * While the venue would refuse its quotes it holds them instead, and requotes
+ * on its first tick after the venue takes them again.
+ *
+ * With `safety` it follows the risk rules: it quotes around the reference
+ * price, widens and pulls as the rules say, stops growing past its loss
+ * limits, and stops for good on an error it does not understand.
  */
 export class HouseMaker {
   readonly trader: TraderKey;
-  private lastQuotedPrice: bigint | null = null;
+  private lastQuoted: Quoting | null = null;
   private lastQuotedAtMs = -Infinity;
   private baseHeldAtStart = 0n;
+  /** Whether quotes may be standing on the venue. */
+  private standing = true;
+  /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
+  private epoch = 0;
+  private readonly expiresInSeconds: number;
 
   constructor(private readonly options: HouseMakerOptions) {
     this.trader = makerTraderKey(options.market);
+    this.expiresInSeconds =
+      Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
-    const { kind, baseToken, quoteToken, startingQuoteBalance, startingBaseBalance } = this.options;
+    const { kind, baseToken, quoteToken, startingQuoteBalance, startingBaseBalance, ledger } =
+      this.options;
     await venue.openTrader(this.trader);
     await venue.deposit(this.trader, quoteToken, startingQuoteBalance);
     if (kind !== "spot") return;
     await venue.deposit(this.trader, baseToken, startingBaseBalance);
-    this.baseHeldAtStart = startingBaseBalance;
+    const kept = ledger?.state.spotBaseAtStart ?? null;
+    if (kept === null) await ledger?.update({ spotBaseAtStart: startingBaseBalance });
+    this.baseHeldAtStart = kept ?? startingBaseBalance;
   }
 
-  private dueForRequote(mark: bigint, nowMs: number): boolean {
-    if (this.lastQuotedPrice === null) return true;
+  /** Takes every quote off the venue, and keeps the tick that may be running from placing more. */
+  async withdraw(venue: Venue): Promise<void> {
+    this.epoch += 1;
+    this.lastQuoted = null;
+    this.standing = false;
+    await venue.cancelAll(this.trader, this.options.market);
+  }
+
+  private dueForRequote(next: Quoting, nowMs: number): boolean {
+    const last = this.lastQuoted;
+    if (last === null) return true;
     if (nowMs - this.lastQuotedAtMs >= this.options.requoteIntervalMs) return true;
+    const { requoteThresholdBps } = this.options;
+    if (next.reduceOnly !== last.reduceOnly) return true;
+    if (Math.abs(next.extraSpreadBps - last.extraSpreadBps) >= requoteThresholdBps) return true;
     const movedBps =
-      (Number(mark - this.lastQuotedPrice) / Number(this.lastQuotedPrice)) * Number(BPS_PER_WHOLE);
-    return !(Math.abs(movedBps) < this.options.requoteThresholdBps);
+      (Number(next.centre - last.centre) / Number(last.centre)) * Number(BPS_PER_WHOLE);
+    return !(Math.abs(movedBps) < requoteThresholdBps);
   }
 
   /** A perpetual's position, or on spot how much base it holds beyond what it started with. */
-  private async inventory(venue: Venue): Promise<bigint> {
+  private inventory(state: TraderState): bigint {
     const { kind, market, baseToken } = this.options;
-    const state = await venue.traderState(this.trader);
     return kind === "perp"
       ? (state.positions[market]?.size ?? 0n)
       : (state.balances[baseToken]?.balance ?? 0n) - this.baseHeldAtStart;
@@ -162,30 +229,81 @@ export class HouseMaker {
    * Throws `QuotesHeld`, having sent nothing, while the venue says it would
    * refuse the quotes: cancelling and sending a ladder it refuses would only
    * empty the book. Its next tick after the venue takes quotes again requotes.
+   * With the risk rules, a failure while sending orders that it does not
+   * understand stops the maker (see `stopAfter`) and is thrown on.
    */
   async tick(venue: Venue): Promise<void> {
+    const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
-    if (!market) return;
+    if (!market || market.markPrice === null) return;
+    const mark = market.markPrice;
+    const { safety } = this.options;
+    const plan = safety ? await safety.assess(mark, await this.equity(venue)) : aroundMark(mark);
+    if (plan.action !== "quote") {
+      this.lastQuoted = null;
+      if (this.standing) await this.withdraw(venue);
+      return;
+    }
     if (market.quotesRefusedBecause !== undefined) {
-      this.lastQuotedPrice = null;
+      this.lastQuoted = null;
       throw new QuotesHeld(this.options.market, market.quotesRefusedBecause);
     }
-    if (market.markPrice === null) return;
-    const mark = market.markPrice;
     const now = this.options.clock.nowMs();
-    if (!this.dueForRequote(mark, now)) return;
+    if (!this.dueForRequote(plan, now)) return;
 
     await venue.cancelAll(this.trader, this.options.market);
-    const orders = ladderOrders(this.options, {
-      mark,
-      tickSize: market.tickSize,
-      position: await this.inventory(venue),
-      positionLimit: divScale(this.options.positionLimitNotional, mark),
-      positionCap: market.positionCap,
-    });
-    for (const order of orders) await venue.placeOrder(this.trader, order);
+    this.standing = false;
+    const position = this.inventory(await venue.traderState(this.trader));
+    const spreadBps = Math.ceil(
+      Math.max(this.options.spreadBps, safety ? MAKER_LIMITS.minHalfSpreadBps : 0) +
+        plan.extraSpreadBps,
+    );
+    const ladder = ladderOrders(
+      { ...this.options, spreadBps },
+      {
+        mark: plan.centre,
+        tickSize: market.tickSize,
+        position,
+        positionLimit: divScale(this.options.positionLimitNotional, plan.centre),
+        positionCap: market.positionCap,
+      },
+    );
+    const orders = plan.reduceOnly ? onlyReducing(ladder, position, this.options.lotSize) : ladder;
+    this.standing = true;
+    try {
+      for (const order of orders) {
+        if (epoch !== this.epoch) return;
+        await venue.placeOrder(this.trader, { ...order, expiresInSeconds: this.expiresInSeconds });
+      }
+    } catch (error) {
+      await this.stopAfter(venue, error).catch(() => {});
+      throw error;
+    }
 
-    this.lastQuotedPrice = mark;
+    this.lastQuoted = plan;
     this.lastQuotedAtMs = now;
+  }
+
+  /** What the risk rules measure the maker's loss by: the seat's equity at the venue's mark. */
+  private async equity(venue: Venue): Promise<bigint> {
+    return (await venue.traderState(this.trader)).equity;
+  }
+
+  /**
+   * An order failed for a reason that is not the venue being away. With the
+   * risk rules the maker does not guess: it stops for good, takes its quotes
+   * off if it can (they expire anyway), and an operator resumes it. A cancel
+   * that fails is not treated this way, since it only removes risk: the tick
+   * that follows tries it again.
+   */
+  private async stopAfter(venue: Venue, error: unknown): Promise<void> {
+    const { safety } = this.options;
+    if (!safety || error instanceof VenueNotReady) return;
+    try {
+      await safety.stopFor(firstLine(error));
+    } finally {
+      this.lastQuoted = null;
+      await this.withdraw(venue).catch(() => {});
+    }
   }
 }

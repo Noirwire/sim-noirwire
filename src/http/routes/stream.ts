@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AppContext } from "../context.js";
+import type { SocketLimiter } from "../rate-limit.js";
 import { marketId } from "../schemas.js";
 
 const POLICY_VIOLATION = 1008;
@@ -13,11 +14,23 @@ const querySchema = z.object({ market: marketId });
  * `WS /v1/stream?market=<id>`: price, fill, candle and stats messages for one
  * market. The service stays awake while any of these sockets is open.
  */
-export const registerStreamRoute = (app: FastifyInstance, ctx: AppContext): void => {
+export const registerStreamRoute = (
+  app: FastifyInstance,
+  ctx: AppContext,
+  socketLimit?: SocketLimiter,
+): void => {
   app.get("/v1/stream", { websocket: true }, (socket, request) => {
     const parsed = querySchema.safeParse(request.query);
     if (!parsed.success) {
       socket.close(POLICY_VIOLATION, "unknown or missing market");
+      return;
+    }
+    const releaseSlot = socketLimit?.acquire(request.ip);
+    if (socketLimit && !releaseSlot) {
+      socket.close(
+        POLICY_VIOLATION,
+        "too many open streams from this address: close one and retry",
+      );
       return;
     }
     const unsubscribe = ctx.hub.subscribe(parsed.data.market, (payload) => {
@@ -39,6 +52,7 @@ export const registerStreamRoute = (app: FastifyInstance, ctx: AppContext): void
       clearInterval(heartbeat);
       unsubscribe();
       released();
+      releaseSlot?.();
     });
   });
 };

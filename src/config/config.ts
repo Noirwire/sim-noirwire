@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DECIMAL_TEXT, fromDecimalString } from "../engine/money.js";
+import { mainnetConfig } from "./mainnet.js";
 
 const decimalAmount = (defaultValue: string) =>
   z
@@ -34,8 +35,15 @@ const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   VENUE: z.enum(["memory", "rollup"]).default("memory"),
   DEV_TRADING: boolFlag("0"),
+  /** A label, except "mainnet": that runs only the maker, the gate and the market data (`mainnet.ts`). */
   NETWORK: z.string().default("devnet"),
   ALLOWED_ORIGINS: commaSeparated("http://localhost:3000"),
+  /** How many reverse proxies sit in front of the service, so the per-IP limits see the caller. Required on mainnet. */
+  TRUSTED_PROXY_HOPS: z.coerce.number().int().min(0).optional(),
+  /** Mainnet: requests one address may make to the public API in a minute. */
+  PUBLIC_RATE_LIMIT_PER_MINUTE: positiveInt(300),
+  /** Mainnet: stream sockets one address may hold open at once. */
+  PUBLIC_SOCKETS_PER_IP: positiveInt(5),
   DATA_DIR: z.string().default("./data"),
   SNAPSHOT_INTERVAL_MS: positiveInt(30_000),
   /** VENUE=rollup: how long the service keeps trading after the last request, with no stream socket open. */
@@ -62,6 +70,8 @@ const envSchema = z.object({
   HOUSE_MAKER_REQUOTE_INTERVAL_MS: positiveInt(90_000),
   HOUSE_MAKER_POSITION_LIMIT_NUSD: decimalAmount("50000"),
   HOUSE_MAKER_MAX_SKEW_BPS: positiveInt(20),
+  /** The maker follows the risk rules (`bots/maker-safety.ts`). Always on, and not switchable off, on mainnet. */
+  HOUSE_MAKER_RISK_RULES: boolFlag("0"),
 
   /** The noise takers trade at all. Off, none is opened, funded or started. */
   NOISE_TAKERS_ENABLED: boolFlag("1"),
@@ -95,11 +105,11 @@ const envSchema = z.object({
   GATE_SECRET_KEY_FILE: z.string().optional(),
   FAUCET_SECRET_KEY_FILE: z.string().optional(),
   BOT_TRADER_SEEDS: z.string().optional(),
+  BOT_TRADER_SEEDS_FILE: z.string().optional(),
   PUBLIC_SOLANA_RPC_URL: z.url().optional(),
   PUBLIC_ROLLUP_RPC_URL: z.url().optional(),
   PUBLIC_ROLLUP_WS_URL: z.url().optional(),
   SERVICE_LOCATION: z.string().default("unnamed machine"),
-  ROLLUP_QUOTE_EXPIRY_SECONDS: positiveInt(180),
   ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("400"),
   ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),
   ROLLUP_TAKER_MAX_NUSD: decimalAmount("50"),
@@ -109,4 +119,9 @@ const envSchema = z.object({
 
 export type Config = z.infer<typeof envSchema>;
 
-export const loadConfig = (env: NodeJS.ProcessEnv = process.env): Config => envSchema.parse(env);
+export const isMainnet = (config: Pick<Config, "NETWORK">): boolean => config.NETWORK === "mainnet";
+
+export const loadConfig = (env: NodeJS.ProcessEnv = process.env): Config => {
+  const config = envSchema.parse(env);
+  return isMainnet(config) ? mainnetConfig(config, env) : config;
+};

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { isMainnet } from "../../config/config.js";
 import type { AppContext } from "../context.js";
 import { marketId } from "../schemas.js";
 import { serializeFill } from "../serialize.js";
@@ -21,7 +22,7 @@ export const registerTapeRoute = (app: FastifyInstance, ctx: AppContext): void =
     const { market, limit } = parsed.data;
     return {
       network: ctx.config.NETWORK,
-      simulated: true,
+      simulated: !isMainnet(ctx.config),
       fills: ctx.tape.recent(market, limit).map(serializeFill),
     };
   });

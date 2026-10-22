@@ -1,11 +1,16 @@
 import { FundingUpdater } from "../bots/funding-updater.js";
 import { HouseMaker } from "../bots/house-maker.js";
 import { Liquidator } from "../bots/liquidator.js";
+import { MakerControl, controlPath } from "../bots/maker-control.js";
+import { MakerRisk, type MakerVoice } from "../bots/maker-risk.js";
+import { MakerSafety } from "../bots/maker-safety.js";
+import { MakerLedger, makerStatePath } from "../bots/maker-state.js";
 import { NoiseTaker } from "../bots/noise-taker.js";
 import { SeededRandom } from "../bots/rng.js";
 import type { Config } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
+import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
@@ -13,8 +18,51 @@ const MAKER_QUOTE_PER_POSITION_LIMIT = 4n;
 const SPOT_MAKER_BASE_PER_TAKER_BASE = 10n;
 /** The funding updater decides by its own clock whether an update is due; this is how often it looks. */
 const FUNDING_CHECK_AT_MOST_EVERY_MS = 5_000;
+/** The market whose price the reference sources give. */
+const REFERENCE_BASE_TOKEN = "SOL";
 
-const houseMaker = (config: Config, market: MarketConfig, sizes: BotSizes): HouseMaker =>
+export interface BotProblems {
+  onError(what: string, error: unknown): void;
+  onRecovered(what: string): void;
+}
+
+/** What the maker says to an operator goes to the log, as an event with no error behind it. */
+const makerVoice = (problems: BotProblems): MakerVoice => ({
+  alert: (message) => problems.onError(message, null),
+  notice: (message) => problems.onError(message, null),
+});
+
+/** The risk rules for one maker. They know the SOL price only, so they cover SOL perpetuals only. */
+const makerSafety = (
+  market: MarketConfig,
+  ledger: MakerLedger,
+  reference: ReferencePrice,
+  control: MakerControl,
+  problems: BotProblems,
+): MakerSafety => {
+  if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
+    throw new Error(
+      `HOUSE_MAKER_RISK_RULES cannot cover ${market.id}: the risk rules need a reference price, ` +
+        "and this service has one for SOL perpetuals only. Leave the market out of the deployment.",
+    );
+  }
+  const voice = makerVoice(problems);
+  return new MakerSafety({
+    reference,
+    risk: new MakerRisk(ledger, systemClock, market.id, voice),
+    control,
+    clock: systemClock,
+    voice,
+    market: market.id,
+  });
+};
+
+const houseMaker = (
+  config: Config,
+  market: MarketConfig,
+  sizes: BotSizes,
+  extras: { safety?: MakerSafety; ledger?: MakerLedger },
+): HouseMaker =>
   new HouseMaker({
     market: market.id,
     kind: market.kind,
@@ -32,6 +80,7 @@ const houseMaker = (config: Config, market: MarketConfig, sizes: BotSizes): Hous
     startingQuoteBalance: config.HOUSE_MAKER_POSITION_LIMIT_NUSD * MAKER_QUOTE_PER_POSITION_LIMIT,
     startingBaseBalance: config.NOISE_TAKER_STARTING_BASE * SPOT_MAKER_BASE_PER_TAKER_BASE,
     clock: systemClock,
+    ...extras,
   });
 
 const noiseTaker = (
@@ -56,9 +105,11 @@ const noiseTaker = (
     random,
   });
 
-export interface BotProblems {
-  onError(what: string, error: unknown): void;
-  onRecovered(what: string): void;
+export interface OpenedBots {
+  /** Starts every bot's loop. */
+  start(): Repeating[];
+  /** Takes every maker's quotes off the venue. Call it once the loops have stopped. */
+  withdrawQuotes(): Promise<void>;
 }
 
 /**
@@ -72,14 +123,24 @@ export const openBots = async (
   config: Config,
   wiring: VenueWiring,
   problems: BotProblems,
-): Promise<() => Repeating[]> => {
+): Promise<OpenedBots> => {
   const { venue, botVenue, botMarkets } = wiring;
   const random = new SeededRandom(config.NOISE_TAKER_SEED);
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
+  const rules = config.HOUSE_MAKER_RISK_RULES;
+  const reference = rules ? new ReferencePrice(referenceSources(systemClock), systemClock) : null;
+  const control = new MakerControl(controlPath(config.DATA_DIR));
   for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
-    const maker = houseMaker(config, market, sizes);
+    // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.
+    const ledger =
+      rules || config.VENUE === "rollup"
+        ? await MakerLedger.open(makerStatePath(config.DATA_DIR, market.id))
+        : undefined;
+    const safety =
+      reference && ledger ? makerSafety(market, ledger, reference, control, problems) : undefined;
+    const maker = houseMaker(config, market, sizes, { safety, ledger });
     await maker.ensureOpen(botVenue);
     makers.push(maker);
     if (config.NOISE_TAKERS_ENABLED) takers.push(noiseTaker(config, market, sizes, random));
@@ -105,7 +166,7 @@ export const openBots = async (
       (error) => problems.onError(what, error),
       () => problems.onRecovered(what),
     );
-  return () => {
+  const start = (): Repeating[] => {
     const loops = [
       ...makers.map((maker, at) =>
         loop(`${botMarkets[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
@@ -136,4 +197,16 @@ export const openBots = async (
     }
     return loops;
   };
+  const withdrawQuotes = async (): Promise<void> => {
+    const withdrawn = await Promise.allSettled(makers.map((maker) => maker.withdraw(botVenue)));
+    withdrawn.forEach((result, at) => {
+      if (result.status === "rejected") {
+        problems.onError(
+          `${botMarkets[at].id} maker could not cancel its quotes; they expire by themselves`,
+          result.reason,
+        );
+      }
+    });
+  };
+  return { start, withdrawQuotes };
 };

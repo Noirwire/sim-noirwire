@@ -36,6 +36,12 @@ export interface NewOrder {
   price?: bigint;
   size: bigint;
   reduceOnly?: boolean;
+  /**
+   * How long a resting remainder stays valid after it is placed, in seconds.
+   * A venue with order expiry makes it void then by itself; the in-memory
+   * venue leaves orders resting until they are cancelled.
+   */
+  expiresInSeconds?: number;
 }
 
 export type OrderStatus = "open" | "filled" | "partiallyFilled" | "cancelled" | "rejected";

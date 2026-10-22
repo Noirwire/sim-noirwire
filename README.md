@@ -110,7 +110,7 @@ start when a required one is missing or a key is not the one the deployment name
 
 | Variable                                                                 | Required | What it is                                                                               |
 | ------------------------------------------------------------------------ | -------- | ---------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start: the service stops if it is mainnet                        |
+| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`     |
 | `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                |
 | `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`              |
 | `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own        |
@@ -120,11 +120,81 @@ start when a required one is missing or a key is not the one the deployment name
 | `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
 | `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)  |
 | `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                        |
-| `ROLLUP_QUOTE_EXPIRY_SECONDS`                                            | no       | How long a resting bot quote stays valid by itself (180 s)                               |
+| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)          |
 | `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
 | `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                              |
 | `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
+
+### Mainnet mode
+
+`NETWORK=mainnet` runs only what a live market needs: the house maker, the gate and the
+read-only market data API. It never starts a faucet, noise takers, the test liquidator, a
+price publisher or the test endpoints, and it stops at start-up, naming everything wrong
+at once, if any of them is configured. No other `NETWORK` value changes behaviour: it stays
+a label, and a service whose `SOLANA_RPC_URL` is mainnet but whose `NETWORK` is not
+`mainnet` still refuses to start.
+
+What mainnet requires (the service says which is missing):
+
+- `VENUE=rollup`, and a Solana at `SOLANA_RPC_URL` whose genesis hash is mainnet's.
+- Everything secret or definitive comes from a mounted file, never an environment
+  variable's content: `GATE_SECRET_KEY_FILE`, `BOT_TRADER_SEEDS_FILE` (hex seeds, one per
+  line or comma separated) and `DEPLOYMENT_PATH`. `GATE_SECRET_KEY`, `BOT_TRADER_SEEDS` and
+  `DEPLOYMENT_JSON` are refused.
+- The deployment description must be a mainnet one: `network` is `mainnet`, no faucet, and
+  the quote token is the real USDC mint.
+- `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL` and `PUBLIC_ROLLUP_WS_URL`, different
+  from the private three and carrying no user name, password or query string. These are the
+  only addresses `GET /v1/deployment` serves; the private ones may hold an API key and are
+  never served. They are also hidden from every logged or served error text.
+- `TRUSTED_PROXY_HOPS`: how many reverse proxies sit in front (`0` if none), so the
+  per-IP limits see the caller and not the proxy.
+- An empty `DATA_DIR`, or one a mainnet run saved: a snapshot from another network is
+  refused.
+
+While it runs: the service is never put to sleep (the maker quotes whether or not anyone is
+watching); `/v1/fund/*` and `/v1/dev/*` answer 404; markets, tape and candles carry
+`simulated: false` and the quote is `USDC`; each address is limited to
+`PUBLIC_RATE_LIMIT_PER_MINUTE` requests a minute (429 with `retry-after`) and
+`PUBLIC_SOCKETS_PER_IP` open stream sockets; and `GET /v1/health` is the container's
+health probe (the image's `HEALTHCHECK` already calls it).
+
+#### The maker's risk rules
+
+On mainnet the house maker always follows its risk rules (`HOUSE_MAKER_RISK_RULES=1`, which
+elsewhere is off by default and on mainnet cannot be set to 0):
+
+- **Quotes expire.** Every resting order carries the program's own expiry, the requote
+  interval plus 10 s, so a maker that dies leaves no quote standing for longer than that.
+  A stop of the service cancels its quotes first.
+- **A reference price.** It quotes around the median of Pyth's latest price (Hermes) and
+  the public tickers of Coinbase, Kraken and OKX, not around the NoirWire mark. It needs the
+  oracle and at least two exchanges, none older than 10 s, within 30 bps of each other; else
+  it pulls its quotes and, once the prices are back, watches them for 10 s before quoting.
+- **Widen and pull.** The half-spread is at least 15 bps and grows by half the price range
+  of the last minute. A NoirWire mark more than 10 bps behind the reference widens it by
+  the gap; more than 100 bps behind, or a move of more than 0.5% in 10 s, pulls the quotes
+  until it settles.
+- **Sizes.** Every level holds `ROLLUP_MAKER_LEVEL_NUSD`. Unset on mainnet, the sizes are
+  3 levels of 50 nUSD, a position limit of 250 nUSD, a requote at 6 bps or every 10 s.
+  Larger than 500 nUSD a level, 250 nUSD of position, a 15 bps floor or a 30 s requote
+  interval stops the start.
+- **Loss limits.** Losing 3% of the equity the UTC day started with, or 5% from the peak,
+  stops it growing: it keeps quoting only the side that shrinks its position, and logs a
+  line that starts with `ALERT`. The state is kept in `DATA_DIR`, so a restart does not
+  reset it, and only an operator ends it.
+- **Kill switch.** `npm run kill-switch -- reduce | stop | resume` (or `node
+dist/kill-switch.js ...` in the container) writes a request into `DATA_DIR` that the
+  maker follows within a second. `reduce` cancels the quotes that would grow the position
+  and keeps the reducing side; `stop` cancels everything; `resume` starts again with the
+  loss limits counting from the equity then.
+- **Errors it does not understand.** While sending orders, any failure other than the
+  rollup being away stops the maker for good (an `ALERT` line, quotes cancelled) until an
+  operator resumes it. A failed cancel is tried again on the next tick.
+
+The risk rules cover SOL perpetuals only; the service refuses to start the maker on any
+other market with them on.
 
 ### Awake and asleep
 
@@ -185,7 +255,7 @@ ones:
 | `PORT`, `HOST`                                  | `4100`, `0.0.0.0`       | Where the HTTP server listens                                                        |
 | `VENUE`                                         | `memory`                | `memory` (in-process engine) or `rollup` (the on-chain program, see above)           |
 | `DEV_TRADING`                                   | `0`                     | Set to `1` to register the `/v1/dev/*` routes. Only takes effect with `VENUE=memory` |
-| `NETWORK`                                       | `devnet`                | The label every response carries                                                     |
+| `NETWORK`                                       | `devnet`                | The label every response carries; `mainnet` switches on the mainnet mode (above)     |
 | `ALLOWED_ORIGINS`                               | `http://localhost:3000` | Comma-separated CORS allow-list                                                      |
 | `DATA_DIR`                                      | `./data`                | Where candles and fund grants are snapshotted                                        |
 | `FUND_AMOUNT_NUSD`                              | `5000`                  | One-time grant size                                                                  |
@@ -209,13 +279,15 @@ a float, never a raw `bigint`), scaled from the engine's internal fixed-point in
 | `GET /candles?market=&interval=1m\|5m\|15m\|1h&limit=`   | OHLCV candles                                                                                                                                                                                                                                                                                                                |
 | `GET /stats`                                             | Orders, fills, volume (user and bot counted separately), traders, latency (median, p99, sample size, where measured), updated at. With `VENUE=rollup` also `botOrdersOutcomeUnknown`: bot orders whose outcome was not known in time, and how many of them settled as executed late or as expired                            |
 | `POST /fund` `{ address }`                               | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP                                                                                                                                                                                                                                     |
-| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                                                                                         |
+| `POST /fund/prepare`, `POST /fund/submit`                | `VENUE=rollup` only, not on mainnet. The same grant in two steps, signed by the user (see "Run on the real program")                                                                                                                                                                                                         |
 | `WS /stream?market=`                                     | `price`, `fill`, `candle`, `stats` messages for one market (`stats` goes to every subscriber)                                                                                                                                                                                                                                |
 | `POST /dev/orders`, `/dev/cancel-all`, `GET /dev/trader` | Trade against `MemoryVenue` directly. Only registered when `VENUE=memory` and `DEV_TRADING=1`                                                                                                                                                                                                                                |
 
 ## How numbers are labelled
 
-- Every market, tape, candle and stats response carries `network` and `simulated: true`.
+- Every market, tape, candle and stats response carries `network`, and the market, tape and
+  candle responses carry `simulated`: `true`, except on `NETWORK=mainnet`, where the data is
+  live and it is `false`.
 - Bot volume, bot orders and bot fills are counted in their own bucket, never merged with a
   user's. The house maker and noise takers trade as `bot:maker:<market>`, `bot:taker:<n>`
   and `bot:liquidator`; a fill never carries a trader identity at all (only two opaque

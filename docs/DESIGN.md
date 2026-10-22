@@ -119,7 +119,7 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
   balance, never above it, so a restart does not pay them twice. On a deployment without
   a faucet nothing is deposited: a bot counts as funded once it holds any collateral, and
   start-up waits, naming the owner key, until the operator has deposited some. Every
-  resting quote carries an expiry of its own (`ROLLUP_QUOTE_EXPIRY_SECONDS`, 180). A
+  resting quote carries an expiry of its own, the maker's requote interval plus 10 s. A
   resting quote the program refuses is logged by its error number and name with the
   seat's owner key (`MakerNotListed`, 6091, also names `set_seat_access`, which the
   exchange admin lists the seat with): once, then once a minute, until one goes through.
@@ -202,11 +202,12 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
   or could not be reached, stops the desk being asked for 5 s. A submit for a transaction
   `prepare` made is not turned away by the per-IP limit that `prepare` paid.
 - **A rollup that refuses.** The HTTP API starts before the rollup is reached. The
-  start-up work (mainnet check, reading the markets, the first read of the public
+  start-up work (network check, reading the markets, the first read of the public
   accounts, opening and funding the bots) is retried after 5 s, doubling to 5 minutes;
   every step of it is safe to repeat. Until it is done `/v1/markets`, `/v1/deployment` and
   the fund routes answer 503 and `/v1/health` answers 503 with the reason; tape, candles
-  and stats come from the snapshot. Only a mainnet `SOLANA_RPC_URL` ends the process. The
+  and stats come from the snapshot. Only a `SOLANA_RPC_URL` on the wrong network ends the process: mainnet without
+  `NETWORK=mainnet`, or `NETWORK=mainnet` on anything but mainnet (`NetworkMismatch`). The
   rollup websocket waits 5 s before its first reconnect and twice as long after each
   refusal, up to 5 minutes (`backOffReconnects`), and a loop that fails repeatedly skips
   turns, at most 30 s apart. A failing thing is logged when it starts failing, as a

@@ -258,6 +258,61 @@ day. To raise it, the exchange's admin sends `update_exchange` with a larger
 and never used can be closed by the admin with `close_unused_trader`. The load test keeps
 its traders in `data/loadtest-traders.json` and reuses them for this reason.
 
+## Running on mainnet
+
+`NETWORK=mainnet` is a separate mode, not a bigger devnet: it runs the house maker, the
+gate and the read-only market data, and refuses to start anything else (see "Mainnet mode"
+in the README). It is for a dedicated host that mounts its secrets as files; the Railway
+steps above do not apply to it. The files and variables it takes, and what each holds:
+
+| Name                                                                     | What it is                                                                                                                                                |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DEPLOYMENT_PATH`                                                        | The mainnet description: `network` `mainnet`, the real USDC mint, no faucet                                                                               |
+| `GATE_SECRET_KEY_FILE`                                                   | The gate keypair file (64-byte JSON array): must be the gate the description names                                                                        |
+| `BOT_TRADER_SEEDS_FILE`                                                  | The maker's seed in hex. It is the maker's seat: back it up offline, never rotate it casually, since a new seed is a new seat and strands the old balance |
+| `SOLANA_RPC_URL`, `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                      | Private endpoints, which may carry an API key. Never served and never logged                                                                              |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | What browsers are told. Separate from the private ones, no key in them                                                                                    |
+| `TRUSTED_PROXY_HOPS`                                                     | Reverse proxies in front of the service (`0` for none)                                                                                                    |
+| `ALLOWED_ORIGINS`                                                        | The production terminal's origin only                                                                                                                     |
+
+Do not set the faucet, noise taker, liquidator, oracle or `DEV_TRADING` variables, nor an
+inline `GATE_SECRET_KEY`, `BOT_TRADER_SEEDS` or `DEPLOYMENT_JSON`: the service refuses to
+start and lists each one. It checks Solana's genesis hash against `NETWORK` before it sends
+anything, and a `DATA_DIR` that holds a snapshot from another network.
+
+Check it with `GET /v1/health` (the container probe): 200 once the maker is open and its
+seat funded and, as the service is never put to sleep on mainnet, the chain is connected
+and the mark is fresh; 503 with a `reason` otherwise.
+
+### The maker on mainnet: risk rules, alerts, kill switch
+
+The maker follows its risk rules (README, "The maker's risk rules"). What an operator needs:
+
+- **The host's clock must be right** (NTP running). Quote expiries are set against the
+  host's clock, and a price source more than 10 s from it is not believed.
+- **Alerts are log lines** that start with `sim-noirwire: ALERT`. One means the maker has
+  stopped growing its position (a loss limit or the kill switch) or has stopped quoting
+  (an error it does not understand), and it stays that way until it is resumed. Watch the
+  log for the word `ALERT`. Lines saying it `pulled its quotes` are not alerts: the price
+  sources disagreed, a price was old, or the market moved fast, and it quotes again by
+  itself after 10 quiet seconds.
+- **The kill switch** is a command on the machine the service runs on, with the service's
+  `DATA_DIR`: `docker exec <container> node dist/kill-switch.js reduce`, or `stop`, or
+  `resume`. It writes a small file the maker reads every second, so it works while the API
+  is busy, needs no network and no key, and a restart keeps what it set. Check the log
+  for the line that says the maker followed it.
+- **Resuming** after a loss limit: check the position, the market and the seat's equity
+  first. `resume` makes the loss limits count from the equity then, so it accepts the loss
+  that stopped the maker.
+- **Files in `DATA_DIR`:** `maker-NSOL-PERP.json` (mode, the equity the limits count from)
+  and `maker-control.json` (the last kill switch request). If the first cannot be read, the
+  service stops at start and says so: fix or move it away on purpose, since starting
+  without it would forget the limits.
+- **Outbound addresses the maker needs** (public, no key): `hermes.pyth.network`,
+  `api.exchange.coinbase.com`, `api.kraken.com` and `www.okx.com`, on port 443. With one of
+  them blocked the maker keeps quoting on the rest as long as Pyth and two exchanges
+  answer; with Pyth blocked, or two of the exchanges, it pulls its quotes.
+
 ## Do not change
 
 Keep it at one replica, and never run a second copy with the same keys. Two processes

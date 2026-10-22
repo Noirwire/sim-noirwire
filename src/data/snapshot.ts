@@ -4,6 +4,8 @@ import type { CandleSnapshotEntry } from "./candles.js";
 
 export interface SnapshotData {
   savedAtMs: number;
+  /** The NETWORK it was saved on: mainnet refuses a snapshot from any other. */
+  network?: string;
   candles: CandleSnapshotEntry[];
   fundedAddresses: string[];
   /** Per market, the last on-chain fill sequence already recorded into the candles. */

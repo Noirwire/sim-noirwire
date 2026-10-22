@@ -372,16 +372,14 @@ const sideTotal = (orders: NewOrder[], side: NewOrder["side"]): bigint =>
 describe("a house maker's ladder under the venue's position cap", () => {
   const ladder = { mark: dollars(106.603), tickSize: dollars(0.01), positionLimit: dollars(500) };
 
-  it("stops each side at the cap, trimming the last level that fits to the room left", () => {
-    const orders = ladderOrders(SHAPE, { ...ladder, position: 0n, positionCap: dollars(22.222) });
+  it("holds every level to the same size and stops each side at the last whole level under the cap", () => {
+    const orders = ladderOrders(SHAPE, { ...ladder, position: 0n, positionCap: dollars(10) });
 
-    expect(sideTotal(orders, "buy")).toBe(dollars(22.222));
-    expect(sideTotal(orders, "sell")).toBe(dollars(22.222));
     expect(orders.filter((order) => order.side === "buy").map((order) => order.size)).toEqual([
       dollars(3.75),
-      dollars(7.5),
-      dollars(10.972),
+      dollars(3.75),
     ]);
+    expect(sideTotal(orders, "sell")).toBe(dollars(7.5));
   });
 
   it("counts a position on a side against that side's room only", () => {
@@ -391,16 +389,16 @@ describe("a house maker's ladder under the venue's position cap", () => {
       positionCap: dollars(22.222),
     });
 
-    expect(sideTotal(orders, "buy")).toBeLessThanOrEqual(dollars(12.222));
-    expect(sideTotal(orders, "sell")).toBe(dollars(22.222));
+    expect(sideTotal(orders, "buy")).toBe(dollars(11.25));
+    expect(sideTotal(orders, "sell")).toBe(dollars(18.75));
   });
 
-  it("leaves out a remainder smaller than a first level, and quotes the whole ladder with no cap", () => {
+  it("leaves out a remainder smaller than a level, and quotes the whole ladder with no cap", () => {
     const tight = ladderOrders(SHAPE, { ...ladder, position: 0n, positionCap: dollars(5) });
     expect(tight.map((order) => order.size)).toEqual([dollars(3.75), dollars(3.75)]);
 
     const uncapped = ladderOrders(SHAPE, { ...ladder, position: 0n });
-    expect(sideTotal(uncapped, "buy")).toBe(dollars(3.75 * 15));
+    expect(sideTotal(uncapped, "buy")).toBe(dollars(3.75 * 5));
   });
 });
 
@@ -468,6 +466,6 @@ describe("a house maker on a venue that would refuse its quotes", () => {
     delete market.quotesRefusedBecause;
     await maker.tick(venue);
 
-    expect(sent).toEqual({ cancels: 1, orders: 6 });
+    expect(sent).toEqual({ cancels: 1, orders: 10 });
   });
 });

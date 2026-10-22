@@ -1,3 +1,4 @@
+import { type Config, isMainnet } from "../config/config.js";
 import type { ChainMarket, PublicAddresses } from "./chain-types.js";
 import type { Deployment } from "./settings.js";
 
@@ -44,6 +45,34 @@ export interface BrowserUrls {
   rollupRpcUrl: string;
   rollupWsUrl: string;
 }
+
+/**
+ * The addresses a browser is told. Off mainnet they default to the service's
+ * own. On mainnet those may carry an API key, so only the PUBLIC_ addresses
+ * are ever used and a missing one is an error, never a fallback.
+ */
+export const browserUrlsFor = (
+  config: Pick<
+    Config,
+    "NETWORK" | "PUBLIC_SOLANA_RPC_URL" | "PUBLIC_ROLLUP_RPC_URL" | "PUBLIC_ROLLUP_WS_URL"
+  >,
+  own: BrowserUrls,
+): BrowserUrls => {
+  const pick = (name: string, configured: string | undefined, fallback: string): string => {
+    if (configured) return configured;
+    if (isMainnet(config)) {
+      throw new Error(
+        `${name} is not set, and on mainnet the service never tells browsers its private address. Set ${name}.`,
+      );
+    }
+    return fallback;
+  };
+  return {
+    solanaRpcUrl: pick("PUBLIC_SOLANA_RPC_URL", config.PUBLIC_SOLANA_RPC_URL, own.solanaRpcUrl),
+    rollupRpcUrl: pick("PUBLIC_ROLLUP_RPC_URL", config.PUBLIC_ROLLUP_RPC_URL, own.rollupRpcUrl),
+    rollupWsUrl: pick("PUBLIC_ROLLUP_WS_URL", config.PUBLIC_ROLLUP_WS_URL, own.rollupWsUrl),
+  };
+};
 
 /**
  * Built field by field from what is public: nothing of the deployment

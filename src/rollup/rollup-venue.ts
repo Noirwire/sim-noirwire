@@ -82,7 +82,6 @@ export interface RollupVenueOptions {
   settings: RollupSettings;
   markets: readonly MarketConfig[];
   bots: BotSpec[];
-  quoteExpirySeconds: number;
   /** Per market, the last fill sequence an earlier run already recorded. */
   recordedThrough: Record<MarketId, number>;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
@@ -383,6 +382,15 @@ export class RollupVenue implements Venue {
     const secret = newOrderSecret();
     this.secrets.add(order.market, trader, secret);
     const rests = order.type === "limit" || order.type === "postOnly";
+    const restsWithoutExpiry = rests && !order.reduceOnly && order.expiresInSeconds === undefined;
+    if (restsWithoutExpiry) {
+      return rejectedOrder(
+        orderId,
+        NO_TAG,
+        order,
+        "a resting order needs an expiry of its own, so it cannot outlive the bot that placed it",
+      );
+    }
     let outcome: PlaceOutcome;
     let owner = "";
     try {
@@ -396,8 +404,8 @@ export class RollupVenue implements Venue {
           reduceOnly: order.reduceOnly ?? false,
           secret,
           restingExpirySeconds:
-            rests && !order.reduceOnly
-              ? Math.floor(Date.now() / MS_PER_SECOND) + this.options.quoteExpirySeconds
+            rests && !order.reduceOnly && order.expiresInSeconds !== undefined
+              ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
               : undefined,
         });
       });
