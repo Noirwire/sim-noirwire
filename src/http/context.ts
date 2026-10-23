@@ -44,4 +44,6 @@ export interface AppContext extends Partial<RollupRoutes> {
   activity: Activity;
   /** VENUE=rollup only: the one-time work that has to finish before the service is useful. */
   startUp?: Pick<StartUp, "ready" | "problem">;
+  /** Whether the makers are quoting under a working hedge; absent until the bots are open. */
+  trading?: () => { ready: boolean; reason?: string };
 }

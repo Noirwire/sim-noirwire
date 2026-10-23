@@ -26,6 +26,7 @@ interface Setup {
   setWakeHeld: (held: boolean) => void;
   releaseWake: () => void;
   readiness: Readiness;
+  trading: { ready: boolean; reason?: string };
   startUp: { ready: boolean; problem: string | null };
   venue: Venue;
 }
@@ -66,6 +67,7 @@ const serviceOn = async (
     setWakeHeld: (value) => (held = value),
     releaseWake: () => release(),
     readiness: { ...READY },
+    trading: { ready: true },
     startUp: { ready: true, problem: null },
     venue: over.venue ?? new MemoryVenue({ clock }),
   };
@@ -78,6 +80,7 @@ const serviceOn = async (
     fundLedger: new FundLedger({ perIpLimit: 20, perIpWindowMs: 60_000, clock }),
     hub: new Hub(),
     activity,
+    trading: () => setup.trading,
     ...(rollupShaped
       ? {
           readiness: () => setup.readiness,
@@ -248,6 +251,25 @@ describe("/v1/health", () => {
 
     setup.readiness = { ...READY };
     expect((await app?.inject({ url: "/v1/health" }))?.statusCode).toBe(200);
+  });
+
+  it("reports trading readiness apart from liveness, and never lets it change the status code", async () => {
+    const { setup, activity } = await serviceOn(true);
+    activity.touch();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    setup.trading = { ready: false, reason: "NSOL-PERP hedge is blind" };
+
+    const response = await app?.inject({ url: "/v1/health" });
+
+    expect(response?.statusCode).toBe(200);
+    expect(JSON.parse(response?.body ?? "{}")).toMatchObject({
+      ok: true,
+      trading: { ready: false, reason: "NSOL-PERP hedge is blind" },
+    });
+
+    setup.trading = { ready: true };
+    const recovered = JSON.parse((await app?.inject({ url: "/v1/health" }))?.body ?? "{}");
+    expect(recovered.trading).toEqual({ ready: true });
   });
 
   it("answers 503 with the reason while the start-up work is refused, asleep or not", async () => {

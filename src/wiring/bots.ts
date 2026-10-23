@@ -17,6 +17,7 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
 import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
+import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
 const MAKER_QUOTE_PER_POSITION_LIMIT = 4n;
@@ -157,9 +158,22 @@ const noiseTaker = (
     random,
   });
 
+/**
+ * Whether the makers are quoting under a working hedge. Not the same as the process being alive. A
+ * hedge that is only `lagging` counts as ready (the maker already quotes wider for it), and the
+ * liquidation keeper and the price crank are not covered: they run outside this process.
+ */
+export interface TradingReadiness {
+  ready: boolean;
+  /** What is wrong, in words, when it is not ready. */
+  reason?: string;
+}
+
 export interface OpenedBots {
   /** Starts every bot's loop. */
   start(): Repeating[];
+  /** Not ready while a maker is stopped or its hedge is blind. */
+  trading(): TradingReadiness;
   /** Takes every maker's quotes off the venue. Call it once the loops have stopped. */
   withdrawQuotes(): Promise<void>;
 }
@@ -182,6 +196,7 @@ export const openBots = async (
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
   const hedges: { market: string; controller: HedgeController }[] = [];
+  const ledgers: { market: string; ledger: MakerLedger }[] = [];
   const rules = config.HOUSE_MAKER_RISK_RULES;
   if (config.HEDGE_ENABLED && !rules) {
     throw new HedgeNotAvailable(
@@ -204,6 +219,7 @@ export const openBots = async (
       config.HEDGE_ENABLED && reference && ledger
         ? hedgeController(config, market, ledger, reference, botVenue, hedgeVenue, problems)
         : undefined;
+    if (ledger) ledgers.push({ market: market.id, ledger });
     if (hedge) hedges.push({ market: market.id, controller: hedge });
     const safety =
       reference && ledger
@@ -251,6 +267,10 @@ export const openBots = async (
         ),
       ),
     ];
+    if (ledgers.length > 0) {
+      const watch = new TradingWatch(trading, makerVoice(problems), systemClock);
+      loops.push(loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => watch.check()));
+    }
     if (liquidator) {
       loops.push(
         loop("liquidator tick", config.LIQUIDATOR_INTERVAL_MS, () =>
@@ -280,5 +300,21 @@ export const openBots = async (
       }
     });
   };
-  return { start, withdrawQuotes };
+  const trading = (): TradingReadiness => {
+    const problems = [
+      ...ledgers
+        .filter(({ ledger }) => ledger.state.mode === "stopped")
+        .map(({ market }) => `${market} maker is stopped`),
+      ...makers.flatMap((maker, at) =>
+        maker.quarantinedSinceMs === null
+          ? []
+          : [`${botMarkets[at].id} maker is held by an order of unknown outcome`],
+      ),
+      ...hedges
+        .filter(({ controller }) => controller.status() === "blind")
+        .map(({ market }) => `${market} hedge is blind`),
+    ];
+    return problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
+  };
+  return { start, trading, withdrawQuotes };
 };

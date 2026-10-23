@@ -93,6 +93,17 @@ export class OrderRefused extends Error {
   }
 }
 
+/** How long an order of unknown outcome that has no expiry of its own may still be dispatched late. */
+export const UNKNOWN_ORDER_QUARANTINE_MS = 60_000;
+
+/** An order may have been executed although the venue never said so: the maker sends nothing until it has looked. */
+export class OrderOutcomeUnknown extends Error {
+  constructor(market: MarketId, reason: string | undefined) {
+    super(`${market} order outcome unknown: ${reason || "no reason given"}`);
+    this.name = "OrderOutcomeUnknown";
+  }
+}
+
 /** A post-only order that would have taken from the book: the one refusal a quoting maker expects now and then. */
 const ROUTINE_REFUSAL = /would (match|cross)/;
 
@@ -260,12 +271,24 @@ export class HouseMaker {
   private standing = true;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
+  /**
+   * An order's outcome is unknown: no quote goes out until a cancel and a read of the seat have both
+   * worked and the unknown order can no longer be dispatched (`quarantineUntilMs`).
+   */
+  private unreconciled = false;
+  private unknownSinceMs = 0;
+  private quarantineUntilMs = 0;
   private readonly expiresInSeconds: number;
 
   constructor(private readonly options: HouseMakerOptions) {
     this.trader = makerTraderKey(options.market);
     this.expiresInSeconds =
       Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
+  }
+
+  /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
+  get quarantinedSinceMs(): number | null {
+    return this.unreconciled ? this.unknownSinceMs : null;
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
@@ -333,10 +356,28 @@ export class HouseMaker {
     if (!market || market.markPrice === null) return;
     const mark = market.markPrice;
     const { safety } = this.options;
+    // The risk rules and the operator's control run every tick, held or not.
     const plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
+    let held = false;
+    let heldProblem: unknown;
+    if (this.unreconciled) {
+      try {
+        held = !(await this.reconcile(venue));
+      } catch (error) {
+        held = true;
+        heldProblem = error;
+      }
+    }
     if (plan.action !== "quote") {
       this.lastQuoted = null;
       if (this.standing) await this.withdraw(venue);
+      if (heldProblem !== undefined) throw heldProblem;
+      return;
+    }
+    // A held maker places only what the risk rules dictate to shrink its position, never a new ladder.
+    if (held && !plan.reduceOnly && !plan.flatten) {
+      this.lastQuoted = null;
+      if (heldProblem !== undefined) throw heldProblem;
       return;
     }
     const refused = market.quotesRefusedBecause;
@@ -356,6 +397,8 @@ export class HouseMaker {
     const flagged = venueReducesOnly || next.flatten === true;
     this.standing = true;
     let leftOut = 0;
+    let unknownReason: string | undefined;
+    let sawUnknown = false;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) return;
@@ -365,6 +408,12 @@ export class HouseMaker {
           expiresInSeconds: this.expiresInSeconds,
         };
         const placed = await venue.placeOrder(this.trader, sent);
+        if (placed.outcomeUnknown) {
+          this.holdForUnknown(sent);
+          sawUnknown = true;
+          unknownReason = placed.reason;
+          break;
+        }
         if (!safety || placed.status !== "rejected") continue;
         if (!isRoutineRefusal(sent, placed.reason)) {
           throw new OrderRefused(this.options.market, placed.reason);
@@ -374,6 +423,11 @@ export class HouseMaker {
     } catch (error) {
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
+    }
+    if (sawUnknown) {
+      this.lastQuoted = null;
+      await this.withdraw(venue).catch(() => {});
+      throw new OrderOutcomeUnknown(this.options.market, unknownReason);
     }
 
     // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
@@ -385,6 +439,39 @@ export class HouseMaker {
     this.lastQuotedAtMs = now;
     safety?.requoteSucceeded();
     if (!next.reduceOnly) this.options.afterRequote?.();
+  }
+
+  /**
+   * Holds the maker until `order`, which may have been dispatched, can no longer rest or fill: its own
+   * expiry for a resting order, else `UNKNOWN_ORDER_QUARANTINE_MS`, counted from now.
+   */
+  private holdForUnknown(order: NewOrder): void {
+    const now = this.options.clock.nowMs();
+    if (!this.unreconciled) this.unknownSinceMs = now;
+    this.unreconciled = true;
+    const resting = order.type === "limit" || order.type === "postOnly";
+    const lastsMs =
+      resting && !order.reduceOnly && order.expiresInSeconds !== undefined
+        ? order.expiresInSeconds * 1_000
+        : UNKNOWN_ORDER_QUARANTINE_MS;
+    this.quarantineUntilMs = Math.max(this.quarantineUntilMs, now + lastsMs);
+  }
+
+  /**
+   * Takes the quotes off and reads the seat. The quarantine ends only when the seat shows no order and
+   * the unknown order's lifetime has passed, since a cancel and an empty seat do not stop a send that
+   * has not arrived yet. A failed cancel or read keeps it, and is thrown.
+   */
+  private async reconcile(venue: Venue): Promise<boolean> {
+    await venue.cancelAll(this.trader, this.options.market);
+    this.standing = false;
+    const seat = await venue.traderState(this.trader);
+    if (seat.openOrders.some((open) => open.market === this.options.market)) {
+      throw new OrderOutcomeUnknown(this.options.market, "orders still show after a cancel");
+    }
+    if (this.options.clock.nowMs() < this.quarantineUntilMs) return false;
+    this.unreconciled = false;
+    return true;
   }
 
   /** The seat's equity and position are what the risk rules judge the maker by. */

@@ -33,6 +33,7 @@ import {
 import { MARKETS } from "../src/engine/markets.js";
 import { placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
+import { TradingWatch } from "../src/wiring/trading-watch.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { dollars, makeVenue } from "./helpers.js";
 
@@ -168,6 +169,8 @@ class Book {
   /** The venue answers every order with a refusal, giving this reason. */
   rejecting: string | null = null;
   rejectedCount = 0;
+  /** The venue answers every order as rejected but possibly executed, giving this reason. */
+  unknownBecause: string | null = null;
   beforePlacing: (() => Promise<void>) | null = null;
   /** Why the market would refuse a resting order, and whether it still takes reduce-only ones. */
   refusedBecause: string | null = null;
@@ -184,6 +187,17 @@ class Book {
       placeOrder: async (_trader: string, order: NewOrder) => {
         await this.beforePlacing?.();
         if (this.failPlacing) throw this.failPlacing;
+        if (this.unknownBecause !== null) {
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: this.unknownBecause,
+            outcomeUnknown: true,
+          };
+        }
         if (this.rejecting !== null) {
           this.rejectedCount += 1;
           return {
@@ -245,6 +259,11 @@ const nearestBidBps = (orders: NewOrder[], reference = 150): number =>
     reference,
     pricesOf(orders, "buy").reduce((a, b) => (a > b ? a : b)),
   );
+
+const voiceOf = (said: { alerts: string[]; notices: string[] }) => ({
+  alert: (message: string) => said.alerts.push(message),
+  notice: (message: string) => said.notices.push(message),
+});
 
 /** One maker under the risk rules, its venue, its clock, and everything it said. */
 const rig = async (
@@ -1846,4 +1865,132 @@ describe("the maker's state file from before the flattening existed", () => {
     expect(ledger.state.mode).toBe("reduce");
     expect(ledger.state.flattenStartedAtMs).toBeNull();
   });
+});
+
+describe("an order whose outcome is unknown", () => {
+  it("holds the maker until the unknown order's own expiry has passed, though the cancel works and the seat is empty", async () => {
+    const { warmUp, book, tick, maker } = await rig("unknown-window");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+
+    book.unknownBecause = null;
+    await tick(5);
+    await tick(5);
+    expect(book.take()).toEqual([]);
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+
+    await tick(11);
+    expect(maker.quarantinedSinceMs).toBeNull();
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("still acts on a loss breach while held, flattening with reduce-only orders only", async () => {
+    const { warmUp, book, tick, ledger } = await rig("unknown-loss");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    book.equity = dollars(969);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("flatten");
+    const placed = book.take();
+    expect(placed.length).toBeGreaterThan(0);
+    expect(placed.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+
+  it("still acts on a loss breach while held and the reconcile keeps failing", async () => {
+    const { warmUp, book, tick, ledger } = await rig("unknown-loss-failing");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+    book.failCancelling = new Error("the venue is away");
+
+    book.equity = dollars(969);
+    await expect(tick(1)).rejects.toThrow("the venue is away");
+
+    expect(ledger.state.mode).toBe("flatten");
+  });
+
+  it("obeys a hard-stop command while held", async () => {
+    const { warmUp, book, tick, ledger, dir, clock, said } = await rig("unknown-kill");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts.some((line) => line.includes("the kill switch stopped it"))).toBe(true);
+    expect(book.take()).toEqual([]);
+  });
+
+  it("reaches the alert sink when the reconcile keeps failing", async () => {
+    const { warmUp, book, tick, maker, clock, said } = await rig("unknown-persistent");
+    const watch = new TradingWatch(
+      () =>
+        maker.quarantinedSinceMs === null
+          ? { ready: true }
+          : { ready: false, reason: "NSOL-PERP maker is held by an order of unknown outcome" },
+      voiceOf(said),
+      clock,
+    );
+    watch.check();
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    watch.check();
+    expect(said.alerts).toHaveLength(1);
+
+    book.unknownBecause = null;
+    book.failCancelling = new Error("the venue is away");
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await expect(tick(30)).rejects.toThrow("the venue is away");
+      watch.check();
+    }
+
+    expect(said.alerts.some((line) => line.includes("has not been ready for"))).toBe(true);
+  });
+
+  it.each([
+    ["a routine-looking", "post-only order would match"],
+    ["a non-routine", "the connection dropped"],
+  ])(
+    "takes the quotes off and holds the maker, whatever %s reason it carries",
+    async (_, reason) => {
+      const { warmUp, book, tick, ledger } = await rig(`unknown-${reason.length}`);
+      await warmUp();
+      book.take();
+      const cancelsBefore = book.cancels;
+      book.unknownBecause = reason;
+
+      await expect(tick(11)).rejects.toThrow("outcome unknown");
+
+      expect(book.cancels).toBeGreaterThan(cancelsBefore);
+      expect(ledger.state.mode).toBe("run");
+
+      book.unknownBecause = null;
+      book.failCancelling = new Error("the venue is away");
+      await expect(tick(11)).rejects.toThrow("the venue is away");
+      expect(book.take()).toEqual([]);
+
+      book.failCancelling = null;
+      await tick(11);
+      await tick(11);
+      expect(book.take().length).toBeGreaterThan(0);
+    },
+  );
 });

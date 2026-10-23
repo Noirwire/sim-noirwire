@@ -59,6 +59,12 @@ export interface PlaceResult {
   filledSize: bigint;
   remainingSize: bigint;
   reason?: string;
+  /**
+   * Set with a `rejected` status when the order may still have been executed: the
+   * rejection is this service's guess, not the venue's answer. A caller that
+   * needs the truth reconciles before it sends or cancels anything else.
+   */
+  outcomeUnknown?: true;
 }
 
 export interface Fill {
