@@ -1,6 +1,6 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   HouseMaker,
   type HouseMakerOptions,
@@ -1907,8 +1907,20 @@ describe("every order of a reduce-only plan carries the reduce-only flag", () =>
 });
 
 describe("a maker whose state cannot be saved fails closed", () => {
-  const breakWrites = (dir: string) =>
-    mkdir(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+  /** A directory where the state file goes: the temporary file is written, but the rename onto it fails. */
+  const breakWrites = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
+    await rm(makerStatePath(dir, PERP), { force: true });
+    await mkdir(makerStatePath(dir, PERP));
+  };
+  const repairWrites = (dir: string) => rm(makerStatePath(dir, PERP), { recursive: true });
+  const markerOf = (dir: string) => `${makerStatePath(dir, PERP)}.failed`;
+  /** A marker path that cannot be checked: a link that points at itself. */
+  const unreadableMarker = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
+    await rm(markerOf(dir), { recursive: true, force: true });
+    await symlink(basename(markerOf(dir)), markerOf(dir));
+  };
 
   it("cancels its quotes at once, and stays stopped on later ticks", async () => {
     const { warmUp, book, dir, tick, ledger } = await rig("persist-fails");
@@ -1935,7 +1947,7 @@ describe("a maker whose state cannot be saved fails closed", () => {
     await breakWrites(dir);
     book.equity = dollars(969);
     await expect(tick(11)).rejects.toThrow(StatePersistenceError);
-    await rm(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+    await repairWrites(dir);
 
     const restarted = await open();
     expect(restarted.ledger.state.mode).toBe("stopped");
@@ -1957,12 +1969,61 @@ describe("a maker whose state cannot be saved fails closed", () => {
     const { dir, ledger } = await rig("persist-marker-stays");
     await breakWrites(dir);
     await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
-    await rm(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+    await repairWrites(dir);
 
     await ledger.update({ mode: "reduce", reason: "other" });
 
     expect(ledger.state.mode).toBe("stopped");
     expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("stopped");
+  });
+
+  it("refuses to open while the marker cannot be checked", async () => {
+    const { dir } = await rig("marker-unreadable");
+    await unreadableMarker(dir);
+
+    await expect(MakerLedger.open(makerStatePath(dir, PERP))).rejects.toThrow("recovery marker");
+  });
+
+  it("refuses the start after the state and the marker both failed to write", async () => {
+    const { dir, ledger } = await rig("persist-both-fail");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await breakWrites(dir);
+    await mkdir(markerOf(dir));
+
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("ALERT"), expect.anything());
+    logged.mockRestore();
+    await unreadableMarker(dir);
+    await expect(MakerLedger.open(makerStatePath(dir, PERP))).rejects.toThrow("recovery marker");
+  });
+
+  it("stays stopped with a recovery-required reason when the marker cannot be removed, and runs the same resume again", async () => {
+    const { dir, ledger, clock } = await rig("persist-rm-fails");
+    const said: string[] = [];
+    const risk = new MakerRisk(ledger, clock, PERP, {
+      alert: (message) => said.push(message),
+      notice: (message) => said.push(message),
+    });
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    await rm(markerOf(dir));
+    await mkdir(markerOf(dir));
+    await writeFile(join(markerOf(dir), "stuck"), "");
+    const resume = { mode: "run", requestedAtMs: 5 } as const;
+
+    await expect(risk.follow(resume, dollars(1_000))).rejects.toThrow(StatePersistenceError);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.reason).toContain("recovery marker could not be removed");
+    expect(ledger.canRetryResume(5)).toBe(true);
+    await rm(markerOf(dir), { recursive: true });
+    await risk.follow(resume, dollars(1_000));
+    expect(ledger.state.mode).toBe("run");
+    expect(ledger.canRetryResume(5)).toBe(false);
+    expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("run");
   });
 
   it("does not keep a mode in memory that is not on disk", async () => {

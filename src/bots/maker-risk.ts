@@ -80,7 +80,9 @@ export class MakerRisk {
 
   /** Follows the operator's newest command, once. */
   async follow(command: ControlCommand | null, equity: bigint): Promise<void> {
-    if (!command || command.requestedAtMs <= this.ledger.state.lastCommandAtMs) return;
+    if (!command) return;
+    const retried = command.mode === "run" && this.ledger.canRetryResume(command.requestedAtMs);
+    if (command.requestedAtMs <= this.ledger.state.lastCommandAtMs && !retried) return;
     this.unknownErrorsInARow = 0;
     if (command.mode === "run") {
       const today = utcDay(this.clock.nowMs());

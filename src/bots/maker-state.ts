@@ -71,14 +71,28 @@ export class StatePersistenceError extends Error {
 export const writeAtomically = async (path: string, text: string): Promise<void> => {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
-  const file = await open(`${path}.tmp`, "w");
+  writes += 1;
+  const temporary = `${path}.${process.pid}.${writes}.tmp`;
   try {
-    await file.writeFile(text);
-    await file.sync();
-  } finally {
-    await file.close();
+    const file = await open(temporary, "w");
+    try {
+      await file.writeFile(text);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
   }
-  await rename(`${path}.tmp`, path);
+  await syncDirectory(directory);
+};
+
+/** Counts writes, so each one has a temporary file of its own. */
+let writes = 0;
+
+const syncDirectory = async (directory: string): Promise<void> => {
   const folder = await open(directory, "r");
   try {
     await folder.sync();
@@ -90,11 +104,23 @@ export const writeAtomically = async (path: string, text: string): Promise<void>
 /** Present while a state write has failed and an operator has not yet resumed the maker. */
 const failedMarkerPath = (statePath: string): string => `${statePath}.failed`;
 
-const exists = (path: string): Promise<boolean> =>
+/** Whether the marker stands. Any answer but "not there" means it cannot be known, and is thrown. */
+const markerStands = (path: string): Promise<boolean> =>
   access(path).then(
     () => true,
-    () => false,
+    (error: unknown) => {
+      if (isMissing(error)) return false;
+      throw new Error(
+        `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
+          "write failed before. Repair the state directory and inspect the state file, then start again.",
+        { cause: error },
+      );
+    },
   );
+
+const RECOVERY_REQUIRED =
+  "its resume was saved, but the recovery marker could not be removed. Run the kill switch " +
+  '"resume" again to finish the recovery';
 
 /** The file of one maker's state, in the data directory. */
 export const makerStatePath = (dataDir: string, market: string): string =>
@@ -113,8 +139,11 @@ export class MakerLedger {
     private recoveryRequired: boolean,
   ) {}
 
+  /** The timestamp of a resume whose write worked but whose marker removal failed. */
+  private resumeToRetry: number | null = null;
+
   static async open(path: string): Promise<MakerLedger> {
-    const interrupted = await exists(failedMarkerPath(path));
+    const interrupted = await markerStands(failedMarkerPath(path));
     let loaded: MakerState;
     try {
       const raw = JSON.parse(await readFile(path, "utf8"));
@@ -163,10 +192,6 @@ export class MakerLedger {
     });
     try {
       await writeAtomically(this.path, text);
-      if (this.recoveryRequired && resumes) {
-        await rm(failedMarkerPath(this.path), { force: true });
-        this.recoveryRequired = false;
-      }
     } catch (error) {
       this.current = {
         ...this.current,
@@ -183,6 +208,24 @@ export class MakerLedger {
       );
       throw new StatePersistenceError(this.path, error);
     }
+    if (this.recoveryRequired && resumes) {
+      const marker = failedMarkerPath(this.path);
+      try {
+        await rm(marker, { force: true });
+        await syncDirectory(dirname(marker));
+      } catch (error) {
+        this.current = { ...next, mode: "stopped", reason: RECOVERY_REQUIRED };
+        this.resumeToRetry = change.lastCommandAtMs ?? null;
+        throw new StatePersistenceError(marker, error);
+      }
+      this.recoveryRequired = false;
+      this.resumeToRetry = null;
+    }
     this.current = next;
+  }
+
+  /** Whether the operator's resume with this timestamp was saved but its recovery never finished, so it may be run again. */
+  canRetryResume(requestedAtMs: number): boolean {
+    return this.resumeToRetry === requestedAtMs;
   }
 }
