@@ -245,6 +245,11 @@ export class MakerSafety {
     return this.options.risk.stopFor(reason);
   }
 
+  /** Tells the operator something that needs a human. */
+  alert(message: string): void {
+    this.options.voice.alert(`ALERT ${this.options.market} maker: ${message}`);
+  }
+
   /** A requote went out in full: the unknown errors before it were not a run of them. */
   requoteSucceeded(): void {
     this.options.risk.requoteSucceeded();

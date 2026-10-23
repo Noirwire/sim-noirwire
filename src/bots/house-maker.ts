@@ -259,6 +259,8 @@ export class HouseMaker {
   private baseHeldAtStart = 0n;
   /** Whether quotes may be standing on the venue. */
   private standing = true;
+  /** Whether the operator has been told that a cancel is unconfirmed. */
+  private cancelAlerted = false;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
   private readonly expiresInSeconds: number;
@@ -288,6 +290,22 @@ export class HouseMaker {
     await venue.cancelAll(this.trader, this.options.market);
     // Only once the venue has taken them off: a cancel that failed is tried again on the next tick.
     this.standing = false;
+  }
+
+  /** `withdraw`, telling the operator once if the venue did not confirm the cancel. The error is thrown on. */
+  private async withdrawOrAlert(venue: Venue): Promise<void> {
+    try {
+      await this.withdraw(venue);
+      this.cancelAlerted = false;
+    } catch (error) {
+      if (!this.cancelAlerted) {
+        this.cancelAlerted = true;
+        this.options.safety?.alert(
+          `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). It tries again on every tick.`,
+        );
+      }
+      throw error;
+    }
   }
 
   private dueForRequote(next: Quoting, nowMs: number): boolean {
@@ -328,6 +346,10 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
+    if (this.options.ledger?.state.mode === "stopped" && this.standing) {
+      this.lastQuoted = null;
+      await this.withdrawOrAlert(venue);
+    }
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
     if (!market || market.markPrice === null) return;
@@ -338,12 +360,14 @@ export class HouseMaker {
       plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
     } catch (error) {
       // The mode could not be saved, so the ledger holds the hard stop in memory: take the quotes off now.
-      if (error instanceof StatePersistenceError) await this.withdraw(venue).catch(() => {});
+      if (error instanceof StatePersistenceError) {
+        await this.withdrawOrAlert(venue).catch(() => {});
+      }
       throw error;
     }
     if (plan.action !== "quote") {
       this.lastQuoted = null;
-      if (this.standing) await this.withdraw(venue);
+      if (this.standing) await this.withdrawOrAlert(venue);
       return;
     }
     const refused = market.quotesRefusedBecause;

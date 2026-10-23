@@ -373,6 +373,7 @@ describe("a maker whose cancel failed", () => {
       assess: async () => plan,
       stopFor: async () => {},
       requoteSucceeded: () => {},
+      alert: () => {},
     } as unknown as MakerSafety;
     const maker = makerOver({ safety });
     const venue = book.asVenue();

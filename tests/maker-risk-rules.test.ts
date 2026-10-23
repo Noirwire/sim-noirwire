@@ -174,6 +174,7 @@ class Book {
   takesReduceOnly = false;
   /** Like the venue: a reduce-only order is refused while the position is flat. */
   refusesReduceOnlyWhenFlat = false;
+  markMissing = false;
 
   asVenue(): Venue {
     return {
@@ -230,7 +231,7 @@ class Book {
       tickSize: dollars(0.01),
       lotSize: dollars(0.001),
       maxLeverage: 5,
-      markPrice: this.mark,
+      markPrice: this.markMissing ? null : this.mark,
       markPriceUpdatedAtMs: 0,
       change24h: null,
       volume24h: 0n,
@@ -1927,6 +1928,43 @@ describe("a maker whose state cannot be saved fails closed", () => {
     expect(ledger.state.mode).toBe("stopped");
   });
 
+  it("starts a restarted maker stopped, and only an explicit resume clears that", async () => {
+    const { warmUp, book, dir, clock, tick, open, venue } = await rig("persist-restart");
+    await warmUp();
+    book.take();
+    await breakWrites(dir);
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+    await rm(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+
+    const restarted = await open();
+    expect(restarted.ledger.state.mode).toBe("stopped");
+    book.equity = dollars(1_000);
+    clock.advance(30_000);
+    await restarted.maker.tick(venue);
+    expect(restarted.ledger.state.mode).toBe("stopped");
+    expect(book.orders).toHaveLength(0);
+
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    clock.advance(1_000);
+    await restarted.maker.tick(venue);
+    expect(restarted.ledger.state.mode).toBe("run");
+    const again = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(again.state.mode).toBe("run");
+  });
+
+  it("keeps the marker while only other changes are written", async () => {
+    const { dir, ledger } = await rig("persist-marker-stays");
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await rm(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+
+    await ledger.update({ mode: "reduce", reason: "other" });
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("stopped");
+  });
+
   it("does not keep a mode in memory that is not on disk", async () => {
     const { dir, ledger } = await rig("persist-memory");
     await breakWrites(dir);
@@ -1946,6 +1984,32 @@ describe("a maker whose state cannot be saved fails closed", () => {
 
     const reopened = await MakerLedger.open(makerStatePath(dir, PERP));
     expect(reopened.state.mode).toBe("reduce");
+  });
+});
+
+describe("a stopped maker keeps trying to cancel", () => {
+  it("retries a failed cancel on later ticks even when the mark is missing, and alerts once", async () => {
+    const { warmUp, book, dir, clock, tick, said } = await rig("stopped-cancel-retry");
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.failCancelling = new Error("the rollup did not answer");
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+    await expect(tick()).rejects.toThrow("did not answer");
+    book.markMissing = true;
+    await expect(tick()).rejects.toThrow("did not answer");
+
+    expect(book.cancels).toBe(cancelsBefore);
+    expect(said.alerts.filter((alert) => alert.includes("cancel was not confirmed"))).toHaveLength(
+      1,
+    );
+
+    book.failCancelling = null;
+    await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
   });
 });
 
