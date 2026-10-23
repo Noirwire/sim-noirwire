@@ -43,6 +43,8 @@ const fileSchema = z.object({
   peakEquity: amount,
   lastCommandAtMs: z.number(),
   spotBaseAtStart: amount,
+  /** Whether the saved stop was asked for. A file from before the field counts a saved stop as asked for. */
+  hardStop: z.boolean().optional(),
 });
 
 const FRESH: MakerState = {
@@ -184,9 +186,12 @@ export class MakerLedger {
   static async open(path: string): Promise<MakerLedger> {
     const marker = await readMarker(path);
     let loaded: MakerState;
+    let savedHardStop = false;
     try {
       const raw = JSON.parse(await readFile(path, "utf8"));
-      loaded = fileSchema.parse(raw);
+      const { hardStop, ...state } = fileSchema.parse(raw);
+      loaded = state;
+      savedHardStop = hardStop ?? state.mode === "stopped";
     } catch (error) {
       if (!isMissing(error)) {
         throw new Error(
@@ -221,8 +226,7 @@ export class MakerLedger {
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
     };
     const ledger = new MakerLedger(path, held, true, true);
-    // A stop that was saved is an intentional one; only a marker over a saved run or a missing file is a fault.
-    ledger.hardStopIntent = loaded.mode === "stopped";
+    ledger.hardStopIntent = savedHardStop;
     return ledger;
   }
 
@@ -253,10 +257,12 @@ export class MakerLedger {
     const next = { ...this.current, ...change };
     if (this.recoveryRequired && !resumes) next.mode = "stopped";
     // Set before the write: a hard stop whose save fails is still a decision to stop.
+    const intent = change.mode === undefined ? this.hardStopIntent : change.mode === "stopped";
     if (change.mode === "stopped") this.hardStopIntent = true;
     const { dayStartEquity, peakEquity, spotBaseAtStart } = next;
     const text = JSON.stringify({
       ...next,
+      hardStop: intent,
       dayStartEquity: dayStartEquity?.toString() ?? null,
       peakEquity: peakEquity?.toString() ?? null,
       spotBaseAtStart: spotBaseAtStart?.toString() ?? null,
@@ -292,7 +298,7 @@ export class MakerLedger {
       this.faulted = false;
     }
     if (change.mode === "stopped") this.faulted = false;
-    if (next.mode !== "stopped") this.hardStopIntent = false;
+    this.hardStopIntent = intent;
     this.current = next;
     if (this.recoveryRequired && change.lastCommandAtMs !== undefined && !resumes) {
       // A newer command is saved: a resume still waiting for its marker to go must not pass any more.
