@@ -54,9 +54,25 @@ export class FakeHedgeVenue implements HedgeVenue {
     return this.rulesNow;
   }
 
+  /** While set, the account endpoint keeps answering with this snapshot: it is behind the venue's own fills. */
+  private frozen: HedgeAccount | null = null;
+  /** Every cancel throws while this is set. */
+  cancelFails = false;
+  /** Stamps the fills; tests point it at their clock. */
+  now: () => number = () => 0;
+
+  /** The account endpoint stops showing new fills until `unfreezeAccount`. */
+  freezeAccount(): void {
+    this.frozen = { position: this.position, equity: this.equity };
+  }
+
+  unfreezeAccount(): void {
+    this.frozen = null;
+  }
+
   async account(): Promise<HedgeAccount> {
     this.reachable();
-    return { position: this.position, equity: this.equity };
+    return this.frozen ?? { position: this.position, equity: this.equity };
   }
 
   async placeIoc(order: HedgeOrder): Promise<HedgeAck> {
@@ -76,6 +92,7 @@ export class FakeHedgeVenue implements HedgeVenue {
 
   async cancel(clientId: string): Promise<void> {
     this.reachable();
+    if (this.cancelFails) throw new Error("the cancel did not go through");
     this.cancelled.push(clientId);
   }
 
@@ -103,7 +120,7 @@ export class FakeHedgeVenue implements HedgeVenue {
       side: order.side,
       size,
       price: order.limitPrice,
-      atMs: 0,
+      atMs: this.now(),
     });
   }
 }

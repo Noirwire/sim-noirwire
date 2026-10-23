@@ -385,6 +385,10 @@ interface (`src/hedge/hedge-venue.ts`) and no client for a real venue, so settin
   - Lagging: the maker quotes 10 bps wider.
   - Blind: the maker stops growing its position and quotes only the side that shrinks it, with an
     `ALERT` line. Both end by themselves once the venue confirms the hedge again.
+  - A flat maker has no side that shrinks its position, so while the hedge is blind it quotes
+    nothing at all. That includes startup: with the hedge enabled, the maker quotes nothing until
+    the hedge venue has answered once. This is an intended fail-safe, not a fault. To run the
+    maker without the hedge, unset `HEDGE_ENABLED` (or set it to `0`) and restart.
 - **The kill switch covers the hedge.** At the soft stop, and while the maker flattens, the
   controller opens no new hedge exposure and only shrinks the hedge as the maker's position
   shrinks. At the hard stop it trades nothing and logs an `ALERT` that the hedge position is

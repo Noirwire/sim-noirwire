@@ -12,6 +12,7 @@ const MARKET = "NSOL-PERP";
 const rig = () => {
   const clock = new ManualClock(START_MS);
   const venue = new FakeHedgeVenue();
+  venue.now = () => clock.nowMs();
   const said = { alerts: [] as string[], notices: [] as string[] };
   const state = {
     maker: 0n,
@@ -116,6 +117,43 @@ describe("the hedge controller", () => {
       expect(venue.position).toBe(dollars(-1));
     });
 
+    it("sends no second order when the reply was lost, the cancel failed and the account read stays stale", async () => {
+      const { venue, state, said, controller, tick } = rig();
+      venue.script({ lost: true });
+      venue.cancelFails = true;
+      venue.freezeAccount();
+      state.maker = dollars(1);
+
+      await tick();
+      for (let i = 0; i < 5; i += 1) await tick(15);
+      expect(venue.placed).toHaveLength(1);
+      expect(venue.position).toBe(dollars(-1));
+      expect(said.alerts.filter((line) => line.includes("could not be cancelled"))).toHaveLength(1);
+
+      venue.unfreezeAccount();
+      await tick();
+      expect(controller.hedgedPosition).toBe(dollars(-1));
+      await tick(15);
+      expect(venue.placed).toHaveLength(1);
+    });
+
+    it("holds while a cancel keeps failing, and resends once an order that did not fill is cancelled", async () => {
+      const { venue, state, tick } = rig();
+      venue.script({ lost: true, fill: 0n });
+      venue.cancelFails = true;
+      state.maker = dollars(1);
+
+      await tick();
+      await tick(15);
+      await tick(15);
+      expect(venue.placed).toHaveLength(1);
+
+      venue.cancelFails = false;
+      await tick(1);
+      expect(venue.placed).toHaveLength(2);
+      expect(venue.position).toBe(dollars(-1));
+    });
+
     it("does not send a second order while an accepted one has not shown in the position", async () => {
       const { venue, state, controller, tick } = rig();
       venue.script({ delayed: true });
@@ -215,6 +253,45 @@ describe("the hedge controller", () => {
       await tick(30);
       await tick(30);
       expect(controller.status()).toBe("lagging");
+    });
+
+    it("stays ok with exposure between the trigger and the soft limit while every order is held", async () => {
+      const { venue, state, controller, tick } = rig();
+      venue.rulesNow = { ...venue.rulesNow, minOrderNotional: dollars(1_000) };
+      await tick();
+      state.maker = dollars(0.5);
+
+      for (let i = 0; i < 5; i += 1) await tick(30);
+
+      expect(venue.placed).toHaveLength(0);
+      expect(controller.status()).toBe("ok");
+    });
+
+    it("still lags when the exposure is above the soft limit and nothing confirms it", async () => {
+      const { venue, state, controller, tick } = rig();
+      venue.rulesNow = { ...venue.rulesNow, minOrderNotional: dollars(1_000) };
+      await tick();
+      state.maker = dollars(0.8);
+
+      await tick(30);
+      await tick(30);
+
+      expect(controller.status()).toBe("lagging");
+    });
+
+    it("treats the last price as missing once it is too old", async () => {
+      const { venue, state, controller, tick } = rig();
+      await tick();
+      venue.script({ reject: "no liquidity" });
+      state.maker = dollars(0.5);
+      await tick();
+      state.reference = { ok: false, reason: "the sources went dark" };
+
+      await tick(5);
+      expect(controller.status()).toBe("ok");
+
+      await tick(10);
+      expect(controller.status()).toBe("blind");
     });
 
     it("sends nothing and lags when the reference price is not trusted", async () => {

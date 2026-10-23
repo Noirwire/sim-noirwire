@@ -437,6 +437,11 @@ settings, all optional:
 - `HEDGE_MAX_LEVERAGE` (3): the hedge position never grows past the hedge account's margin
   times this.
 
+A blind hedge takes a flat maker fully dark: with no position there is no side that shrinks it,
+so it quotes nothing. The same holds at startup, before the hedge venue has answered once. This
+is an intended fail-safe. To start the maker without the hedge, unset `HEDGE_ENABLED` (or set it
+to `0`) and restart the service.
+
 What an operator sees: a line that says the maker's hedge is blind starts with `ALERT`; lines
 about a lagging hedge, a venue that cannot be reached or answers again, a refused order or an
 order of unknown outcome are notices. The kill switch covers the hedge: at the soft stop it

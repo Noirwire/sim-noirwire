@@ -1,3 +1,4 @@
+import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import type { MakerVoice } from "../bots/maker-risk.js";
 import type { MakerMode } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
@@ -34,6 +35,15 @@ export interface HedgeControllerOptions {
   settings: HedgeSettings;
 }
 
+/** An order whose outcome the controller does not know yet: it is never followed by a new order. */
+interface UnexplainedOrder {
+  clientId: string;
+  sentAtMs: number;
+  positionBefore: bigint;
+  cancelled: boolean;
+  alerted: boolean;
+}
+
 const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
 
 /**
@@ -54,6 +64,8 @@ export class HedgeController implements HedgeGate {
   private position: bigint | null = null;
   private unhedged = 0n;
   private lastPrice: bigint | null = null;
+  private lastPriceAtMs = 0;
+  private unexplained: UnexplainedOrder | null = null;
   private reachable = false;
   private lastReadAtMs: number | null = null;
   private confirmedAtMs: number | null = null;
@@ -101,10 +113,14 @@ export class HedgeController implements HedgeGate {
       return;
     }
     this.unmanagedAnnounced = false;
+    const reference = await this.options.reference.read();
+    if (reference.ok) {
+      this.lastPrice = reference.price;
+      this.lastPriceAtMs = clock.nowMs();
+    }
+    if (await this.stillUnexplained(account)) return;
     if (clock.nowMs() < this.holdUntilMs) return;
 
-    const reference = await this.options.reference.read();
-    if (reference.ok) this.lastPrice = reference.price;
     const decision = decideHedge({
       makerPosition: maker,
       hedgePosition: account.position,
@@ -117,7 +133,11 @@ export class HedgeController implements HedgeGate {
       mayGrow: mode === "run",
     });
     if (decision.action === "none") {
-      if (decision.reason === "hedged" || decision.reason === "below the trigger") {
+      // A fresh venue read with the exposure inside the soft limit is a confirmation, whatever held the order.
+      if (
+        decision.reason !== "no trusted price" &&
+        this.unhedgedNotional() < this.options.settings.softUnhedgedNotional
+      ) {
         this.confirmedAtMs = clock.nowMs();
       }
       return;
@@ -131,17 +151,24 @@ export class HedgeController implements HedgeGate {
       limitPrice: decision.limitPrice,
       reduceOnly: decision.reduceOnly,
     };
-    const accepted = await this.send(order);
+    const accepted = await this.send(order, account.position);
     const after = await this.readVenue();
     if (after) this.noteAccount(after, maker);
     // An accepted order that has not moved the position may still fill: wait for the venue to show it.
     if (accepted && (!after || after.position === account.position)) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
+      this.unexplained ??= {
+        clientId: order.clientId,
+        sentAtMs: clock.nowMs(),
+        positionBefore: account.position,
+        cancelled: true,
+        alerted: false,
+      };
     }
   }
 
   /** Whether the venue took the order. A refusal or an unclear answer holds back the next order. */
-  private async send(order: HedgeOrder): Promise<boolean> {
+  private async send(order: HedgeOrder, positionBefore: bigint): Promise<boolean> {
     const { venue, voice, market, clock } = this.options;
     try {
       const ack = await venue.placeIoc(order);
@@ -152,11 +179,57 @@ export class HedgeController implements HedgeGate {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
       voice.notice(
         `${market} hedge order has an unknown outcome (${firstLine(error)}). ` +
-          "It is not sent again until the venue's position has settled.",
+          "It is not sent again until the venue's position or fills have explained it.",
       );
-      await venue.cancel(order.clientId).catch(() => {});
+      this.unexplained = {
+        clientId: order.clientId,
+        sentAtMs: clock.nowMs(),
+        positionBefore,
+        cancelled: false,
+        alerted: false,
+      };
+      await this.cancelUnexplained(this.unexplained);
     }
     return false;
+  }
+
+  /** Cancels the order by its client id. A cancel that fails stays unresolved, is retried, and is an ALERT. */
+  private async cancelUnexplained(order: UnexplainedOrder): Promise<void> {
+    const { venue, voice, market } = this.options;
+    order.cancelled = await venue.cancel(order.clientId).then(
+      () => true,
+      () => false,
+    );
+    if (order.cancelled || order.alerted) return;
+    order.alerted = true;
+    voice.alert(
+      `ALERT ${market} hedge: an order of unknown outcome could not be cancelled. ` +
+        "No hedge order is sent until the venue's position or fills explain it. Check the hedge account by hand.",
+    );
+  }
+
+  /**
+   * Whether an order of unknown outcome is still unexplained, which holds every new order. It is
+   * explained when the hedge position moved, or when the venue's fills show its client id and the
+   * position has caught up. With neither, it is explained as not filled only once its cancel went
+   * through and the settle time has passed. A cancel that fails is retried every tick.
+   */
+  private async stillUnexplained(account: HedgeAccount): Promise<boolean> {
+    const order = this.unexplained;
+    if (!order) return false;
+    const { venue, clock } = this.options;
+    if (account.position !== order.positionBefore) {
+      this.unexplained = null;
+      return false;
+    }
+    if (!order.cancelled) await this.cancelUnexplained(order);
+    const fills = await venue.fills(order.sentAtMs).catch(() => null);
+    if (fills === null || fills.some((fill) => fill.clientId === order.clientId)) return true;
+    if (order.cancelled && clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs) {
+      this.unexplained = null;
+      return false;
+    }
+    return true;
   }
 
   /** The venue's account, or null with the venue marked unreachable. Rules are read once. */
@@ -191,7 +264,10 @@ export class HedgeController implements HedgeGate {
 
   private unhedgedNotional(): bigint {
     if (this.unhedged === 0n) return 0n;
-    if (this.lastPrice === null) return this.options.settings.hardUnhedgedNotional;
+    const priceAge = this.options.clock.nowMs() - this.lastPriceAtMs;
+    if (this.lastPrice === null || priceAge > MAKER_LIMITS.maxSourceAgeMs) {
+      return this.options.settings.hardUnhedgedNotional;
+    }
     return mulDivScale(absBigInt(this.unhedged), this.lastPrice);
   }
 
