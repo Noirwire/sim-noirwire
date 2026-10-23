@@ -18,7 +18,7 @@ import { NetworkMismatch } from "./rollup/connections.js";
 import { waitFor } from "./scheduling/backoff.js";
 import { type Repeating, every, idleWithin } from "./scheduling/repeating.js";
 import { StartUp } from "./scheduling/start-up.js";
-import { type OpenedBots, openBots } from "./wiring/bots.js";
+import { HedgeNotAvailable, type OpenedBots, openBots } from "./wiring/bots.js";
 import { memoryWiring } from "./wiring/memory-wiring.js";
 import { rollupWiring } from "./wiring/rollup-wiring.js";
 
@@ -176,7 +176,7 @@ export const startApp = async (
     },
     wanted: () => activity.wanted(),
     cleanup: () => wiring.rest(),
-    isFatal: (error) => error instanceof NetworkMismatch,
+    isFatal: (error) => error instanceof NetworkMismatch || error instanceof HedgeNotAvailable,
     onFailure: (error, failures, retryInMs) =>
       console.error(
         `sim-noirwire: start-up failed (try ${failures}), trying again in ${Math.round(retryInMs / 1_000)} s: ${firstLine(error)}`,

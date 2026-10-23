@@ -108,24 +108,27 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                                 | Required | What it is                                                                                  |
-| ------------------------------------------------------------------------ | -------- | ------------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`        |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                   |
-| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`                 |
-| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own           |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                        |
-| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)     |
-| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine    |
-| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                 |
-| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)     |
-| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                           |
-| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)             |
-| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)      |
-| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)                  |
-| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after a good requote, at most every 15 s, for an outside monitor |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                                 |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open       |
+| Variable                                                                 | Required | What it is                                                                                                           |
+| ------------------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`                                 |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                                            |
+| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`                                          |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own                                    |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                                                 |
+| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)                              |
+| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine                             |
+| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                                          |
+| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)                              |
+| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                                                    |
+| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)                                      |
+| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)                               |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)                                           |
+| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                          |
+| `HEDGE_ENABLED`                                                          | no       | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                     |
+| `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no       | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                        |
+| `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no       | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3) |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                                                          |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open                                |
 
 ### Mainnet mode
 
@@ -354,6 +357,38 @@ elsewhere is off by default and on mainnet cannot be set to 0):
 
 The risk rules cover SOL perpetuals only; the service refuses to start the maker on any
 other market with them on.
+
+#### The hedge controller
+
+An optional controller keeps the maker's net SOL exposure near flat by trading the offsetting
+position on an outside perpetuals venue. It is **off unless `HEDGE_ENABLED=1`**: with it unset
+nothing hedge-related runs and the maker behaves exactly as before. It needs the risk rules
+(`HOUSE_MAKER_RISK_RULES=1`) and a hedge venue client. This build ships only the venue
+interface (`src/hedge/hedge-venue.ts`) and no client for a real venue, so setting
+`HEDGE_ENABLED=1` stops the start with a message that says so.
+
+- **What it sends.** Each tick it reads the maker's position and the venue's real position and
+  sends at most one immediate-or-cancel order that works the difference toward zero, priced at
+  most 20 bps through the reference price. The size is rounded down to the venue's increment.
+  The venue's minimum order notional is read from the venue: smaller differences are left alone
+  until they add up to one. The hedge position never grows past the hedge account's margin times
+  `HEDGE_MAX_LEVERAGE`, and nothing is sent without a trusted reference price.
+- **It never trusts an order's answer.** After every order it reads the venue's position again.
+  A partial fill is just what is left to hedge on the next tick. An order whose outcome is unknown
+  (no answer, or accepted with no change in the position yet) is not sent again for 10 s, and a
+  refused one for 5 s.
+- **Status the maker reads.** `ok`; `lagging` when the unhedged exposure reaches
+  `HEDGE_SOFT_UNHEDGED_NUSD` or the venue has confirmed nothing for `HEDGE_CONFIRM_TIMEOUT_SECONDS`;
+  `blind` when the venue cannot be reached (or says it is not trading), the controller has not
+  heard from it within that timeout, or the unhedged exposure reaches `HEDGE_HARD_UNHEDGED_NUSD`.
+  Before the venue has answered once, the status is `blind`.
+  - Lagging: the maker quotes 10 bps wider.
+  - Blind: the maker stops growing its position and quotes only the side that shrinks it, with an
+    `ALERT` line. Both end by themselves once the venue confirms the hedge again.
+- **The kill switch covers the hedge.** At the soft stop, and while the maker flattens, the
+  controller opens no new hedge exposure and only shrinks the hedge as the maker's position
+  shrinks. At the hard stop it trades nothing and logs an `ALERT` that the hedge position is
+  left as it is and is unmanaged: close it by hand on the venue if it should not stay open.
 
 ### Awake and asleep
 

@@ -421,6 +421,29 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   them blocked the maker keeps quoting on the rest as long as Pyth and two exchanges
   answer; with Pyth blocked, or two of the exchanges, it pulls its quotes.
 
+### The hedge controller on mainnet (off by default)
+
+`HEDGE_ENABLED` is unset by default and nothing hedge-related runs. This build contains no
+client for a real hedge venue, so `HEDGE_ENABLED=1` stops the start with a message saying
+so; a client is added behind the `HedgeVenue` interface after it has been tried by hand. The
+settings, all optional:
+
+- `HEDGE_SOFT_UNHEDGED_NUSD` (100): unhedged exposure from which the hedge is lagging and the
+  maker quotes 10 bps wider.
+- `HEDGE_HARD_UNHEDGED_NUSD` (250): from which the hedge is blind and the maker quotes only
+  the side that shrinks its position. Must be above the soft limit, or the start is refused.
+- `HEDGE_CONFIRM_TIMEOUT_SECONDS` (60): without a venue confirmation for this long the hedge
+  is lagging, and with no answer from the venue at all for this long it is blind.
+- `HEDGE_MAX_LEVERAGE` (3): the hedge position never grows past the hedge account's margin
+  times this.
+
+What an operator sees: a line that says the maker's hedge is blind starts with `ALERT`; lines
+about a lagging hedge, a venue that cannot be reached or answers again, a refused order or an
+order of unknown outcome are notices. The kill switch covers the hedge: at the soft stop it
+opens no new hedge, and at the hard stop it trades nothing and logs an `ALERT` that the hedge
+position is unmanaged, so check that position on the venue and close it by hand if it should
+not stay open. The hedge account's key is a separate hot key holding only the hedge margin.
+
 ## Do not change
 
 Keep it at one replica, and never run a second copy with the same keys. Two processes

@@ -1,5 +1,7 @@
 import type { Clock } from "../engine/clock.js";
 import { absBigInt, mulDivScale } from "../engine/money.js";
+import type { HedgeGate, HedgeStatus } from "../hedge/hedge-controller.js";
+import { HEDGE_LIMITS } from "../hedge/hedge-limits.js";
 import { firstLine } from "../logging/first-line.js";
 import type { Reference } from "../prices/reference-price.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
@@ -110,6 +112,8 @@ export interface MakerSafetyOptions {
   clock: Clock;
   voice: MakerVoice;
   market: string;
+  /** Where the maker's exposure is hedged outside. Without it the maker is unhedged, as it always was. */
+  hedge?: HedgeGate;
 }
 
 /**
@@ -123,6 +127,7 @@ export class MakerSafety {
   /** The newest reference price that was good, kept for the loss limits while the reference is down. */
   private lastGood: GoodReference | null = null;
   private pulled = false;
+  private hedgeStatus: HedgeStatus = "ok";
 
   constructor(private readonly options: MakerSafetyOptions) {}
 
@@ -167,13 +172,41 @@ export class MakerSafety {
     const widenForLag = lag > MAKER_LIMITS.markLagWidenBps ? lag : 0;
     if (this.pulled) this.options.voice.notice(`${this.options.market} maker is quoting again`);
     this.pulled = false;
+    const hedge = this.followHedge();
+    const widenForHedge = hedge === "lagging" ? HEDGE_LIMITS.laggingExtraSpreadBps : 0;
     return {
       action: "quote",
       centre: reference.price,
-      extraSpreadBps: volatility * MAKER_LIMITS.volatilityShare + widenForLag,
-      reduceOnly: risk.mode !== "run",
+      extraSpreadBps: volatility * MAKER_LIMITS.volatilityShare + widenForLag + widenForHedge,
+      reduceOnly: risk.mode !== "run" || hedge === "blind",
       flatten: risk.mode === "flatten",
     };
+  }
+
+  /**
+   * The hedge's status, said aloud when it changes. A lagging hedge widens the
+   * quotes; a blind one lets the maker quote only the side that shrinks its
+   * position. Both end by themselves once the venue confirms the hedge again.
+   */
+  private followHedge(): HedgeStatus {
+    const status = this.options.hedge?.status() ?? "ok";
+    if (status === this.hedgeStatus) return status;
+    this.hedgeStatus = status;
+    const { voice, market } = this.options;
+    if (status === "blind") {
+      voice.alert(
+        `ALERT ${market} maker: its hedge is blind (the hedge venue cannot be reached, or the unhedged ` +
+          "exposure is past the hard limit). It stops growing its position and quotes only the side " +
+          "that shrinks it, until the hedge is confirmed again.",
+      );
+    } else if (status === "lagging") {
+      voice.notice(
+        `${market} maker: its hedge is lagging, so it quotes ${HEDGE_LIMITS.laggingExtraSpreadBps} bps wider until the venue confirms it`,
+      );
+    } else {
+      voice.notice(`${market} maker: its hedge is confirmed again, so it quotes normally`);
+    }
+    return status;
   }
 
   /**
