@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { MakerMode } from "../src/bots/maker-state.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { HedgeController } from "../src/hedge/hedge-controller.js";
+import { HEDGE_LIMITS } from "../src/hedge/hedge-limits.js";
 import type { Reference } from "../src/prices/reference-price.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
 import { dollars } from "./helpers.js";
@@ -9,7 +10,7 @@ import { dollars } from "./helpers.js";
 const START_MS = Date.parse("2026-11-02T12:00:00Z");
 const MARKET = "NSOL-PERP";
 
-const rig = () => {
+const rig = (settled = true) => {
   const clock = new ManualClock(START_MS);
   const venue = new FakeHedgeVenue();
   venue.now = () => clock.nowMs();
@@ -37,6 +38,7 @@ const rig = () => {
       maxLeverage: 3,
     },
   });
+  if (settled) clock.advance(HEDGE_LIMITS.settleAfterUnknownMs);
   /** Moves the clock on, then runs one tick. */
   const tick = async (seconds = 1) => {
     clock.advance(seconds * 1_000);
@@ -69,6 +71,46 @@ describe("the hedge controller", () => {
     await tick();
 
     expect(venue.placed).toHaveLength(1);
+  });
+
+  describe("right after a restart", () => {
+    it("sends no order inside the settle window, even when the decision calls for one", async () => {
+      const { venue, state, controller, tick } = rig(false);
+      state.maker = dollars(1);
+
+      await tick(1);
+      await tick(5);
+      await tick(3);
+
+      expect(venue.placed).toHaveLength(0);
+      expect(controller.hedgedPosition).toBe(0n);
+    });
+
+    it("sends the order once the window has passed", async () => {
+      const { venue, state, tick } = rig(false);
+      state.maker = dollars(1);
+
+      await tick(5);
+      expect(venue.placed).toHaveLength(0);
+
+      await tick(5);
+      expect(venue.placed).toHaveLength(1);
+      expect(venue.position).toBe(dollars(-1));
+    });
+
+    it("says once that it is waiting for the venue to settle", async () => {
+      const { said, state, tick } = rig(false);
+      state.maker = dollars(1);
+
+      await tick(1);
+      await tick(1);
+      await tick(1);
+      await tick(10);
+
+      expect(said.notices.filter((line) => line.includes("settle after a restart"))).toHaveLength(
+        1,
+      );
+    });
   });
 
   describe("reconciling from the venue's position", () => {
