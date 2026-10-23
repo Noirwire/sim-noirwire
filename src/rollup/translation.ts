@@ -60,6 +60,7 @@ const STATUS_OF: Record<PlaceStatus, (filled: bigint, size: bigint) => OrderStat
 const reasonOf = (outcome: PlaceOutcome): string | undefined => {
   if (outcome.status === "expired") return "no result before the order expired";
   if (outcome.status === "refused") return "post-only order would match";
+  if (outcome.status === "unknown") return outcome.reason ?? "the order's outcome is not known";
   return outcome.reason;
 };
 
@@ -79,6 +80,7 @@ export const placeResultOf = (
     filledSize,
     remainingSize: order.size - filledSize,
     reason: reasonOf(outcome),
+    ...(outcome.status === "unknown" ? { outcomeUnknown: true as const } : {}),
   };
 };
 

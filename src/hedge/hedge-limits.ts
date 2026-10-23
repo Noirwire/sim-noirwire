@@ -13,6 +13,9 @@ export const HEDGE_LIMITS = {
   retryAfterRefusalMs: 5_000,
 } as const;
 
+/** Every call to the hedge venue gets this long to answer before the controller stops waiting for it. */
+export const VENUE_CALL_TIMEOUT_MS = 8_000;
+
 /** The settings an operator chooses, already parsed. */
 export interface HedgeSettings {
   /** Unhedged exposure in dollars from which the hedge counts as lagging. */

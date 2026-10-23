@@ -157,9 +157,18 @@ const noiseTaker = (
     random,
   });
 
+/** Whether the makers are quoting under a working hedge. Not the same as the process being alive. */
+export interface TradingReadiness {
+  ready: boolean;
+  /** What is wrong, in words, when it is not ready. */
+  reason?: string;
+}
+
 export interface OpenedBots {
   /** Starts every bot's loop. */
   start(): Repeating[];
+  /** Not ready while a maker is stopped or its hedge is blind. */
+  trading(): TradingReadiness;
   /** Takes every maker's quotes off the venue. Call it once the loops have stopped. */
   withdrawQuotes(): Promise<void>;
 }
@@ -182,6 +191,7 @@ export const openBots = async (
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
   const hedges: { market: string; controller: HedgeController }[] = [];
+  const ledgers: { market: string; ledger: MakerLedger }[] = [];
   const rules = config.HOUSE_MAKER_RISK_RULES;
   if (config.HEDGE_ENABLED && !rules) {
     throw new HedgeNotAvailable(
@@ -204,6 +214,7 @@ export const openBots = async (
       config.HEDGE_ENABLED && reference && ledger
         ? hedgeController(config, market, ledger, reference, botVenue, hedgeVenue, problems)
         : undefined;
+    if (ledger) ledgers.push({ market: market.id, ledger });
     if (hedge) hedges.push({ market: market.id, controller: hedge });
     const safety =
       reference && ledger
@@ -280,5 +291,16 @@ export const openBots = async (
       }
     });
   };
-  return { start, withdrawQuotes };
+  const trading = (): TradingReadiness => {
+    const problems = [
+      ...ledgers
+        .filter(({ ledger }) => ledger.state.mode === "stopped")
+        .map(({ market }) => `${market} maker is stopped`),
+      ...hedges
+        .filter(({ controller }) => controller.status() === "blind")
+        .map(({ market }) => `${market} hedge is blind`),
+    ];
+    return problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
+  };
+  return { start, trading, withdrawQuotes };
 };

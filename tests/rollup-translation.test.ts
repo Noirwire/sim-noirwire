@@ -109,6 +109,14 @@ describe("what the program made of a bot's order", () => {
       expect(result({ status })).toMatchObject({ status: "rejected", remainingSize: dollars(2) });
     }
   });
+
+  it("flags only an order whose outcome is unknown, and says why", () => {
+    expect(result({ status: "unknown" })).toMatchObject({ outcomeUnknown: true });
+    expect(result({ status: "unknown" }).reason).toBeTruthy();
+    for (const status of ["refused", "expired", "invalid", "failed"] as const) {
+      expect(result({ status }).outcomeUnknown).toBeUndefined();
+    }
+  });
 });
 
 describe("a trader's own view of its seat", () => {

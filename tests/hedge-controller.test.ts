@@ -10,7 +10,23 @@ import { dollars } from "./helpers.js";
 const START_MS = Date.parse("2026-11-02T12:00:00Z");
 const MARKET = "NSOL-PERP";
 
+/** Deadline timers that fire only when a test says so. */
+const manualTimers = () => {
+  const pending = new Set<() => void>();
+  return {
+    schedule: (fire: () => void) => {
+      pending.add(fire);
+      return () => pending.delete(fire);
+    },
+    fireAll: () => {
+      for (const fire of [...pending]) fire();
+      pending.clear();
+    },
+  };
+};
+
 const rig = (settled = true) => {
+  const timers = manualTimers();
   const clock = new ManualClock(START_MS);
   const venue = new FakeHedgeVenue();
   venue.now = () => clock.nowMs();
@@ -31,6 +47,7 @@ const rig = (settled = true) => {
       notice: (message) => said.notices.push(message),
     },
     market: MARKET,
+    schedule: timers.schedule,
     settings: {
       softUnhedgedNotional: dollars(100),
       hardUnhedgedNotional: dollars(250),
@@ -44,8 +61,21 @@ const rig = (settled = true) => {
     clock.advance(seconds * 1_000);
     await controller.tick();
   };
-  return { clock, venue, said, state, controller, tick };
+  /** Runs one tick, firing every deadline that comes up until it ends. */
+  const tickThroughDeadlines = async (seconds = 1) => {
+    clock.advance(seconds * 1_000);
+    let ended = false;
+    const running = controller.tick().finally(() => (ended = true));
+    while (!ended) {
+      await new Promise((resolve) => setImmediate(resolve));
+      timers.fireAll();
+    }
+    await running;
+  };
+  return { clock, venue, said, state, controller, tick, tickThroughDeadlines };
 };
+
+const NEVER = (): Promise<never> => new Promise(() => {});
 
 describe("the hedge controller", () => {
   it("is blind until the venue has answered once", () => {
@@ -277,6 +307,124 @@ describe("the hedge controller", () => {
       clock.advance(61_000);
 
       expect(controller.status()).toBe("blind");
+    });
+  });
+
+  describe("when a venue call never answers", () => {
+    it("stops waiting for a read, marks the venue unreachable and recovers when it answers", async () => {
+      const { venue, controller, tick, tickThroughDeadlines } = rig();
+      await tick();
+      expect(controller.status()).toBe("ok");
+
+      const answering = venue.account.bind(venue);
+      venue.account = NEVER;
+      await tickThroughDeadlines();
+      expect(controller.status()).toBe("blind");
+
+      venue.account = answering;
+      await tick();
+      expect(controller.status()).toBe("ok");
+    });
+
+    it("treats an order that never answers as an unknown outcome and sends nothing more for now", async () => {
+      const { venue, state, said, tickThroughDeadlines, tick } = rig();
+      let answerLate: (ack: { status: "accepted" }) => void = () => {};
+      let sent = 0;
+      venue.placeIoc = () => {
+        sent += 1;
+        return new Promise((resolve) => (answerLate = resolve));
+      };
+      state.maker = dollars(1);
+
+      await tickThroughDeadlines();
+      expect(said.notices.some((line) => line.includes("unknown outcome"))).toBe(true);
+      expect(venue.cancelled).toHaveLength(1);
+
+      answerLate({ status: "accepted" });
+      state.maker = dollars(1.5);
+      await tick();
+
+      expect(sent).toBe(1);
+    });
+
+    it("ignores a read that answers after its deadline", async () => {
+      const { venue, controller, tick, tickThroughDeadlines } = rig();
+      await tick();
+      const accountNow = venue.account.bind(venue);
+      let answerLate: () => void = () => {};
+      venue.account = () =>
+        new Promise((resolve) => {
+          answerLate = () => void accountNow().then(resolve);
+        });
+
+      await tickThroughDeadlines();
+      answerLate();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(controller.status()).toBe("blind");
+    });
+
+    it("counts a cancel that never answers as a cancel that failed", async () => {
+      const { venue, state, said, tickThroughDeadlines } = rig();
+      venue.script({ lost: true });
+      venue.cancel = NEVER;
+      state.maker = dollars(1);
+
+      await tickThroughDeadlines();
+
+      expect(said.alerts.some((line) => line.includes("could not be cancelled"))).toBe(true);
+    });
+  });
+
+  describe("what an operator notice may say of a venue failure", () => {
+    const SECRET = "sk_live_9f8e7d6c5b4a";
+
+    it("names the class of a failed order and never its message", async () => {
+      const { venue, state, said, tick } = rig();
+      venue.placeIoc = async () => {
+        throw new TypeError(`request rejected: authorization ${SECRET}`);
+      };
+      state.maker = dollars(1);
+
+      await tick();
+
+      const notice = said.notices.find((line) => line.includes("unknown outcome"));
+      expect(notice).toContain("TypeError");
+      expect(said.notices.join("\n")).not.toContain(SECRET);
+    });
+
+    it("names the class of a failed read and never its message", async () => {
+      const { venue, said, tick } = rig();
+      await tick();
+      venue.account = async () => {
+        throw new Error(`401 for key ${SECRET}`);
+      };
+
+      await tick();
+
+      expect(said.notices.some((line) => line.includes("cannot be reached"))).toBe(true);
+      expect(said.notices.join("\n")).not.toContain(SECRET);
+    });
+
+    it("does not repeat the reason of an unhealthy venue", async () => {
+      const { venue, said, tick } = rig();
+      await tick();
+      venue.unhealthyBecause = `halted, token ${SECRET}`;
+
+      await tick();
+
+      expect(said.notices.join("\n")).not.toContain(SECRET);
+    });
+
+    it("says non-error for something thrown that is not an error", async () => {
+      const { venue, state, said, tick } = rig();
+      venue.placeIoc = () => Promise.reject(SECRET);
+      state.maker = dollars(1);
+
+      await tick();
+
+      expect(said.notices.join("\n")).toContain("non-error");
+      expect(said.notices.join("\n")).not.toContain(SECRET);
     });
   });
 

@@ -8,6 +8,11 @@ import type { AppContext } from "../context.js";
  * sends nothing, so stale prices are expected and do not count against it.
  * Until then the answer is 503 with what is missing. This route never wakes
  * the service, so an uptime probe can poll it freely.
+ *
+ * While awake the answer also carries `trading: { ready, reason? }`, which is
+ * not `ok`: a blind hedge or a stopped maker makes it not ready but leaves the
+ * status code alone, so a probe does not restart a process that restarting
+ * cannot help. Alert on `trading.ready` instead.
  */
 export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void => {
   app.get("/v1/health", { config: { wakes: false } }, async (_request, reply) => {
@@ -16,7 +21,9 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
       network: ctx.config.NETWORK,
       awake: ctx.activity.awake,
     };
-    if (!ctx.readiness) return { ok: true, ...base };
+    const trading = ctx.activity.awake ? ctx.trading?.() : undefined;
+    const tradingField = trading ? { trading } : {};
+    if (!ctx.readiness) return { ok: true, ...base, ...tradingField };
     const readiness = ctx.readiness();
     const started = ctx.startUp?.ready ?? true;
     const reason =
@@ -27,6 +34,6 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
       (!ctx.activity.awake || (readiness.connected && readiness.pricesFresh));
     return reply
       .status(ok ? 200 : 503)
-      .send({ ok, ...base, ...readiness, ...(reason === null ? {} : { reason }) });
+      .send({ ok, ...base, ...readiness, ...tradingField, ...(reason === null ? {} : { reason }) });
   });
 };
