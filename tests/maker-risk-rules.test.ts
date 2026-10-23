@@ -1,6 +1,20 @@
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
+
+/** While `fails` is set, removing a recovery marker is refused, as a failing disk would. */
+const removal = vi.hoisted(() => ({ fails: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rm: (path: Parameters<typeof actual.rm>[0], options?: Parameters<typeof actual.rm>[1]) =>
+      removal.fails && String(path).endsWith(".failed")
+        ? Promise.reject(new Error("EBUSY: the disk refused the removal"))
+        : actual.rm(path, options),
+  };
+});
 import {
   HouseMaker,
   type HouseMakerOptions,
@@ -2009,21 +2023,79 @@ describe("a maker whose state cannot be saved fails closed", () => {
     await breakWrites(dir);
     await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
     await repairWrites(dir);
-    await rm(markerOf(dir));
-    await mkdir(markerOf(dir));
-    await writeFile(join(markerOf(dir), "stuck"), "");
     const resume = { mode: "run", requestedAtMs: 5 } as const;
+    removal.fails = true;
 
     await expect(risk.follow(resume, dollars(1_000))).rejects.toThrow(StatePersistenceError);
 
     expect(ledger.state.mode).toBe("stopped");
     expect(ledger.state.reason).toContain("recovery marker could not be removed");
-    expect(ledger.canRetryResume(5)).toBe(true);
-    await rm(markerOf(dir), { recursive: true });
-    await risk.follow(resume, dollars(1_000));
-    expect(ledger.state.mode).toBe("run");
-    expect(ledger.canRetryResume(5)).toBe(false);
+    expect(await ledger.canRetryResume(5)).toBe(true);
+    expect(JSON.parse(await readFile(markerOf(dir), "utf8"))).toEqual({
+      phase: "resumed",
+      commandTs: 5,
+    });
+
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(restarted.state.mode).toBe("stopped");
+    removal.fails = false;
+    const again = new MakerRisk(restarted, clock, PERP, {
+      alert: (message) => said.push(message),
+      notice: (message) => said.push(message),
+    });
+    await again.follow(resume, dollars(1_000));
+    expect(restarted.state.mode).toBe("run");
+    expect(await restarted.canRetryResume(5)).toBe(false);
     expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("run");
+  });
+
+  it("finishes a saved resume at the next start once the marker can be removed", async () => {
+    const { dir, ledger, clock } = await rig("persist-finish-on-open");
+    const risk = new MakerRisk(ledger, clock, PERP, { alert: () => {}, notice: () => {} });
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    removal.fails = true;
+    await expect(risk.follow({ mode: "run", requestedAtMs: 5 }, dollars(1_000))).rejects.toThrow(
+      StatePersistenceError,
+    );
+
+    const held = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(held.state.mode).toBe("stopped");
+    expect(held.state.reason).toContain("recovery marker could not be removed");
+    removal.fails = false;
+    const finished = await MakerLedger.open(makerStatePath(dir, PERP));
+
+    expect(finished.state.mode).toBe("run");
+    await expect(access(markerOf(dir))).rejects.toThrow();
+  });
+
+  it("does not let an old run command resume a maker whose marker says failed", async () => {
+    const { dir, ledger, clock } = await rig("persist-stale-run");
+    await breakWrites(dir);
+    await expect(ledger.update({ peakEquity: 1n })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    await writeFile(
+      makerStatePath(dir, PERP),
+      JSON.stringify({
+        mode: "run",
+        reason: null,
+        flattenStartedAtMs: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 5,
+        spotBaseAtStart: null,
+      }),
+    );
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    const risk = new MakerRisk(restarted, clock, PERP, { alert: () => {}, notice: () => {} });
+
+    await risk.follow({ mode: "run", requestedAtMs: 5 }, dollars(1_000));
+    expect(restarted.state.mode).toBe("stopped");
+
+    await risk.follow({ mode: "run", requestedAtMs: 6 }, dollars(1_000));
+    expect(restarted.state.mode).toBe("run");
   });
 
   it("does not keep a mode in memory that is not on disk", async () => {

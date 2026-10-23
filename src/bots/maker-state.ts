@@ -1,4 +1,4 @@
-import { access, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -104,19 +104,57 @@ const syncDirectory = async (directory: string): Promise<void> => {
 /** Present while a state write has failed and an operator has not yet resumed the maker. */
 const failedMarkerPath = (statePath: string): string => `${statePath}.failed`;
 
-/** Whether the marker stands. Any answer but "not there" means it cannot be known, and is thrown. */
-const markerStands = (path: string): Promise<boolean> =>
-  access(path).then(
-    () => true,
-    (error: unknown) => {
-      if (isMissing(error)) return false;
-      throw new Error(
-        `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
-          "write failed before. Repair the state directory and inspect the state file, then start again.",
-        { cause: error },
-      );
-    },
-  );
+/**
+ * What the marker says. "failed": a state write failed and nothing since has
+ * been resumed. "resumed": the operator's resume with `commandTs` was saved,
+ * and only the removal of the marker is left.
+ */
+interface Marker {
+  phase: "failed" | "resumed";
+  commandTs: number | null;
+}
+
+const markerSchema = z.object({
+  phase: z.enum(["failed", "resumed"]),
+  commandTs: z.number().nullable(),
+});
+
+const FAILED_MARKER: Marker = { phase: "failed", commandTs: null };
+
+const writeMarker = (statePath: string, marker: Marker): Promise<void> =>
+  writeAtomically(failedMarkerPath(statePath), JSON.stringify(marker));
+
+/**
+ * The marker, or null when it is not there. A marker that cannot be read at
+ * all means it cannot be known whether a write failed, and is thrown; one
+ * that is not valid counts as "failed".
+ */
+const readMarker = async (statePath: string): Promise<Marker | null> => {
+  const path = failedMarkerPath(statePath);
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw new Error(
+      `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
+        "write failed before. Repair the state directory and inspect the state file, then start again.",
+      { cause: error },
+    );
+  }
+  try {
+    return markerSchema.parse(JSON.parse(text));
+  } catch {
+    return FAILED_MARKER;
+  }
+};
+
+/** Removes the marker and syncs the directory, so the removal survives a crash. */
+const removeMarker = async (statePath: string): Promise<void> => {
+  const path = failedMarkerPath(statePath);
+  await rm(path, { force: true });
+  await syncDirectory(dirname(path));
+};
 
 const RECOVERY_REQUIRED =
   "its resume was saved, but the recovery marker could not be removed. Run the kill switch " +
@@ -137,13 +175,11 @@ export class MakerLedger {
     private readonly path: string,
     private current: MakerState,
     private recoveryRequired: boolean,
+    private faulted: boolean,
   ) {}
 
-  /** The timestamp of a resume whose write worked but whose marker removal failed. */
-  private resumeToRetry: number | null = null;
-
   static async open(path: string): Promise<MakerLedger> {
-    const interrupted = await markerStands(failedMarkerPath(path));
+    const marker = await readMarker(path);
     let loaded: MakerState;
     try {
       const raw = JSON.parse(await readFile(path, "utf8"));
@@ -158,17 +194,43 @@ export class MakerLedger {
       }
       loaded = { ...FRESH };
     }
-    if (!interrupted) return new MakerLedger(path, loaded, false);
+    if (marker === null) return new MakerLedger(path, loaded, false, false);
+    if (
+      marker.phase === "resumed" &&
+      loaded.mode === "run" &&
+      loaded.lastCommandAtMs === marker.commandTs
+    ) {
+      try {
+        await removeMarker(path);
+        return new MakerLedger(path, loaded, false, false);
+      } catch {
+        return new MakerLedger(
+          path,
+          { ...loaded, mode: "stopped", reason: RECOVERY_REQUIRED },
+          true,
+          true,
+        );
+      }
+    }
     const held: MakerState = {
       ...loaded,
       mode: "stopped",
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
     };
-    return new MakerLedger(path, held, true);
+    return new MakerLedger(path, held, true, true);
   }
 
   get state(): Readonly<MakerState> {
     return this.current;
+  }
+
+  /**
+   * The mode the hedge follows. A state that could not be saved stops the
+   * maker's quoting but is no decision to abandon its exposure, so the hedge
+   * sees the soft stop: it may shrink what it holds and open nothing new.
+   */
+  get hedgeMode(): MakerMode {
+    return this.faulted && this.current.mode === "stopped" ? "reduce" : this.current.mode;
   }
 
   /**
@@ -199,7 +261,8 @@ export class MakerLedger {
         reason: "its state could not be saved to disk",
       };
       this.recoveryRequired = true;
-      await writeAtomically(failedMarkerPath(this.path), "failed").catch((markerError) =>
+      this.faulted = true;
+      await writeMarker(this.path, FAILED_MARKER).catch((markerError) =>
         console.error(
           `sim-noirwire: ALERT could not write ${failedMarkerPath(this.path)} either, so a restart may ` +
             "quote again. The maker stays stopped in memory. Do not restart it until the disk is fixed.",
@@ -209,23 +272,27 @@ export class MakerLedger {
       throw new StatePersistenceError(this.path, error);
     }
     if (this.recoveryRequired && resumes) {
-      const marker = failedMarkerPath(this.path);
       try {
-        await rm(marker, { force: true });
-        await syncDirectory(dirname(marker));
+        await writeMarker(this.path, { phase: "resumed", commandTs: next.lastCommandAtMs });
+        await removeMarker(this.path);
       } catch (error) {
         this.current = { ...next, mode: "stopped", reason: RECOVERY_REQUIRED };
-        this.resumeToRetry = change.lastCommandAtMs ?? null;
-        throw new StatePersistenceError(marker, error);
+        throw new StatePersistenceError(failedMarkerPath(this.path), error);
       }
       this.recoveryRequired = false;
-      this.resumeToRetry = null;
+      this.faulted = false;
     }
+    if (change.mode === "stopped") this.faulted = false;
     this.current = next;
   }
 
-  /** Whether the operator's resume with this timestamp was saved but its recovery never finished, so it may be run again. */
-  canRetryResume(requestedAtMs: number): boolean {
-    return this.resumeToRetry === requestedAtMs;
+  /**
+   * Whether the marker on disk says this operator resume was saved and only
+   * the marker's removal is left, so the same command may be run again.
+   */
+  async canRetryResume(requestedAtMs: number): Promise<boolean> {
+    if (!this.recoveryRequired) return false;
+    const marker = await readMarker(this.path).catch(() => null);
+    return marker?.phase === "resumed" && marker.commandTs === requestedAtMs;
   }
 }

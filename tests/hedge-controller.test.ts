@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import type { MakerMode } from "../src/bots/maker-state.js";
+import { mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { MakerLedger, type MakerMode, makerStatePath } from "../src/bots/maker-state.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { HedgeController } from "../src/hedge/hedge-controller.js";
 import { HEDGE_LIMITS } from "../src/hedge/hedge-limits.js";
@@ -10,7 +12,7 @@ import { dollars } from "./helpers.js";
 const START_MS = Date.parse("2026-11-02T12:00:00Z");
 const MARKET = "NSOL-PERP";
 
-const rig = (settled = true) => {
+const rig = (settled = true, modeOf?: () => MakerMode) => {
   const clock = new ManualClock(START_MS);
   const venue = new FakeHedgeVenue();
   venue.now = () => clock.nowMs();
@@ -25,7 +27,7 @@ const rig = (settled = true) => {
     clock,
     reference: { read: async () => state.reference },
     makerPosition: async () => state.maker,
-    makerMode: () => state.mode,
+    makerMode: () => (modeOf ? modeOf() : state.mode),
     voice: {
       alert: (message) => said.alerts.push(message),
       notice: (message) => said.notices.push(message),
@@ -388,6 +390,51 @@ describe("the hedge controller", () => {
       state.mode = "run";
       await tick();
       expect(venue.placed).toHaveLength(1);
+    });
+  });
+
+  describe("when the maker's state cannot be saved", () => {
+    const root = join("data-test", `hedge-fault-${Date.now()}`);
+    afterAll(() => rm(root, { recursive: true, force: true }));
+
+    const faultedLedger = async (name: string): Promise<MakerLedger> => {
+      const dir = join(root, name);
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ peakEquity: dollars(1_000) })).rejects.toThrow();
+      return ledger;
+    };
+
+    it("still shrinks the hedge as the maker shrinks, and opens nothing new", async () => {
+      const ledger = await faultedLedger("shrinks");
+      expect(ledger.state.mode).toBe("stopped");
+      const { venue, state, said, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+
+      state.maker = dollars(5);
+      await tick();
+      expect(venue.placed).toHaveLength(0);
+
+      state.maker = dollars(0.4);
+      await tick();
+      expect(venue.placed).toMatchObject([{ side: "buy", size: dollars(0.6), reduceOnly: true }]);
+      expect(said.alerts.filter((line) => line.includes("unmanaged"))).toHaveLength(0);
+    });
+
+    it("still abandons the hedge at an intentional hard stop", async () => {
+      const dir = join(root, "intentional");
+      await mkdir(dir, { recursive: true });
+      const ledger = await MakerLedger.open(makerStatePath(dir, MARKET));
+      await ledger.update({ mode: "stopped", reason: "the kill switch stopped it" });
+      const { venue, state, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+
+      await tick();
+
+      expect(venue.placed).toHaveLength(0);
     });
   });
 });
