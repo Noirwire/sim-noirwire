@@ -18,7 +18,7 @@ import {
 } from "../src/bots/maker-control.js";
 import { MakerRisk } from "../src/bots/maker-risk.js";
 import { MakerSafety, worstEquity } from "../src/bots/maker-safety.js";
-import { MakerLedger, makerStatePath } from "../src/bots/maker-state.js";
+import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
 import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/types.js";
@@ -172,6 +172,8 @@ class Book {
   /** Why the market would refuse a resting order, and whether it still takes reduce-only ones. */
   refusedBecause: string | null = null;
   takesReduceOnly = false;
+  /** Like the venue: a reduce-only order is refused while the position is flat. */
+  refusesReduceOnlyWhenFlat = false;
 
   asVenue(): Venue {
     return {
@@ -184,6 +186,17 @@ class Book {
       placeOrder: async (_trader: string, order: NewOrder) => {
         await this.beforePlacing?.();
         if (this.failPlacing) throw this.failPlacing;
+        if (this.refusesReduceOnlyWhenFlat && order.reduceOnly === true && this.position === 0n) {
+          this.rejectedCount += 1;
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: "ReduceOnlyWouldIncrease",
+          };
+        }
         if (this.rejecting !== null) {
           this.rejectedCount += 1;
           return {
@@ -1123,6 +1136,16 @@ describe("a house maker that stops or fails", () => {
   });
 });
 
+const SKEW_SHAPE = {
+  market: PERP,
+  levels: 1,
+  spreadBps: 15,
+  levelStepBps: 5,
+  baseSizePerLevel: 1n,
+  maxSkewBps: 20,
+  lotSize: 1n,
+};
+
 const sidesOf = (orders: NewOrder[]): Set<string> => new Set(orders.map((order) => order.side));
 
 describe("a house maker past a loss limit flattens its position", () => {
@@ -1845,5 +1868,118 @@ describe("the maker's state file from before the flattening existed", () => {
 
     expect(ledger.state.mode).toBe("reduce");
     expect(ledger.state.flattenStartedAtMs).toBeNull();
+  });
+});
+
+describe("every order of a reduce-only plan carries the reduce-only flag", () => {
+  it("flags the soft stop's orders, so a fill between the position read and the order cannot flip it", async () => {
+    const { warmUp, book, dir, clock, tick, ledger } = await rig("reduce-flag-race");
+    book.position = dollars(0.5);
+    book.refusesReduceOnlyWhenFlat = true;
+    await warmUp();
+    book.take();
+
+    await requestMode(dir, "reduce", clock.nowMs() + 1);
+    book.beforePlacing = async () => {
+      book.position = 0n;
+    };
+    await tick();
+
+    expect(book.orders).toHaveLength(0);
+    expect(book.rejectedCount).toBeGreaterThan(0);
+    expect(ledger.state.mode).toBe("reduce");
+  });
+
+  it("flags them when no race happens either", async () => {
+    const { warmUp, book, dir, clock, tick } = await rig("reduce-flag-plain");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+
+    await requestMode(dir, "reduce", clock.nowMs() + 1);
+    await tick();
+
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(0);
+    expect(orders.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+});
+
+describe("a maker whose state cannot be saved fails closed", () => {
+  const breakWrites = (dir: string) =>
+    mkdir(`${makerStatePath(dir, PERP)}.tmp`, { recursive: true });
+
+  it("cancels its quotes at once, and stays stopped on later ticks", async () => {
+    const { warmUp, book, dir, tick, ledger } = await rig("persist-fails");
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    await breakWrites(dir);
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    expect(ledger.state.mode).toBe("stopped");
+    book.equity = dollars(1_000);
+    await tick(30);
+    expect(book.orders).toHaveLength(0);
+    expect(ledger.state.mode).toBe("stopped");
+  });
+
+  it("does not keep a mode in memory that is not on disk", async () => {
+    const { dir, ledger } = await rig("persist-memory");
+    await breakWrites(dir);
+
+    await expect(ledger.update({ mode: "reduce", reason: "test" })).rejects.toThrow(
+      StatePersistenceError,
+    );
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.lastCommandAtMs).toBe(0);
+  });
+
+  it("writes the state to a file a restart reads back", async () => {
+    const { dir, ledger } = await rig("persist-ok");
+
+    await ledger.update({ mode: "reduce", reason: "test" });
+
+    const reopened = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(reopened.state.mode).toBe("reduce");
+  });
+});
+
+describe("the skew uses exact integer ratios", () => {
+  it("skews a position of half the limit the same at any scale", () => {
+    const shape = { ...SKEW_SHAPE };
+    const small = ladderOrders(shape, {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      position: 1n,
+      positionLimit: 2n,
+    });
+    const huge = ladderOrders(shape, {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      position: 10n ** 30n,
+      positionLimit: 2n * 10n ** 30n,
+    });
+
+    expect(pricesOf(huge, "buy")[0]).toBe(pricesOf(small, "buy")[0]);
+    expect(pricesOf(huge, "sell")[0]).toBe(pricesOf(small, "sell")[0]);
+  });
+
+  it("caps the skew at the limit however large the position is", () => {
+    const base = {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      positionLimit: 10n ** 30n,
+    };
+    const full = ladderOrders(SKEW_SHAPE, { ...base, position: 10n ** 30n });
+    const beyond = ladderOrders(SKEW_SHAPE, { ...base, position: 10n ** 40n });
+    const nearly = ladderOrders(SKEW_SHAPE, { ...base, position: 9n * 10n ** 29n });
+
+    expect(pricesOf(beyond, "sell")[0]).toBe(pricesOf(full, "sell")[0]);
+    expect(pricesOf(nearly, "sell")[0]).toBeGreaterThan(pricesOf(full, "sell")[0]);
   });
 });

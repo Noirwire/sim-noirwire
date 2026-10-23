@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -59,10 +59,32 @@ const FRESH: MakerState = {
 export const isMissing = (error: unknown): boolean =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
 
+/** The maker's state could not be written, so a restart would not see it. */
+export class StatePersistenceError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`the maker's state file ${path} could not be written`, { cause });
+    this.name = "StatePersistenceError";
+  }
+}
+
+/** Writes the file, syncs it, renames it into place, and syncs the directory so the rename survives a crash. */
 export const writeAtomically = async (path: string, text: string): Promise<void> => {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(`${path}.tmp`, text);
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true });
+  const file = await open(`${path}.tmp`, "w");
+  try {
+    await file.writeFile(text);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
   await rename(`${path}.tmp`, path);
+  const folder = await open(directory, "r");
+  try {
+    await folder.sync();
+  } finally {
+    await folder.close();
+  }
 };
 
 /** The file of one maker's state, in the data directory. */
@@ -99,16 +121,31 @@ export class MakerLedger {
     return this.current;
   }
 
-  /** Changes the state in memory, then on disk. If the disk write fails, the change still holds here. */
+  /**
+   * Writes the changed state to disk, and holds it in memory only once that
+   * has worked. If the write fails the maker fails closed: the mode here
+   * becomes `stopped` and stays so until a later write succeeds, and the
+   * failure is thrown as a `StatePersistenceError`.
+   */
   async update(change: Partial<MakerState>): Promise<void> {
-    this.current = { ...this.current, ...change };
-    const { dayStartEquity, peakEquity, spotBaseAtStart } = this.current;
+    const next = { ...this.current, ...change };
+    const { dayStartEquity, peakEquity, spotBaseAtStart } = next;
     const text = JSON.stringify({
-      ...this.current,
+      ...next,
       dayStartEquity: dayStartEquity?.toString() ?? null,
       peakEquity: peakEquity?.toString() ?? null,
       spotBaseAtStart: spotBaseAtStart?.toString() ?? null,
     });
-    await writeAtomically(this.path, text);
+    try {
+      await writeAtomically(this.path, text);
+    } catch (error) {
+      this.current = {
+        ...this.current,
+        mode: "stopped",
+        reason: "its state could not be saved to disk",
+      };
+      throw new StatePersistenceError(this.path, error);
+    }
+    this.current = next;
   }
 }
