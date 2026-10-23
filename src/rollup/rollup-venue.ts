@@ -54,6 +54,8 @@ const CONNECTED_WITHIN_MS = 3 * REREAD_INTERVAL_MS;
 const MS_PER_SECOND = 1_000;
 /** How long a rest waits for the requests in flight before it lets them go. */
 const DRAIN_WITHIN_MS = 2_000;
+/** How long an order of unknown outcome may hold its bot's tick before it is reported as still unknown. */
+export const SETTLEMENT_DEADLINE_MS = 30_000;
 /** The program gives a bot's order no tag: its fills are recognised by receipt instead. */
 const NO_TAG = 0n;
 
@@ -442,13 +444,25 @@ export class RollupVenue implements Venue {
   private async onceSettled(settled: Promise<PlaceOutcome>): Promise<PlaceOutcome> {
     const { handlers } = this.options;
     handlers.onBotOrderUnknown();
-    const outcome = await settled.catch((): PlaceOutcome => ({
+    const stillUnknown = (reason: string): PlaceOutcome => ({
       status: "unknown",
       filled: 0n,
       rested: 0n,
       sendToResultMs: 0,
-      reason: "the order's outcome could not be settled",
-    }));
+      reason,
+    });
+    let stopWaiting: () => void = () => {};
+    const timedOut = new Promise<PlaceOutcome>((resolve) => {
+      const timer = setTimeout(
+        () => resolve(stillUnknown("the order was not settled in time")),
+        SETTLEMENT_DEADLINE_MS,
+      );
+      stopWaiting = () => clearTimeout(timer);
+    });
+    const outcome = await Promise.race([
+      settled.catch(() => stillUnknown("the order's outcome could not be settled")),
+      timedOut,
+    ]).finally(stopWaiting);
     handlers.onBotOrderSettled(executed(outcome));
     return outcome;
   }

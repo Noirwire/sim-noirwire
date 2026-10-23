@@ -17,6 +17,7 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
 import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
+import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
 const MAKER_QUOTE_PER_POSITION_LIMIT = 4n;
@@ -157,7 +158,11 @@ const noiseTaker = (
     random,
   });
 
-/** Whether the makers are quoting under a working hedge. Not the same as the process being alive. */
+/**
+ * Whether the makers are quoting under a working hedge. Not the same as the process being alive. A
+ * hedge that is only `lagging` counts as ready (the maker already quotes wider for it), and the
+ * liquidation keeper and the price crank are not covered: they run outside this process.
+ */
 export interface TradingReadiness {
   ready: boolean;
   /** What is wrong, in words, when it is not ready. */
@@ -262,6 +267,10 @@ export const openBots = async (
         ),
       ),
     ];
+    if (ledgers.length > 0) {
+      const watch = new TradingWatch(trading, makerVoice(problems));
+      loops.push(loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => watch.check()));
+    }
     if (liquidator) {
       loops.push(
         loop("liquidator tick", config.LIQUIDATOR_INTERVAL_MS, () =>

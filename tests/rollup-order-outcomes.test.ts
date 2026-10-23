@@ -4,7 +4,11 @@ import { MARKETS } from "../src/engine/markets.js";
 import type { NewOrder } from "../src/engine/types.js";
 import type { ChainMarket, PlaceOutcome } from "../src/rollup/chain-types.js";
 import { RollupMarket } from "../src/rollup/rollup-market.js";
-import { RollupVenue, type RollupVenueOptions } from "../src/rollup/rollup-venue.js";
+import {
+  RollupVenue,
+  type RollupVenueOptions,
+  SETTLEMENT_DEADLINE_MS,
+} from "../src/rollup/rollup-venue.js";
 import { dollars } from "./helpers.js";
 
 const fakeTrader = vi.hoisted(() => ({
@@ -137,6 +141,30 @@ describe("what the rollup venue tells the maker about an order that may have bee
 
     expect(result).toMatchObject({ status: "rejected", outcomeUnknown: true });
     expect(secrets()).toHaveLength(1);
+  });
+
+  it("stops waiting for a settlement that never comes and keeps the order unknown", async () => {
+    vi.useFakeTimers();
+    try {
+      const { venue, secrets } = venueWith();
+      fakeTrader.place = () =>
+        Promise.resolve<PlaceOutcome>({
+          status: "unknown",
+          filled: 0n,
+          rested: 0n,
+          sendToResultMs: 0,
+          settled: new Promise(() => {}),
+        });
+
+      const placing = venue.placeOrder(TRADER, order());
+      await vi.advanceTimersByTimeAsync(SETTLEMENT_DEADLINE_MS);
+      const result = await placing;
+
+      expect(result).toMatchObject({ status: "rejected", outcomeUnknown: true });
+      expect(secrets()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not flag an order the rollup's clock settled as expired", async () => {

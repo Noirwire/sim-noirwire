@@ -46,6 +46,21 @@ export const withinDeadline = <T>(
       );
   });
 
-/** What may be logged of a failure whose message another party wrote: its class, never its text. */
-export const errorClass = (error: unknown): string =>
-  error instanceof Error ? error.name : "non-error";
+const KNOWN_ERROR_CLASSES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "AbortError",
+  "VenueCallTimeout",
+  "VenueUnhealthy",
+  "UnknownOutcomeError",
+]);
+
+/**
+ * What may be logged of a failure whose message and name another party wrote: a fixed label,
+ * never their text. A name outside the known classes is only `other-error`.
+ */
+export const errorClass = (error: unknown): string => {
+  if (!(error instanceof Error)) return "non-error";
+  return KNOWN_ERROR_CLASSES.has(error.name) ? error.name : "other-error";
+};

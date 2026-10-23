@@ -93,6 +93,14 @@ export class OrderRefused extends Error {
   }
 }
 
+/** An order may have been executed although the venue never said so: the maker sends nothing until it has looked. */
+export class OrderOutcomeUnknown extends Error {
+  constructor(market: MarketId, reason: string | undefined) {
+    super(`${market} order outcome unknown: ${reason || "no reason given"}`);
+    this.name = "OrderOutcomeUnknown";
+  }
+}
+
 /** A post-only order that would have taken from the book: the one refusal a quoting maker expects now and then. */
 const ROUTINE_REFUSAL = /would (match|cross)/;
 
@@ -260,6 +268,8 @@ export class HouseMaker {
   private standing = true;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
+  /** An order's outcome is unknown: no quote goes out until a cancel and a read of the seat have both worked. */
+  private unreconciled = false;
   private readonly expiresInSeconds: number;
 
   constructor(private readonly options: HouseMakerOptions) {
@@ -328,6 +338,7 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
+    if (this.unreconciled) await this.reconcile(venue);
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
     if (!market || market.markPrice === null) return;
@@ -356,6 +367,7 @@ export class HouseMaker {
     const flagged = venueReducesOnly || next.flatten === true;
     this.standing = true;
     let leftOut = 0;
+    let unknownReason: string | undefined;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) return;
@@ -365,6 +377,11 @@ export class HouseMaker {
           expiresInSeconds: this.expiresInSeconds,
         };
         const placed = await venue.placeOrder(this.trader, sent);
+        if (placed.outcomeUnknown) {
+          this.unreconciled = true;
+          unknownReason = placed.reason;
+          break;
+        }
         if (!safety || placed.status !== "rejected") continue;
         if (!isRoutineRefusal(sent, placed.reason)) {
           throw new OrderRefused(this.options.market, placed.reason);
@@ -374,6 +391,11 @@ export class HouseMaker {
     } catch (error) {
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
+    }
+    if (this.unreconciled) {
+      this.lastQuoted = null;
+      await this.withdraw(venue).catch(() => {});
+      throw new OrderOutcomeUnknown(this.options.market, unknownReason);
     }
 
     // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
@@ -385,6 +407,17 @@ export class HouseMaker {
     this.lastQuotedAtMs = now;
     safety?.requoteSucceeded();
     if (!next.reduceOnly) this.options.afterRequote?.();
+  }
+
+  /** Ends the quarantine once the quotes are off and the seat can be read. A failure keeps it, and is thrown. */
+  private async reconcile(venue: Venue): Promise<void> {
+    await venue.cancelAll(this.trader, this.options.market);
+    this.standing = false;
+    const seat = await venue.traderState(this.trader);
+    if (seat.openOrders.some((open) => open.market === this.options.market)) {
+      throw new OrderOutcomeUnknown(this.options.market, "orders still show after a cancel");
+    }
+    this.unreconciled = false;
   }
 
   /** The seat's equity and position are what the risk rules judge the maker by. */

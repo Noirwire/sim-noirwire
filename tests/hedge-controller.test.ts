@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { MakerMode } from "../src/bots/maker-state.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { HedgeController } from "../src/hedge/hedge-controller.js";
-import { HEDGE_LIMITS } from "../src/hedge/hedge-limits.js";
+import { errorClass } from "../src/hedge/call-deadline.js";
+import { HEDGE_LIMITS, LATE_DISPATCH_QUARANTINE_MS } from "../src/hedge/hedge-limits.js";
 import type { Reference } from "../src/prices/reference-price.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
 import { dollars } from "./helpers.js";
@@ -33,6 +34,7 @@ const rig = (settled = true) => {
   const said = { alerts: [] as string[], notices: [] as string[] };
   const state = {
     maker: 0n,
+    hangMaker: false,
     mode: "run" as MakerMode,
     reference: { ok: true, price: dollars(150) } as Reference,
   };
@@ -40,7 +42,7 @@ const rig = (settled = true) => {
     venue,
     clock,
     reference: { read: async () => state.reference },
-    makerPosition: async () => state.maker,
+    makerPosition: () => (state.hangMaker ? NEVER() : Promise.resolve(state.maker)),
     makerMode: () => state.mode,
     voice: {
       alert: (message) => said.alerts.push(message),
@@ -66,6 +68,7 @@ const rig = (settled = true) => {
     clock.advance(seconds * 1_000);
     let ended = false;
     const running = controller.tick().finally(() => (ended = true));
+    running.catch(() => {});
     while (!ended) {
       await new Promise((resolve) => setImmediate(resolve));
       timers.fireAll();
@@ -181,7 +184,10 @@ describe("the hedge controller", () => {
       await tick();
       expect(venue.placed).toHaveLength(1);
 
-      await tick(11);
+      await tick(30);
+      expect(venue.placed).toHaveLength(1);
+
+      await tick(30);
       expect(venue.placed.map((order) => order.size)).toEqual([dollars(1), dollars(0.5)]);
     });
 
@@ -194,7 +200,7 @@ describe("the hedge controller", () => {
       await tick();
       expect(venue.placed).toHaveLength(1);
 
-      await tick(11);
+      await tick(LATE_DISPATCH_QUARANTINE_MS / 1_000);
       expect(venue.placed).toHaveLength(2);
       expect(venue.position).toBe(dollars(-1));
     });
@@ -226,8 +232,8 @@ describe("the hedge controller", () => {
       state.maker = dollars(1);
 
       await tick();
-      await tick(15);
-      await tick(15);
+      await tick(30);
+      await tick(30);
       expect(venue.placed).toHaveLength(1);
 
       venue.cancelFails = false;
@@ -364,6 +370,48 @@ describe("the hedge controller", () => {
       expect(controller.status()).toBe("blind");
     });
 
+    it("goes blind at once when the maker's position read hangs after a healthy tick", async () => {
+      const { state, controller, tick, tickThroughDeadlines } = rig();
+      await tick();
+      expect(controller.status()).toBe("ok");
+
+      state.hangMaker = true;
+      await expect(tickThroughDeadlines()).rejects.toThrow("did not answer");
+
+      expect(controller.status()).toBe("blind");
+
+      state.hangMaker = false;
+      await tick();
+      expect(controller.status()).toBe("ok");
+    });
+
+    it("sends no second order while the first may still dispatch, even after its cancel and the settle time", async () => {
+      const { venue, state, controller, tickThroughDeadlines, tick } = rig();
+      const first = venue.placeIoc.bind(venue);
+      let sent = 0;
+      venue.placeIoc = (order) => {
+        sent += 1;
+        return sent === 1 ? NEVER() : first(order);
+      };
+      state.maker = dollars(1);
+
+      await tickThroughDeadlines();
+      expect(sent).toBe(1);
+
+      await tick(HEDGE_LIMITS.settleAfterUnknownMs / 1_000 + 1);
+      expect(sent).toBe(1);
+
+      // The first order reaches the venue late, inside the quarantine, and fills.
+      venue.position = dollars(-1);
+      state.maker = dollars(1.5);
+      await tick(5);
+      expect(sent).toBe(1);
+
+      await tick(LATE_DISPATCH_QUARANTINE_MS / 1_000);
+      expect(venue.placed.map((order) => order.size)).toEqual([dollars(0.5)]);
+      expect(controller.hedgedPosition).toBe(dollars(-1.5));
+    });
+
     it("counts a cancel that never answers as a cancel that failed", async () => {
       const { venue, state, said, tickThroughDeadlines } = rig();
       venue.script({ lost: true });
@@ -413,6 +461,30 @@ describe("the hedge controller", () => {
 
       await tick();
 
+      expect(said.notices.join("\n")).not.toContain(SECRET);
+    });
+
+    it("maps an error class it does not know to other-error, whatever its name says", () => {
+      const named = new Error("x");
+      named.name = `Auth_${SECRET}`;
+
+      expect(errorClass(named)).toBe("other-error");
+      expect(errorClass(new TypeError("x"))).toBe("TypeError");
+      expect(errorClass(new Error("x"))).toBe("Error");
+    });
+
+    it("keeps a custom error name out of the notice", async () => {
+      const { venue, state, said, tick } = rig();
+      venue.placeIoc = async () => {
+        const error = new Error("denied");
+        error.name = `Auth_${SECRET}`;
+        throw error;
+      };
+      state.maker = dollars(1);
+
+      await tick();
+
+      expect(said.notices.join("\n")).toContain("other-error");
       expect(said.notices.join("\n")).not.toContain(SECRET);
     });
 

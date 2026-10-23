@@ -12,7 +12,8 @@ import type { AppContext } from "../context.js";
  * While awake the answer also carries `trading: { ready, reason? }`, which is
  * not `ok`: a blind hedge or a stopped maker makes it not ready but leaves the
  * status code alone, so a probe does not restart a process that restarting
- * cannot help. Alert on `trading.ready` instead.
+ * cannot help. A lagging hedge counts as ready; the keeper and the price
+ * crank are not covered. The service alerts on the transition itself.
  */
 export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void => {
   app.get("/v1/health", { config: { wakes: false } }, async (_request, reply) => {

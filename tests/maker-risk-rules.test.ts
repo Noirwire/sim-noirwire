@@ -168,6 +168,8 @@ class Book {
   /** The venue answers every order with a refusal, giving this reason. */
   rejecting: string | null = null;
   rejectedCount = 0;
+  /** The venue answers every order as rejected but possibly executed, giving this reason. */
+  unknownBecause: string | null = null;
   beforePlacing: (() => Promise<void>) | null = null;
   /** Why the market would refuse a resting order, and whether it still takes reduce-only ones. */
   refusedBecause: string | null = null;
@@ -184,6 +186,17 @@ class Book {
       placeOrder: async (_trader: string, order: NewOrder) => {
         await this.beforePlacing?.();
         if (this.failPlacing) throw this.failPlacing;
+        if (this.unknownBecause !== null) {
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: this.unknownBecause,
+            outcomeUnknown: true,
+          };
+        }
         if (this.rejecting !== null) {
           this.rejectedCount += 1;
           return {
@@ -1846,4 +1859,35 @@ describe("the maker's state file from before the flattening existed", () => {
     expect(ledger.state.mode).toBe("reduce");
     expect(ledger.state.flattenStartedAtMs).toBeNull();
   });
+});
+
+describe("an order whose outcome is unknown", () => {
+  it.each([
+    ["a routine-looking", "post-only order would match"],
+    ["a non-routine", "the connection dropped"],
+  ])(
+    "takes the quotes off and holds the maker, whatever %s reason it carries",
+    async (_, reason) => {
+      const { warmUp, book, tick, ledger } = await rig(`unknown-${reason.length}`);
+      await warmUp();
+      book.take();
+      const cancelsBefore = book.cancels;
+      book.unknownBecause = reason;
+
+      await expect(tick(11)).rejects.toThrow("outcome unknown");
+
+      expect(book.cancels).toBeGreaterThan(cancelsBefore);
+      expect(ledger.state.mode).toBe("run");
+
+      book.unknownBecause = null;
+      book.failCancelling = new Error("the venue is away");
+      await expect(tick(11)).rejects.toThrow("the venue is away");
+      expect(book.take()).toEqual([]);
+
+      book.failCancelling = null;
+      await tick(11);
+      await tick(11);
+      expect(book.take().length).toBeGreaterThan(0);
+    },
+  );
 });

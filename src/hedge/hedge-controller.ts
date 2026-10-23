@@ -6,7 +6,12 @@ import { absBigInt, mulDivScale, toDecimalString } from "../engine/money.js";
 import type { Reference } from "../prices/reference-price.js";
 import { type Schedule, errorClass, realSchedule, withinDeadline } from "./call-deadline.js";
 import { decideHedge } from "./hedge-decision.js";
-import { HEDGE_LIMITS, type HedgeSettings, VENUE_CALL_TIMEOUT_MS } from "./hedge-limits.js";
+import {
+  HEDGE_LIMITS,
+  type HedgeSettings,
+  LATE_DISPATCH_QUARANTINE_MS,
+  VENUE_CALL_TIMEOUT_MS,
+} from "./hedge-limits.js";
 import type { HedgeAccount, HedgeMarketRules, HedgeOrder, HedgeVenue } from "./hedge-venue.js";
 
 /**
@@ -54,6 +59,8 @@ interface UnexplainedOrder {
   positionBefore: bigint;
   cancelled: boolean;
   alerted: boolean;
+  /** The order's call may still be dispatched late until then, so nothing clears the hold before it. */
+  quarantinedUntilMs: number;
 }
 
 const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
@@ -118,7 +125,14 @@ export class HedgeController implements HedgeGate {
 
   async tick(): Promise<void> {
     const { clock, makerMode, makerPosition } = this.options;
-    const maker = await this.within("the maker's position", makerPosition);
+    let maker: bigint;
+    try {
+      maker = await this.within("the maker's position", makerPosition);
+    } catch (error) {
+      // Without the maker's exposure the controller cannot hedge it: say so now, not when the last read ages out.
+      this.reachable = false;
+      throw error;
+    }
     const account = await this.readVenue();
     const { rules } = this;
     if (!account || !rules) return;
@@ -181,6 +195,7 @@ export class HedgeController implements HedgeGate {
         positionBefore: account.position,
         cancelled: true,
         alerted: false,
+        quarantinedUntilMs: 0,
       };
     }
   }
@@ -221,6 +236,7 @@ export class HedgeController implements HedgeGate {
         positionBefore,
         cancelled: false,
         alerted: false,
+        quarantinedUntilMs: clock.nowMs() + LATE_DISPATCH_QUARANTINE_MS,
       };
       await this.cancelUnexplained(this.unexplained);
     }
@@ -246,13 +262,15 @@ export class HedgeController implements HedgeGate {
    * Whether an order of unknown outcome is still unexplained, which holds every new order. It is
    * explained when the hedge position moved, or when the venue's fills show its client id and the
    * position has caught up. With neither, it is explained as not filled only once its cancel went
-   * through and the settle time has passed. A cancel that fails is retried every tick.
+   * through and the settle time has passed. A cancel that fails is retried every tick. An order
+   * whose call timed out or failed is held in either case until its late-dispatch quarantine ends.
    */
   private async stillUnexplained(account: HedgeAccount): Promise<boolean> {
     const order = this.unexplained;
     if (!order) return false;
     const { venue, clock } = this.options;
-    if (account.position !== order.positionBefore) {
+    const quarantined = clock.nowMs() < order.quarantinedUntilMs;
+    if (account.position !== order.positionBefore && !quarantined) {
       this.unexplained = null;
       return false;
     }
@@ -261,7 +279,11 @@ export class HedgeController implements HedgeGate {
       () => null,
     );
     if (fills === null || fills.some((fill) => fill.clientId === order.clientId)) return true;
-    if (order.cancelled && clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs) {
+    if (
+      order.cancelled &&
+      !quarantined &&
+      clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs
+    ) {
       this.unexplained = null;
       return false;
     }
