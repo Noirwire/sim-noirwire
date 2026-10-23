@@ -98,6 +98,16 @@ describe("the hedge controller", () => {
       expect(venue.position).toBe(dollars(-1));
     });
 
+    it("reports blind inside the settle window so the maker cannot add exposure", async () => {
+      const { controller, tick } = rig(false);
+
+      await tick(1);
+      expect(controller.status()).toBe("blind");
+
+      await tick(10);
+      expect(controller.status()).not.toBe("blind");
+    });
+
     it("says once that it is waiting for the venue to settle", async () => {
       const { said, state, tick } = rig(false);
       state.maker = dollars(1);

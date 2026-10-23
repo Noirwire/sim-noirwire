@@ -96,6 +96,7 @@ export class HedgeController implements HedgeGate {
     if (!this.reachable || lastRead === null || now - lastRead > settings.confirmTimeoutMs) {
       return "blind";
     }
+    if (now < this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return "blind";
     const exposed = this.unhedgedNotional();
     if (exposed >= settings.hardUnhedgedNotional) return "blind";
     if (exposed >= settings.softUnhedgedNotional) return "lagging";
