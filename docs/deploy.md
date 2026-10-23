@@ -423,10 +423,19 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
 
 ### The hedge controller on mainnet (off by default)
 
-`HEDGE_ENABLED` is unset by default and nothing hedge-related runs. This build contains no
-client for a real hedge venue, so `HEDGE_ENABLED=1` stops the start with a message saying
-so; a client is added behind the `HedgeVenue` interface after it has been tried by hand. The
-settings, all optional:
+`HEDGE_ENABLED` is unset by default and nothing hedge-related runs. This repository contains
+no client for a real hedge venue. With `HEDGE_ENABLED=1` the service loads one from a module
+implementing the `HedgeVenue` interface, supplied separately and kept out of this repository:
+
+- `HEDGE_VENUE_MODULE`: the absolute path of the module's JavaScript file. Required with
+  `HEDGE_ENABLED=1`; a relative path or a missing file stops the start. Ignored, and never
+  imported, when the hedge is off.
+- `HEDGE_VENUE_*`: every other variable with this prefix is handed to the module with the prefix
+  removed (`HEDGE_VENUE_API_URL` becomes `API_URL`). Values are never logged; errors name keys only.
+
+At start the service calls the venue's `health()` and `rules()` once and refuses to start if
+either fails or returns nothing. Try the module by hand before enabling it. The settings, all
+optional:
 
 - `HEDGE_SOFT_UNHEDGED_NUSD` (100): unhedged exposure from which the hedge is lagging and the
   maker quotes 10 bps wider.

@@ -77,6 +77,8 @@ const envSchema = z.object({
 
   /** The hedge controller offsets the maker's SOL exposure on an outside perpetuals venue. Off, nothing hedge-related runs. */
   HEDGE_ENABLED: boolFlag("0"),
+  /** Absolute path of the module that supplies the hedge venue. Required with HEDGE_ENABLED=1, ignored otherwise. */
+  HEDGE_VENUE_MODULE: z.string().optional(),
   /** Unhedged exposure from which the hedge is lagging and the maker quotes wider. */
   HEDGE_SOFT_UNHEDGED_NUSD: decimalAmount("100"),
   /** Unhedged exposure from which the hedge is blind and the maker only reduces. Must exceed the soft limit. */

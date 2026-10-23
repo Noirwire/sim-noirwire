@@ -72,8 +72,12 @@ export class HedgeController implements HedgeGate {
   private holdUntilMs = 0;
   private unmanagedAnnounced = false;
   private orders = 0;
+  private readonly startedAtMs: number;
+  private restartNoticeSent = false;
 
-  constructor(private readonly options: HedgeControllerOptions) {}
+  constructor(private readonly options: HedgeControllerOptions) {
+    this.startedAtMs = options.clock.nowMs();
+  }
 
   /** The hedge account's position at the last read the venue answered. */
   get hedgedPosition(): bigint | null {
@@ -92,6 +96,7 @@ export class HedgeController implements HedgeGate {
     if (!this.reachable || lastRead === null || now - lastRead > settings.confirmTimeoutMs) {
       return "blind";
     }
+    if (now < this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return "blind";
     const exposed = this.unhedgedNotional();
     if (exposed >= settings.hardUnhedgedNotional) return "blind";
     if (exposed >= settings.softUnhedgedNotional) return "lagging";
@@ -118,6 +123,7 @@ export class HedgeController implements HedgeGate {
       this.lastPrice = reference.price;
       this.lastPriceAtMs = clock.nowMs();
     }
+    if (this.settlingAfterStart()) return;
     if (await this.stillUnexplained(account)) return;
     if (clock.nowMs() < this.holdUntilMs) return;
 
@@ -165,6 +171,22 @@ export class HedgeController implements HedgeGate {
         alerted: false,
       };
     }
+  }
+
+  /**
+   * An order sent just before a restart is not known to this process, so no order is sent until the
+   * venue has had the settle time to show it. The account is still read and noted meanwhile.
+   */
+  private settlingAfterStart(): boolean {
+    const { clock, voice, market } = this.options;
+    if (clock.nowMs() >= this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return false;
+    if (!this.restartNoticeSent) {
+      this.restartNoticeSent = true;
+      voice.notice(
+        `${market} hedge is waiting for the venue to settle after a restart before it sends an order`,
+      );
+    }
+    return true;
   }
 
   /** Whether the venue took the order. A refusal or an unclear answer holds back the next order. */

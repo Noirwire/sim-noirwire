@@ -108,27 +108,28 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                                 | Required | What it is                                                                                                           |
-| ------------------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`                                 |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                                            |
-| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`                                          |
-| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own                                    |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                                                 |
-| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)                              |
-| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine                             |
-| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                                          |
-| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)                              |
-| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                                                    |
-| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)                                      |
-| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)                               |
-| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)                                           |
-| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                          |
-| `HEDGE_ENABLED`                                                          | no       | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                     |
-| `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no       | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                        |
-| `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no       | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3) |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                                                          |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open                                |
+| Variable                                                                 | Required   | What it is                                                                                                                                                   |
+| ------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SOLANA_RPC_URL`                                                         | yes        | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`                                                                         |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes        | The rollup's private endpoint through the query filter, and its websocket                                                                                    |
+| `DEPOSIT_RPC_URL`                                                        | no         | Overrides where deposits are sent; by default the deployment's `depositUrl`                                                                                  |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no         | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own                                                                            |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes        | The deployment description the order book repository's set-up prints                                                                                         |
+| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes        | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)                                                                      |
+| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead    | The path of each keypair file, in place of the key itself, for a run on your own machine                                                                     |
+| `BOT_TRADER_SEEDS`                                                       | yes        | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                                                                                  |
+| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no         | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)                                                                      |
+| `SERVICE_LOCATION`                                                       | no         | Where the service runs; labels the latency figure                                                                                                            |
+| `HOUSE_MAKER_RISK_RULES`                                                 | no         | `1` makes the house maker follow the risk rules (always on, mainnet; see below)                                                                              |
+| `IDLE_AFTER_MS`                                                          | no         | How long the service keeps trading after the last request, with no socket (10 minutes)                                                                       |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no         | How long it keeps trading after the last stream socket closes (15 seconds)                                                                                   |
+| `HEALTHCHECK_URL`                                                        | no         | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                                                                  |
+| `HEDGE_ENABLED`                                                          | no         | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                                                             |
+| `HEDGE_VENUE_MODULE`, `HEDGE_VENUE_*`                                    | with hedge | Absolute path of the hedge venue module (required with `HEDGE_ENABLED=1`, ignored otherwise); every other `HEDGE_VENUE_*` is passed to it without the prefix |
+| `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no         | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                                                                |
+| `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no         | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3)                                         |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no         | Bot order sizes as notional                                                                                                                                  |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no         | Seats the liquidator tries blind per market per tick; seats this service did not open                                                                        |
 
 ### Mainnet mode
 
@@ -363,9 +364,20 @@ other market with them on.
 An optional controller keeps the maker's net SOL exposure near flat by trading the offsetting
 position on an outside perpetuals venue. It is **off unless `HEDGE_ENABLED=1`**: with it unset
 nothing hedge-related runs and the maker behaves exactly as before. It needs the risk rules
-(`HOUSE_MAKER_RISK_RULES=1`) and a hedge venue client. This build ships only the venue
-interface (`src/hedge/hedge-venue.ts`) and no client for a real venue, so setting
-`HEDGE_ENABLED=1` stops the start with a message that says so.
+(`HOUSE_MAKER_RISK_RULES=1`) and a hedge venue. This repository ships only the venue
+interface (`src/hedge/hedge-venue.ts`); the venue itself comes from a module implementing that
+interface, supplied separately and kept out of this repository.
+
+- **`HEDGE_VENUE_MODULE`** is the absolute path of that module's JavaScript file. It is required
+  with `HEDGE_ENABLED=1` and ignored, never imported, when the hedge is off. A relative path or a
+  missing file stops the start. The module's default export is a function
+  `createVenue(config: Record<string, string>): Promise<HedgeVenue>`.
+- **`HEDGE_VENUE_*`** settings are passed to that function: every environment variable starting
+  with `HEDGE_VENUE_`, except `HEDGE_VENUE_MODULE`, with the prefix removed (`HEDGE_VENUE_API_URL`
+  arrives as `API_URL`). Their values are never logged; start-up errors name only the keys.
+- **Start-up checks.** The service refuses to start if the module cannot be imported, does not
+  export the function, returns something that lacks any `HedgeVenue` method, or if the venue's
+  `health()` or `rules()` fails or returns nothing.
 
 - **What it sends.** Each tick it reads the maker's position and the venue's real position and
   sends at most one immediate-or-cancel order that works the difference toward zero, priced at
