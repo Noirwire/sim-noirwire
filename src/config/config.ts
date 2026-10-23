@@ -75,6 +75,17 @@ const envSchema = z.object({
   /** Pinged after each good requote of the house maker, so an outside monitor notices when the pings stop. */
   HEALTHCHECK_URL: z.url().optional(),
 
+  /** The hedge controller offsets the maker's SOL exposure on an outside perpetuals venue. Off, nothing hedge-related runs. */
+  HEDGE_ENABLED: boolFlag("0"),
+  /** Unhedged exposure from which the hedge is lagging and the maker quotes wider. */
+  HEDGE_SOFT_UNHEDGED_NUSD: decimalAmount("100"),
+  /** Unhedged exposure from which the hedge is blind and the maker only reduces. Must exceed the soft limit. */
+  HEDGE_HARD_UNHEDGED_NUSD: decimalAmount("250"),
+  /** No venue confirmation for this long makes the hedge lagging. */
+  HEDGE_CONFIRM_TIMEOUT_SECONDS: positiveInt(60),
+  /** Margin cap: the hedge position never grows past the hedge account's margin times this. */
+  HEDGE_MAX_LEVERAGE: positiveInt(3),
+
   /** The noise takers trade at all. Off, none is opened, funded or started. */
   NOISE_TAKERS_ENABLED: boolFlag("1"),
   NOISE_TAKER_TICK_MS: positiveInt(500),

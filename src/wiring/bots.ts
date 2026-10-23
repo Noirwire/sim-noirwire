@@ -1,4 +1,7 @@
+import { makerTraderKey } from "../bots/bot-traders.js";
 import { FundingUpdater } from "../bots/funding-updater.js";
+import { HedgeController, type HedgeGate } from "../hedge/hedge-controller.js";
+import type { HedgeVenue } from "../hedge/hedge-venue.js";
 import { healthPing } from "../bots/health-ping.js";
 import { HouseMaker } from "../bots/house-maker.js";
 import { Liquidator } from "../bots/liquidator.js";
@@ -11,6 +14,7 @@ import { SeededRandom } from "../bots/rng.js";
 import type { Config } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
+import type { Venue } from "../engine/types.js";
 import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
@@ -33,6 +37,51 @@ const makerVoice = (problems: BotProblems): MakerVoice => ({
   notice: (message) => problems.onError(message, null),
 });
 
+/** HEDGE_ENABLED is set but the service cannot hedge as configured. It cannot start. */
+export class HedgeNotAvailable extends Error {
+  constructor(reason: string) {
+    super(`HEDGE_ENABLED=1 cannot start: ${reason}`);
+    this.name = "HedgeNotAvailable";
+  }
+}
+
+/** The hedge controller for one maker, or nothing while hedging is off. */
+const hedgeController = (
+  config: Config,
+  market: MarketConfig,
+  ledger: MakerLedger,
+  reference: ReferencePrice,
+  botVenue: Venue,
+  hedgeVenue: HedgeVenue | undefined,
+  problems: BotProblems,
+): HedgeController => {
+  if (!hedgeVenue) {
+    throw new HedgeNotAvailable(
+      "this build has no client for a hedge venue. Unset HEDGE_ENABLED to run the maker unhedged.",
+    );
+  }
+  if (config.HEDGE_SOFT_UNHEDGED_NUSD >= config.HEDGE_HARD_UNHEDGED_NUSD) {
+    throw new HedgeNotAvailable("HEDGE_SOFT_UNHEDGED_NUSD must be below HEDGE_HARD_UNHEDGED_NUSD.");
+  }
+  const trader = makerTraderKey(market.id);
+  return new HedgeController({
+    venue: hedgeVenue,
+    clock: systemClock,
+    reference,
+    makerPosition: async () =>
+      (await botVenue.traderState(trader)).positions[market.id]?.size ?? 0n,
+    makerMode: () => ledger.state.mode,
+    voice: makerVoice(problems),
+    market: market.id,
+    settings: {
+      softUnhedgedNotional: config.HEDGE_SOFT_UNHEDGED_NUSD,
+      hardUnhedgedNotional: config.HEDGE_HARD_UNHEDGED_NUSD,
+      confirmTimeoutMs: config.HEDGE_CONFIRM_TIMEOUT_SECONDS * 1_000,
+      maxLeverage: config.HEDGE_MAX_LEVERAGE,
+    },
+  });
+};
+
 /** The risk rules for one maker. They know the SOL price only, so they cover SOL perpetuals only. */
 const makerSafety = (
   market: MarketConfig,
@@ -40,6 +89,7 @@ const makerSafety = (
   reference: ReferencePrice,
   control: MakerControl,
   problems: BotProblems,
+  hedge?: HedgeGate,
 ): MakerSafety => {
   if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
     throw new Error(
@@ -55,6 +105,7 @@ const makerSafety = (
     clock: systemClock,
     voice,
     market: market.id,
+    hedge,
   });
 };
 
@@ -124,12 +175,19 @@ export const openBots = async (
   config: Config,
   wiring: VenueWiring,
   problems: BotProblems,
+  hedgeVenue?: HedgeVenue,
 ): Promise<OpenedBots> => {
   const { venue, botVenue, botMarkets } = wiring;
   const random = new SeededRandom(config.NOISE_TAKER_SEED);
   const makers: HouseMaker[] = [];
   const takers: NoiseTaker[] = [];
+  const hedges: { market: string; controller: HedgeController }[] = [];
   const rules = config.HOUSE_MAKER_RISK_RULES;
+  if (config.HEDGE_ENABLED && !rules) {
+    throw new HedgeNotAvailable(
+      "the hedge couples to the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
+    );
+  }
   const reference = rules ? new ReferencePrice(referenceSources(), systemClock) : null;
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
@@ -142,8 +200,15 @@ export const openBots = async (
       rules || config.VENUE === "rollup"
         ? await MakerLedger.open(makerStatePath(config.DATA_DIR, market.id))
         : undefined;
+    const hedge =
+      config.HEDGE_ENABLED && reference && ledger
+        ? hedgeController(config, market, ledger, reference, botVenue, hedgeVenue, problems)
+        : undefined;
+    if (hedge) hedges.push({ market: market.id, controller: hedge });
     const safety =
-      reference && ledger ? makerSafety(market, ledger, reference, control, problems) : undefined;
+      reference && ledger
+        ? makerSafety(market, ledger, reference, control, problems, hedge)
+        : undefined;
     const maker = houseMaker(config, market, sizes, { safety, ledger, afterRequote });
     await maker.ensureOpen(botVenue);
     makers.push(maker);
@@ -176,6 +241,9 @@ export const openBots = async (
         loop(`${botMarkets[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
           maker.tick(botVenue),
         ),
+      ),
+      ...hedges.map(({ market, controller }) =>
+        loop(`${market} hedge tick`, config.HOUSE_MAKER_TICK_MS, () => controller.tick()),
       ),
       ...takers.map((taker, at) =>
         loop(`${botMarkets[at].id} taker tick`, config.NOISE_TAKER_TICK_MS, () =>
