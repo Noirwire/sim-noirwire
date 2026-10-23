@@ -345,13 +345,19 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   sources disagreed, a price was old, or the market moved fast, and it quotes again by
   itself after 10 quiet seconds.
 - **A heartbeat for an outside monitor.** Set `HEALTHCHECK_URL` to a ping address (for
-  example a healthchecks.io check) and the maker calls it after each good requote of both
-  sides, about every 10 s. It sends none while a loss limit or the kill switch has the
-  maker reducing, or while the program's market is reduce-only. Set the monitor's period
-  to 1 minute with a short grace, and have it message you when the calls stop. That also
-  fires when the maker is stopped, flattening or reducing, or the prices are pulled for
-  long, which is the point. The address is never logged; if a call fails the log says
-  `health check ping failing` with what to check, and quoting goes on.
+  example a healthchecks.io check) and the maker calls it after a good requote of both
+  sides, at most once every 15 s (the maker requotes about every 10 s, so in practice
+  about every 20 s; a monitor such as healthchecks.io takes five pings a minute per
+  check). It sends none while a loss limit or the kill switch has the maker reducing, or
+  while the program's market is reduce-only. Set the monitor's period to 1 minute with a
+  short grace, and have it message you when the calls stop. That also fires when the
+  maker is stopped, flattening or reducing, or the prices are pulled for long, which is
+  the point. **A page during a reduce-only market is expected, not a fault:** the maker
+  is doing what it should (quoting only the side that shrinks its position, flagged
+  reduce-only) and silences the heartbeat on purpose. Check the market's status first; if
+  it is reduce-only the page is that, and it clears by itself with the first full
+  two-sided requote after the market opens again. The address is never logged; if a call
+  fails the log says `health check ping failing` with what to check, and quoting goes on.
 - **Two stops, and what each does to users.** The soft stop keeps quoting the side that
   shrinks the maker's position, so users can still close against it. The hard stop quotes
   nothing, so **users cannot close their positions until the maker is resumed**; the
@@ -359,8 +365,10 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   since the stop is kept in `DATA_DIR`. Nothing starts the hard stop where the soft stop
   would do. A loss limit flattens (below), an error it does not understand or a control
   file it cannot read falls back to the soft stop, and the hard stop comes only from the
-  operator or from an escalation: a second failure while already reducing, the wider loss
-  limit, a flattening that fails or takes over ten minutes.
+  operator or from an escalation: five errors it does not understand in a row at the soft
+  stop (a good requote in between starts the count again), an error it does not
+  understand while flattening, the wider loss limit, a flattening that fails or takes over
+  ten minutes (three while the reference price is down, see below).
 - **A loss limit flattens.** Past 3% of the day's start or 5% from the peak (counted at the
   worse of the venue's mark and the reference price) the maker works its position down
   with one reduce-only order, at most 25 bps through the fresh reference price, replaced
@@ -369,9 +377,27 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   position remains after ten minutes, it stops altogether. Reduce-only orders carry no
   program expiry (the venue sends none for them), so they stand until the maker cancels
   them at the next requote, at a stop of the service or at its next start.
+  - **Flat means dark.** A flattening that completes leaves the maker with no position and
+    quoting nothing, so new users find an empty book, until an operator resumes it. The
+    breach alert says so when the flattening starts, and when the position reaches flat the
+    log gets one more `ALERT` line: it has reduced its position to flat, quotes nothing
+    until an operator resumes it, and to resume it run the kill switch with `resume` once
+    the market has been checked (see "Resuming" below). That line is the end of a
+    successful flattening, not a new problem.
+  - **Midnight does not reset the loss line.** While the maker still holds a position to
+    flatten, the UTC day's starting equity is kept across 00:00 UTC, so the 6% line keeps
+    counting from where the day began. It starts the new day's count once the position is
+    flat, or when an operator resumes it.
+  - **While the reference price is down,** the loss limits are counted at the last good
+    reference price from the past hour instead of the venue's mark, which may be stale. With
+    no good reference price in the past hour they are counted at the worse of the mark and
+    the last good price known (the mark alone if there never was one), and a flattening gets
+    three minutes before it stops the maker, not ten.
 - **A reduce-only market.** If the exchange admin sets the market to reduce-only, the
   maker keeps quoting the side that shrinks its position, flagged reduce-only, and
-  cancels the rest. No heartbeat is sent meanwhile. Any other reason the program refuses
+  cancels the rest. No heartbeat is sent meanwhile, on purpose, so the outside monitor
+  pages for as long as the market is reduce-only: that page means the market is
+  reduce-only and the maker is working as designed. Any other reason the program refuses
   quotes (paused, a stale mark, a dislocation, a tripped USDC guard) holds all quotes back.
 - **The kill switch** is a command on the machine the service runs on, with the service's
   `DATA_DIR`: `docker exec <container> node dist/kill-switch.js reduce`, `resume`, or
@@ -383,7 +409,9 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   file parses again, until a newer `resume` is written.
 - **Resuming** after a loss limit: check the position, the market and the seat's equity
   first, and that the exchange's keeper is running. `resume` makes the loss limits count
-  from the equity then, so it accepts the loss that stopped the maker.
+  from the equity then, so it accepts the loss that stopped the maker. A maker that
+  flattened successfully does not resume by itself: it stays dark, quoting nothing, until
+  `resume` is run (`docker exec <container> node dist/kill-switch.js resume`).
 - **Files in `DATA_DIR`:** `maker-NSOL-PERP.json` (mode, the equity the limits count from)
   and `maker-control.json` (the last kill switch request). If the first cannot be read, the
   service stops at start and says so: fix or move it away on purpose, since starting

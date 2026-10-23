@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { healthPing } from "../src/bots/health-ping.js";
+import { MIN_PING_GAP_MS, healthPing } from "../src/bots/health-ping.js";
 import { HouseMaker, type HouseMakerOptions, ladderOrders } from "../src/bots/house-maker.js";
 import type { MakerSafety, Plan } from "../src/bots/maker-safety.js";
 import { loadConfig } from "../src/config/config.js";
@@ -8,6 +8,7 @@ import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/typ
 import { dollars } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
+const START_MS = Date.parse("2026-11-02T12:00:00Z");
 const SECRET_URL = "https://hc-ping.example/3f9a1c2e-secret-token";
 
 const problemsOf = () => {
@@ -66,6 +67,8 @@ describe("the health check ping", () => {
   });
 
   it("survives a log that throws", async () => {
+    const clock = new ManualClock(START_MS);
+    let sends = 0;
     const ping = healthPing(
       SECRET_URL,
       {
@@ -74,30 +77,45 @@ describe("the health check ping", () => {
         },
         onRecovered: () => {},
       },
-      async () => ({ status: 500 }),
+      async () => {
+        sends += 1;
+        return { status: 500 };
+      },
+      clock,
     );
 
     ping();
     await settle();
+    clock.advance(MIN_PING_GAP_MS);
     ping();
     await settle();
+
+    expect(sends).toBe(2);
   });
 
   it("reports that it works again after a failure, and sends no second ping while one is on its way", async () => {
     const { seen, problems } = problemsOf();
+    const clock = new ManualClock(START_MS);
     let answers = 0;
     let release = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
-    const ping = healthPing(SECRET_URL, problems, async () => {
-      answers += 1;
-      if (answers === 1) throw new Error("down");
-      await gate;
-      return { status: 200 };
-    });
+    const ping = healthPing(
+      SECRET_URL,
+      problems,
+      async () => {
+        answers += 1;
+        if (answers === 1) throw new Error("down");
+        await gate;
+        return { status: 200 };
+      },
+      clock,
+    );
 
     ping();
     await settle();
+    clock.advance(MIN_PING_GAP_MS);
     ping();
+    clock.advance(MIN_PING_GAP_MS);
     ping();
     await settle();
     expect(answers).toBe(2);
@@ -106,6 +124,78 @@ describe("the health check ping", () => {
 
     expect(seen.errors).toHaveLength(1);
     expect(seen.recovered).toBe(1);
+  });
+
+  it("sends at most one ping every 15 s, however often the maker requotes", async () => {
+    const clock = new ManualClock(START_MS);
+    const sent: number[] = [];
+    const ping = healthPing(
+      SECRET_URL,
+      problemsOf().problems,
+      async () => {
+        sent.push(clock.nowMs() - START_MS);
+        return { status: 200 };
+      },
+      clock,
+    );
+
+    for (let at = 0; at <= 60_000; at += 10_000) {
+      clock.set(START_MS + at);
+      ping();
+      await settle();
+    }
+
+    expect(sent).toEqual([0, 20_000, 40_000, 60_000]);
+  });
+
+  it("sends the next ping once 15 s have passed since the last, and not a moment before", async () => {
+    const clock = new ManualClock(START_MS);
+    let sends = 0;
+    const ping = healthPing(
+      SECRET_URL,
+      problemsOf().problems,
+      async () => {
+        sends += 1;
+        return { status: 200 };
+      },
+      clock,
+    );
+
+    ping();
+    await settle();
+    clock.advance(MIN_PING_GAP_MS - 1);
+    ping();
+    await settle();
+    expect(sends).toBe(1);
+
+    clock.advance(1);
+    ping();
+    await settle();
+    expect(sends).toBe(2);
+  });
+
+  it("counts the gap from the last ping it sent, not from a call it dropped", async () => {
+    const clock = new ManualClock(START_MS);
+    let sends = 0;
+    const ping = healthPing(
+      SECRET_URL,
+      problemsOf().problems,
+      async () => {
+        sends += 1;
+        return { status: 200 };
+      },
+      clock,
+    );
+
+    ping();
+    await settle();
+    clock.advance(10_000);
+    ping();
+    clock.advance(5_000);
+    ping();
+    await settle();
+
+    expect(sends).toBe(2);
   });
 
   it("is read from HEALTHCHECK_URL, which is optional and must be an address", () => {
@@ -282,6 +372,7 @@ describe("a maker whose cancel failed", () => {
     const safety = {
       assess: async () => plan,
       stopFor: async () => {},
+      requoteSucceeded: () => {},
     } as unknown as MakerSafety;
     const maker = makerOver({ safety });
     const venue = book.asVenue();

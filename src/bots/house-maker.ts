@@ -383,6 +383,7 @@ export class HouseMaker {
     }
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
+    safety?.requoteSucceeded();
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
 
@@ -424,9 +425,9 @@ export class HouseMaker {
   /**
    * An order failed for a reason that is not the venue being away. With the
    * risk rules the maker does not guess: it falls back to the soft stop, or
-   * stops altogether if it was not quoting freely already (see
-   * `MakerRisk.stopFor`), takes its quotes off if it can, and an operator
-   * resumes it. A cancel that fails is not treated this way, since it only
+   * stops altogether if it was flattening already or has met such errors
+   * repeatedly at the soft stop (see `MakerRisk.stopFor`), takes its quotes
+   * off if it can, and an operator resumes it. A cancel that fails is not treated this way, since it only
    * removes risk: the tick that follows tries it again.
    */
   private async stopAfter(venue: Venue, error: unknown): Promise<void> {
