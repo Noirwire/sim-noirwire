@@ -7,6 +7,8 @@ import { SnapshotStore } from "./data/snapshot.js";
 import { StatsTracker } from "./data/stats.js";
 import { TapeStore } from "./data/tape-store.js";
 import { systemClock } from "./engine/clock.js";
+import type { HedgeVenue } from "./hedge/hedge-venue.js";
+import { HedgeVenueLoadError, hedgeVenueFor } from "./hedge/venue-loader.js";
 import { Hub } from "./http/hub.js";
 import { buildServer } from "./http/server.js";
 import { firstLine } from "./logging/first-line.js";
@@ -160,6 +162,8 @@ export const startApp = async (
   let closed = false;
   let closing: Promise<void> | null = null;
   let bots: OpenedBots | null = null;
+  /** Loaded once: a start-up retry reuses the venue rather than loading the module again. */
+  let hedgeVenue: HedgeVenue | undefined;
 
   /** Once the loops have stopped, the makers' quotes come off the venue: a stopped service leaves none standing. */
   const takeQuotesOff = async (): Promise<void> => {
@@ -169,14 +173,23 @@ export const startApp = async (
   const startUp = new StartUp({
     work: async () => {
       await wiring.prepare();
-      bots = await openBots(config, wiring, {
-        onError: logError,
-        onRecovered: logRecovered,
-      });
+      hedgeVenue ??= await hedgeVenueFor(config);
+      bots = await openBots(
+        config,
+        wiring,
+        {
+          onError: logError,
+          onRecovered: logRecovered,
+        },
+        hedgeVenue,
+      );
     },
     wanted: () => activity.wanted(),
     cleanup: () => wiring.rest(),
-    isFatal: (error) => error instanceof NetworkMismatch || error instanceof HedgeNotAvailable,
+    isFatal: (error) =>
+      error instanceof NetworkMismatch ||
+      error instanceof HedgeNotAvailable ||
+      error instanceof HedgeVenueLoadError,
     onFailure: (error, failures, retryInMs) =>
       console.error(
         `sim-noirwire: start-up failed (try ${failures}), trying again in ${Math.round(retryInMs / 1_000)} s: ${firstLine(error)}`,

@@ -57,7 +57,7 @@ const hedgeController = (
 ): HedgeController => {
   if (!hedgeVenue) {
     throw new HedgeNotAvailable(
-      "this build has no client for a hedge venue. Unset HEDGE_ENABLED to run the maker unhedged.",
+      "no hedge venue was supplied. Set HEDGE_VENUE_MODULE, or unset HEDGE_ENABLED to run the maker unhedged.",
     );
   }
   if (config.HEDGE_SOFT_UNHEDGED_NUSD >= config.HEDGE_HARD_UNHEDGED_NUSD) {
