@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { MakerLedger, type MakerMode, makerStatePath } from "../src/bots/maker-state.js";
@@ -438,6 +438,43 @@ describe("the hedge controller", () => {
       await tick();
 
       expect(venue.placed).toHaveLength(0);
+    });
+
+    it("keeps a hard stop saved while the marker stood as stopped after a restart, but a marker alone as reduce", async () => {
+      const dir = join(root, "stop-saved-under-marker");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ peakEquity: dollars(1_000) })).rejects.toThrow();
+      await rm(path, { recursive: true });
+      await ledger.update({ mode: "stopped", reason: "the kill switch", lastCommandAtMs: 7 });
+
+      const restarted = await MakerLedger.open(path);
+      expect(restarted.hedgeMode).toBe("stopped");
+      const { venue, state, tick } = rig(true, () => restarted.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+      await tick();
+      expect(venue.placed).toHaveLength(0);
+
+      await rm(path);
+      await writeFile(
+        path,
+        JSON.stringify({
+          mode: "run",
+          reason: null,
+          flattenStartedAtMs: null,
+          day: null,
+          dayStartEquity: null,
+          peakEquity: null,
+          lastCommandAtMs: 7,
+          spotBaseAtStart: null,
+        }),
+      );
+      const markerOnly = await MakerLedger.open(path);
+      expect(markerOnly.state.mode).toBe("stopped");
+      expect(markerOnly.hedgeMode).toBe("reduce");
     });
 
     it("still abandons the hedge at an intentional hard stop", async () => {

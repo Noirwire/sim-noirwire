@@ -220,7 +220,10 @@ export class MakerLedger {
       mode: "stopped",
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
     };
-    return new MakerLedger(path, held, true, true);
+    const ledger = new MakerLedger(path, held, true, true);
+    // A stop that was saved is an intentional one; only a marker over a saved run or a missing file is a fault.
+    ledger.hardStopIntent = loaded.mode === "stopped";
+    return ledger;
   }
 
   get state(): Readonly<MakerState> {
