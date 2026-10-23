@@ -202,7 +202,11 @@ export class MakerLedger {
       }
       loaded = { ...FRESH };
     }
-    if (marker === null) return new MakerLedger(path, loaded, false, false);
+    const withSavedIntent = (ledger: MakerLedger): MakerLedger => {
+      ledger.hardStopIntent = savedHardStop;
+      return ledger;
+    };
+    if (marker === null) return withSavedIntent(new MakerLedger(path, loaded, false, false));
     if (
       marker.phase === "resumed" &&
       loaded.mode === "run" &&
@@ -210,13 +214,15 @@ export class MakerLedger {
     ) {
       try {
         await removeMarker(path);
-        return new MakerLedger(path, loaded, false, false);
+        return withSavedIntent(new MakerLedger(path, loaded, false, false));
       } catch {
-        return new MakerLedger(
-          path,
-          { ...loaded, mode: "stopped", reason: RECOVERY_REQUIRED },
-          true,
-          true,
+        return withSavedIntent(
+          new MakerLedger(
+            path,
+            { ...loaded, mode: "stopped", reason: RECOVERY_REQUIRED },
+            true,
+            true,
+          ),
         );
       }
     }
@@ -225,9 +231,7 @@ export class MakerLedger {
       mode: "stopped",
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
     };
-    const ledger = new MakerLedger(path, held, true, true);
-    ledger.hardStopIntent = savedHardStop;
-    return ledger;
+    return withSavedIntent(new MakerLedger(path, held, true, true));
   }
 
   get state(): Readonly<MakerState> {

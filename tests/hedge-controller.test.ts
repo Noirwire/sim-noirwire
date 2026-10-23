@@ -515,6 +515,27 @@ describe("the hedge controller", () => {
       expect((await MakerLedger.open(path)).hedgeMode).toBe("reduce");
     });
 
+    it("keeps a saved stop's intent through a plain open and a later non-mode update", async () => {
+      const dir = join(root, "plain-open");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const old = {
+        mode: "stopped",
+        reason: "the kill switch stopped it",
+        flattenStartedAtMs: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 3,
+        spotBaseAtStart: null,
+      };
+      await writeFile(path, JSON.stringify(old));
+      const ledger = await MakerLedger.open(path);
+      await ledger.update({ peakEquity: 5n });
+      await writeFile(`${path}.failed`, JSON.stringify({ phase: "failed", commandTs: null }));
+      expect((await MakerLedger.open(path)).hedgeMode).toBe("stopped");
+    });
+
     it("still abandons the hedge at an intentional hard stop", async () => {
       const dir = join(root, "intentional");
       await mkdir(dir, { recursive: true });
