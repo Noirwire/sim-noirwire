@@ -23,7 +23,7 @@ import { firstLine } from "../logging/first-line.js";
 import { makerTraderKey } from "./bot-traders.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
 import type { MakerSafety, Plan } from "./maker-safety.js";
-import type { MakerLedger } from "./maker-state.js";
+import { type MakerLedger, StatePersistenceError } from "./maker-state.js";
 
 export interface HouseMakerOptions {
   market: MarketId;
@@ -118,12 +118,13 @@ const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigin
  */
 export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => {
   const { mark, tickSize, position, positionLimit, positionCap, minEdgeBps } = ladder;
-  const inventoryShare = positionLimit > 0n ? Number(position) / Number(positionLimit) : 0;
-  const skewBps = Math.max(-1, Math.min(1, inventoryShare)) * shape.maxSkewBps;
-  const center =
-    mark -
-    (mark * BigInt(Math.round(skewBps * SKEW_PRECISION))) /
-      (BPS_PER_WHOLE * BigInt(SKEW_PRECISION));
+  const boundedPosition =
+    positionLimit > 0n ? maxBigInt(-positionLimit, minBigInt(position, positionLimit)) : 0n;
+  const skewMilliBps =
+    positionLimit > 0n
+      ? (boundedPosition * BigInt(Math.round(shape.maxSkewBps * SKEW_PRECISION))) / positionLimit
+      : 0n;
+  const center = mark - (mark * skewMilliBps) / (BPS_PER_WHOLE * BigInt(SKEW_PRECISION));
   // Rounded up, so the edge is never a unit short of what was asked.
   const minEdge =
     minEdgeBps === undefined
@@ -258,6 +259,8 @@ export class HouseMaker {
   private baseHeldAtStart = 0n;
   /** Whether quotes may be standing on the venue. */
   private standing = true;
+  /** Whether the operator has been told that a cancel is unconfirmed. */
+  private cancelAlerted = false;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
   private readonly expiresInSeconds: number;
@@ -289,6 +292,22 @@ export class HouseMaker {
     this.standing = false;
   }
 
+  /** `withdraw`, telling the operator once if the venue did not confirm the cancel. The error is thrown on. */
+  private async withdrawOrAlert(venue: Venue): Promise<void> {
+    try {
+      await this.withdraw(venue);
+      this.cancelAlerted = false;
+    } catch (error) {
+      if (!this.cancelAlerted) {
+        this.cancelAlerted = true;
+        this.options.safety?.alert(
+          `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). It tries again on every tick.`,
+        );
+      }
+      throw error;
+    }
+  }
+
   private dueForRequote(next: Quoting, nowMs: number): boolean {
     const last = this.lastQuoted;
     if (last === null) return true;
@@ -297,9 +316,8 @@ export class HouseMaker {
     if (next.reduceOnly !== last.reduceOnly) return true;
     if (Boolean(next.flatten) !== Boolean(last.flatten)) return true;
     if (Math.abs(next.extraSpreadBps - last.extraSpreadBps) >= requoteThresholdBps) return true;
-    const movedBps =
-      (Number(next.centre - last.centre) / Number(last.centre)) * Number(BPS_PER_WHOLE);
-    return !(Math.abs(movedBps) < requoteThresholdBps);
+    const moved = absBigInt(next.centre - last.centre) * BPS_PER_WHOLE;
+    return !(moved < BigInt(Math.round(requoteThresholdBps)) * last.centre);
   }
 
   /** A perpetual's position, or on spot how much base it holds beyond what it started with. */
@@ -328,15 +346,28 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
+    if (this.options.ledger?.state.mode === "stopped" && this.standing) {
+      this.lastQuoted = null;
+      await this.withdrawOrAlert(venue);
+    }
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
     if (!market || market.markPrice === null) return;
     const mark = market.markPrice;
     const { safety } = this.options;
-    const plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
+    let plan: Plan;
+    try {
+      plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
+    } catch (error) {
+      // The mode could not be saved, so the ledger holds the hard stop in memory: take the quotes off now.
+      if (error instanceof StatePersistenceError) {
+        await this.withdrawOrAlert(venue).catch(() => {});
+      }
+      throw error;
+    }
     if (plan.action !== "quote") {
       this.lastQuoted = null;
-      if (this.standing) await this.withdraw(venue);
+      if (this.standing) await this.withdrawOrAlert(venue);
       return;
     }
     const refused = market.quotesRefusedBecause;
@@ -353,7 +384,7 @@ export class HouseMaker {
     this.standing = false;
     const position = this.inventory(await venue.traderState(this.trader));
     const orders = this.ordersFor(next, market, position);
-    const flagged = venueReducesOnly || next.flatten === true;
+    const flagged = next.reduceOnly || next.flatten === true;
     this.standing = true;
     let leftOut = 0;
     try {

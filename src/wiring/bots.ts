@@ -70,7 +70,7 @@ const hedgeController = (
     reference,
     makerPosition: async () =>
       (await botVenue.traderState(trader)).positions[market.id]?.size ?? 0n,
-    makerMode: () => ledger.state.mode,
+    makerMode: () => ledger.hedgeMode,
     voice: makerVoice(problems),
     market: market.id,
     settings: {
