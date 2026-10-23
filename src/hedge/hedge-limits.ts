@@ -22,6 +22,12 @@ export const VENUE_CALL_TIMEOUT_MS = 8_000;
  */
 export const LATE_DISPATCH_QUARANTINE_MS = 60_000;
 
+/**
+ * An order of unknown outcome that nothing has explained for this long makes the hedge blind. The hold
+ * itself is never released by age: an operator checks the hedge account.
+ */
+export const UNRESOLVED_HOLD_BLIND_MS = 120_000;
+
 /** The settings an operator chooses, already parsed. */
 export interface HedgeSettings {
   /** Unhedged exposure in dollars from which the hedge counts as lagging. */

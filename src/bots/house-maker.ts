@@ -93,6 +93,9 @@ export class OrderRefused extends Error {
   }
 }
 
+/** How long an order of unknown outcome that has no expiry of its own may still be dispatched late. */
+export const UNKNOWN_ORDER_QUARANTINE_MS = 60_000;
+
 /** An order may have been executed although the venue never said so: the maker sends nothing until it has looked. */
 export class OrderOutcomeUnknown extends Error {
   constructor(market: MarketId, reason: string | undefined) {
@@ -268,14 +271,24 @@ export class HouseMaker {
   private standing = true;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
-  /** An order's outcome is unknown: no quote goes out until a cancel and a read of the seat have both worked. */
+  /**
+   * An order's outcome is unknown: no quote goes out until a cancel and a read of the seat have both
+   * worked and the unknown order can no longer be dispatched (`quarantineUntilMs`).
+   */
   private unreconciled = false;
+  private unknownSinceMs = 0;
+  private quarantineUntilMs = 0;
   private readonly expiresInSeconds: number;
 
   constructor(private readonly options: HouseMakerOptions) {
     this.trader = makerTraderKey(options.market);
     this.expiresInSeconds =
       Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
+  }
+
+  /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
+  get quarantinedSinceMs(): number | null {
+    return this.unreconciled ? this.unknownSinceMs : null;
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
@@ -338,7 +351,7 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
-    if (this.unreconciled) await this.reconcile(venue);
+    if (this.unreconciled && !(await this.reconcile(venue))) return;
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
     if (!market || market.markPrice === null) return;
@@ -378,7 +391,7 @@ export class HouseMaker {
         };
         const placed = await venue.placeOrder(this.trader, sent);
         if (placed.outcomeUnknown) {
-          this.unreconciled = true;
+          this.holdForUnknown(sent);
           unknownReason = placed.reason;
           break;
         }
@@ -409,15 +422,37 @@ export class HouseMaker {
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
 
-  /** Ends the quarantine once the quotes are off and the seat can be read. A failure keeps it, and is thrown. */
-  private async reconcile(venue: Venue): Promise<void> {
+  /**
+   * Holds the maker until `order`, which may have been dispatched, can no longer rest or fill: its own
+   * expiry for a resting order, else `UNKNOWN_ORDER_QUARANTINE_MS`, counted from now.
+   */
+  private holdForUnknown(order: NewOrder): void {
+    const now = this.options.clock.nowMs();
+    if (!this.unreconciled) this.unknownSinceMs = now;
+    this.unreconciled = true;
+    const resting = order.type === "limit" || order.type === "postOnly";
+    const lastsMs =
+      resting && !order.reduceOnly && order.expiresInSeconds !== undefined
+        ? order.expiresInSeconds * 1_000
+        : UNKNOWN_ORDER_QUARANTINE_MS;
+    this.quarantineUntilMs = Math.max(this.quarantineUntilMs, now + lastsMs);
+  }
+
+  /**
+   * Takes the quotes off and reads the seat. The quarantine ends only when the seat shows no order and
+   * the unknown order's lifetime has passed, since a cancel and an empty seat do not stop a send that
+   * has not arrived yet. A failed cancel or read keeps it, and is thrown.
+   */
+  private async reconcile(venue: Venue): Promise<boolean> {
     await venue.cancelAll(this.trader, this.options.market);
     this.standing = false;
     const seat = await venue.traderState(this.trader);
     if (seat.openOrders.some((open) => open.market === this.options.market)) {
       throw new OrderOutcomeUnknown(this.options.market, "orders still show after a cancel");
     }
+    if (this.options.clock.nowMs() < this.quarantineUntilMs) return false;
     this.unreconciled = false;
+    return true;
   }
 
   /** The seat's equity and position are what the risk rules judge the maker by. */

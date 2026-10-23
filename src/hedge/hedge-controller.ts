@@ -10,6 +10,7 @@ import {
   HEDGE_LIMITS,
   type HedgeSettings,
   LATE_DISPATCH_QUARANTINE_MS,
+  UNRESOLVED_HOLD_BLIND_MS,
   VENUE_CALL_TIMEOUT_MS,
 } from "./hedge-limits.js";
 import type { HedgeAccount, HedgeMarketRules, HedgeOrder, HedgeVenue } from "./hedge-venue.js";
@@ -116,6 +117,10 @@ export class HedgeController implements HedgeGate {
       return "blind";
     }
     if (now < this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return "blind";
+    // A hold that nothing has resolved is never released by age, but it is no longer a hedge anyone can trust.
+    if (this.unexplained && now - this.unexplained.sentAtMs > UNRESOLVED_HOLD_BLIND_MS) {
+      return "blind";
+    }
     const exposed = this.unhedgedNotional();
     if (exposed >= settings.hardUnhedgedNotional) return "blind";
     if (exposed >= settings.softUnhedgedNotional) return "lagging";

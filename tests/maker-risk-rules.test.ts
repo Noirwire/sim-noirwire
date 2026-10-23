@@ -33,6 +33,7 @@ import {
 import { MARKETS } from "../src/engine/markets.js";
 import { placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
+import { TradingWatch } from "../src/wiring/trading-watch.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { dollars, makeVenue } from "./helpers.js";
 
@@ -258,6 +259,11 @@ const nearestBidBps = (orders: NewOrder[], reference = 150): number =>
     reference,
     pricesOf(orders, "buy").reduce((a, b) => (a > b ? a : b)),
   );
+
+const voiceOf = (said: { alerts: string[]; notices: string[] }) => ({
+  alert: (message: string) => said.alerts.push(message),
+  notice: (message: string) => said.notices.push(message),
+});
 
 /** One maker under the risk rules, its venue, its clock, and everything it said. */
 const rig = async (
@@ -1862,6 +1868,53 @@ describe("the maker's state file from before the flattening existed", () => {
 });
 
 describe("an order whose outcome is unknown", () => {
+  it("holds the maker until the unknown order's own expiry has passed, though the cancel works and the seat is empty", async () => {
+    const { warmUp, book, tick, maker } = await rig("unknown-window");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+
+    book.unknownBecause = null;
+    await tick(5);
+    await tick(5);
+    expect(book.take()).toEqual([]);
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+
+    await tick(11);
+    expect(maker.quarantinedSinceMs).toBeNull();
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("reaches the alert sink when the reconcile keeps failing", async () => {
+    const { warmUp, book, tick, maker, clock, said } = await rig("unknown-persistent");
+    const watch = new TradingWatch(
+      () =>
+        maker.quarantinedSinceMs === null
+          ? { ready: true }
+          : { ready: false, reason: "NSOL-PERP maker is held by an order of unknown outcome" },
+      voiceOf(said),
+      clock,
+    );
+    watch.check();
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    watch.check();
+    expect(said.alerts).toHaveLength(1);
+
+    book.unknownBecause = null;
+    book.failCancelling = new Error("the venue is away");
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await expect(tick(30)).rejects.toThrow("the venue is away");
+      watch.check();
+    }
+
+    expect(said.alerts.some((line) => line.includes("has not been ready for"))).toBe(true);
+  });
+
   it.each([
     ["a routine-looking", "post-only order would match"],
     ["a non-routine", "the connection dropped"],

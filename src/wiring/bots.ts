@@ -268,7 +268,7 @@ export const openBots = async (
       ),
     ];
     if (ledgers.length > 0) {
-      const watch = new TradingWatch(trading, makerVoice(problems));
+      const watch = new TradingWatch(trading, makerVoice(problems), systemClock);
       loops.push(loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => watch.check()));
     }
     if (liquidator) {
@@ -305,6 +305,11 @@ export const openBots = async (
       ...ledgers
         .filter(({ ledger }) => ledger.state.mode === "stopped")
         .map(({ market }) => `${market} maker is stopped`),
+      ...makers.flatMap((maker, at) =>
+        maker.quarantinedSinceMs === null
+          ? []
+          : [`${botMarkets[at].id} maker is held by an order of unknown outcome`],
+      ),
       ...hedges
         .filter(({ controller }) => controller.status() === "blind")
         .map(({ market }) => `${market} hedge is blind`),

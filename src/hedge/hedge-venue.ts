@@ -49,8 +49,16 @@ export type HedgeHealth = { ok: true } | { ok: false; reason: string };
 export interface HedgeVenue {
   rules(): Promise<HedgeMarketRules>;
   account(): Promise<HedgeAccount>;
-  /** Throws, or resolves without an answer the controller can believe, when the outcome is unknown. */
+  /**
+   * Throws, or resolves without an answer the controller can believe, when the outcome is unknown.
+   *
+   * Contract: the implementation aborts the request itself within a bound well below
+   * `LATE_DISPATCH_QUARANTINE_MS`, so a request the controller has given up on cannot reach the venue
+   * after the controller's quarantine. The controller stops waiting after its own deadline but cannot
+   * stop the call; without this bound the quarantine proves nothing.
+   */
   placeIoc(order: HedgeOrder): Promise<HedgeAck>;
+  /** Bound by the same contract as `placeIoc`: it aborts within a bound below `LATE_DISPATCH_QUARANTINE_MS`. */
   cancel(clientId: string): Promise<void>;
   fills(sinceMs: number): Promise<HedgeFill[]>;
   /** Whether the venue answers and is trading: its heartbeat. */

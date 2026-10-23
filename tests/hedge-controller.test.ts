@@ -412,6 +412,26 @@ describe("the hedge controller", () => {
       expect(controller.hedgedPosition).toBe(dollars(-1.5));
     });
 
+    it("goes blind once an order's hold stays unresolved for 2 minutes, and is never released by age", async () => {
+      const { venue, state, controller, tick } = rig();
+      venue.script({ lost: true, fill: 0n });
+      venue.fills = async () => {
+        throw new Error("fills are not available");
+      };
+      state.maker = dollars(0.5);
+
+      await tick();
+      await tick(60);
+      expect(controller.status()).not.toBe("blind");
+
+      await tick(61);
+      expect(controller.status()).toBe("blind");
+
+      await tick(600);
+      expect(controller.status()).toBe("blind");
+      expect(venue.placed).toHaveLength(1);
+    });
+
     it("counts a cancel that never answers as a cancel that failed", async () => {
       const { venue, state, said, tickThroughDeadlines } = rig();
       venue.script({ lost: true });
