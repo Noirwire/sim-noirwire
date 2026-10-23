@@ -376,8 +376,10 @@ interface, supplied separately and kept out of this repository.
   with `HEDGE_VENUE_`, except `HEDGE_VENUE_MODULE`, with the prefix removed (`HEDGE_VENUE_API_URL`
   arrives as `API_URL`). Their values are never logged; start-up errors name only the keys.
 - **Start-up checks.** The service refuses to start if the module cannot be imported, does not
-  export the function, returns something that lacks any `HedgeVenue` method, or if the venue's
-  `health()` or `rules()` fails or returns nothing.
+  export the function, returns something that lacks any `HedgeVenue` method, does not declare
+  `maxCallMs` (a finite number above 0 and at most 30000: the longest one `placeIoc` or `cancel`
+  call stays alive before the module aborts it), or if the venue's `health()` or `rules()` fails
+  or returns nothing.
 
 - **What it sends.** Each tick it reads the maker's position and the venue's real position and
   sends at most one immediate-or-cancel order that works the difference toward zero, priced at

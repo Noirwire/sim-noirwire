@@ -1887,6 +1887,56 @@ describe("an order whose outcome is unknown", () => {
     expect(book.take().length).toBeGreaterThan(0);
   });
 
+  it("still acts on a loss breach while held, flattening with reduce-only orders only", async () => {
+    const { warmUp, book, tick, ledger } = await rig("unknown-loss");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    book.equity = dollars(969);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("flatten");
+    const placed = book.take();
+    expect(placed.length).toBeGreaterThan(0);
+    expect(placed.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+
+  it("still acts on a loss breach while held and the reconcile keeps failing", async () => {
+    const { warmUp, book, tick, ledger } = await rig("unknown-loss-failing");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+    book.failCancelling = new Error("the venue is away");
+
+    book.equity = dollars(969);
+    await expect(tick(1)).rejects.toThrow("the venue is away");
+
+    expect(ledger.state.mode).toBe("flatten");
+  });
+
+  it("obeys a hard-stop command while held", async () => {
+    const { warmUp, book, tick, ledger, dir, clock, said } = await rig("unknown-kill");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts.some((line) => line.includes("the kill switch stopped it"))).toBe(true);
+    expect(book.take()).toEqual([]);
+  });
+
   it("reaches the alert sink when the reconcile keeps failing", async () => {
     const { warmUp, book, tick, maker, clock, said } = await rig("unknown-persistent");
     const watch = new TradingWatch(

@@ -351,16 +351,33 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
-    if (this.unreconciled && !(await this.reconcile(venue))) return;
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
     if (!market || market.markPrice === null) return;
     const mark = market.markPrice;
     const { safety } = this.options;
+    // The risk rules and the operator's control run every tick, held or not.
     const plan = safety ? await this.assess(safety, venue, mark) : aroundMark(mark);
+    let held = false;
+    let heldProblem: unknown;
+    if (this.unreconciled) {
+      try {
+        held = !(await this.reconcile(venue));
+      } catch (error) {
+        held = true;
+        heldProblem = error;
+      }
+    }
     if (plan.action !== "quote") {
       this.lastQuoted = null;
       if (this.standing) await this.withdraw(venue);
+      if (heldProblem !== undefined) throw heldProblem;
+      return;
+    }
+    // A held maker places only what the risk rules dictate to shrink its position, never a new ladder.
+    if (held && !plan.reduceOnly && !plan.flatten) {
+      this.lastQuoted = null;
+      if (heldProblem !== undefined) throw heldProblem;
       return;
     }
     const refused = market.quotesRefusedBecause;
@@ -381,6 +398,7 @@ export class HouseMaker {
     this.standing = true;
     let leftOut = 0;
     let unknownReason: string | undefined;
+    let sawUnknown = false;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) return;
@@ -392,6 +410,7 @@ export class HouseMaker {
         const placed = await venue.placeOrder(this.trader, sent);
         if (placed.outcomeUnknown) {
           this.holdForUnknown(sent);
+          sawUnknown = true;
           unknownReason = placed.reason;
           break;
         }
@@ -405,7 +424,7 @@ export class HouseMaker {
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
-    if (this.unreconciled) {
+    if (sawUnknown) {
       this.lastQuoted = null;
       await this.withdraw(venue).catch(() => {});
       throw new OrderOutcomeUnknown(this.options.market, unknownReason);

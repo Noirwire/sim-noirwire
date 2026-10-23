@@ -433,7 +433,9 @@ implementing the `HedgeVenue` interface, supplied separately and kept out of thi
 - `HEDGE_VENUE_*`: every other variable with this prefix is handed to the module with the prefix
   removed (`HEDGE_VENUE_API_URL` becomes `API_URL`). Values are never logged; errors name keys only.
 
-At start the service calls the venue's `health()` and `rules()` once and refuses to start if
+The venue must declare `maxCallMs`, the longest one `placeIoc` or `cancel` call stays alive
+before the module aborts it: a finite number above 0 and at most 30000 (half of the 60 s
+late-dispatch quarantine). The service refuses to start without it. At start the service calls the venue's `health()` and `rules()` once and refuses to start if
 either fails or returns nothing. Try the module by hand before enabling it. The settings, all
 optional:
 
