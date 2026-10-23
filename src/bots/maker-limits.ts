@@ -45,6 +45,15 @@ export const MAKER_LIMITS = {
   flattenGiveBps: 25,
   /** A maker still holding a position this long after it began to reduce it stops quoting altogether. */
   flattenDeadlineMs: 600_000,
+  /**
+   * While the reference price is down and none was good in the last
+   * referenceMemoryMs, the maker is blind, and a flattening gets this long
+   * instead of flattenDeadlineMs.
+   */
+  blindFlattenDeadlineMs: 180_000,
+  referenceMemoryMs: 3_600_000,
+  /** Unknown errors in a row, while the maker is at the soft stop, that make it stop quoting altogether. */
+  unknownErrorsBeforeHardStop: 5,
 
   /** A resting quote lives at most the requote interval plus this long. */
   expiryMarginSeconds: 10,

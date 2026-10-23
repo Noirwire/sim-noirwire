@@ -108,24 +108,24 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                                 | Required | What it is                                                                               |
-| ------------------------------------------------------------------------ | -------- | ---------------------------------------------------------------------------------------- |
-| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`     |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                |
-| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`              |
-| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own        |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                     |
-| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)  |
-| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine |
-| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)              |
-| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)  |
-| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                        |
-| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)          |
-| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)   |
-| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)               |
-| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after each good requote, for an outside monitor               |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                              |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open    |
+| Variable                                                                 | Required | What it is                                                                                  |
+| ------------------------------------------------------------------------ | -------- | ------------------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                                         | yes      | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`        |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes      | The rollup's private endpoint through the query filter, and its websocket                   |
+| `DEPOSIT_RPC_URL`                                                        | no       | Overrides where deposits are sent; by default the deployment's `depositUrl`                 |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no       | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own           |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes      | The deployment description the order book repository's set-up prints                        |
+| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes      | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)     |
+| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead  | The path of each keypair file, in place of the key itself, for a run on your own machine    |
+| `BOT_TRADER_SEEDS`                                                       | yes      | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                 |
+| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no       | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)     |
+| `SERVICE_LOCATION`                                                       | no       | Where the service runs; labels the latency figure                                           |
+| `HOUSE_MAKER_RISK_RULES`                                                 | no       | `1` makes the house maker follow the risk rules (always on, mainnet; see below)             |
+| `IDLE_AFTER_MS`                                                          | no       | How long the service keeps trading after the last request, with no socket (10 minutes)      |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no       | How long it keeps trading after the last stream socket closes (15 seconds)                  |
+| `HEALTHCHECK_URL`                                                        | no       | An address the maker calls after a good requote, at most every 15 s, for an outside monitor |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no       | Bot order sizes as notional                                                                 |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no       | Seats the liquidator tries blind per market per tick; seats this service did not open       |
 
 ### Mainnet mode
 
@@ -290,12 +290,21 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   reference, a mark far from it or a fast move, it pulls the order like any other quote.
   It logs a line that starts with `ALERT`. If an order fails, the loss reaches 6% of the
   day's start or 10% from the peak, or it still holds a position ten minutes after it
-  began, it stops quoting altogether (the hard stop below), with another `ALERT`. The
-  state is kept in `DATA_DIR`, so a restart does not reset it, and only an operator ends
-  it.
+  began, it stops quoting altogether (the hard stop below), with another `ALERT`. A
+  flattening that works leaves the maker flat and dark: it quotes nothing, so new users
+  find an empty book, until an operator resumes it, and the log says so in an `ALERT` line
+  when the position reaches flat. The state is kept in `DATA_DIR`, so a restart does not
+  reset it, and only an operator ends it. While it still holds a position to flatten, the
+  UTC day's starting equity is kept across midnight, so the 6% line does not move. While
+  the reference price is down, the limits are counted at the last good reference price
+  from the past hour instead of the venue's possibly stale mark; with none that recent
+  they are counted at the worse of the mark and the last good price known, and a
+  flattening gets three minutes, not ten.
 - **Reduce-only markets.** When the program has set the market to reduce-only, the maker
   cancels what it has and keeps quoting the side that shrinks its own position, flagged
-  reduce-only: that is the side users need to close theirs. Flat, it quotes nothing. For
+  reduce-only: that is the side users need to close theirs. Flat, it quotes nothing. It
+  sends no heartbeat meanwhile (see "A heartbeat" below), so the outside monitor pages
+  until the market opens again. For
   any other reason the program would refuse its quotes (paused, a stale mark, a tripped
   guard, a dislocation) it sends nothing. A reduce-only order carries no program expiry,
   so the maker's own cancels (at every requote and at a stop of the service) are what
@@ -319,17 +328,24 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   wait.
 - **Errors it does not understand.** While sending orders, any failure other than the
   rollup being away makes the maker fall back to the soft stop (an `ALERT` line, quotes
-  cancelled, the reducing side quoted again on the next tick). If it meets another while
-  it is already reducing, flattening or stopped from growing, it stops altogether. Either
-  lasts until an operator resumes it. A failed cancel is tried again on the next tick.
+  cancelled, the reducing side quoted again on the next tick). At the soft stop it takes
+  five such errors in a row, with no good requote between them, to stop altogether; one
+  while it is flattening stops it at once, since a flattening that cannot place its order
+  is not working. Either lasts until an operator resumes it. A failed cancel is tried again
+  on the next tick.
 - **An unreadable control file.** A control file that cannot be read holds the maker at the
   soft stop (an `ALERT` line). It stays there after the file parses again, until a newer
   `resume` is written. A hard stop or a flattening already in force is not loosened.
-- **A heartbeat.** With `HEALTHCHECK_URL` set, the maker calls that address after each
-  requote of both sides, about every 10 s on mainnet. It sends none while a loss limit,
-  the kill switch or a reduce-only market has it reducing only, so the outside monitor
-  alerts when the calls stop: the maker is stopped, reducing, pulled, stuck or the machine
-  is down. A failed call is logged without the address and never stops the maker.
+- **A heartbeat.** With `HEALTHCHECK_URL` set, the maker calls that address after a
+  requote of both sides, at most once every 15 s (a monitor such as healthchecks.io takes
+  five pings a minute per check). It sends none while a loss limit, the kill switch or a
+  reduce-only market has it reducing only, so the outside monitor alerts when the calls
+  stop: the maker is stopped, reducing, pulled, stuck or the machine is down. **A
+  reduce-only market silences the heartbeat on purpose,** so a monitor page while the
+  program's market is reduce-only is understood, not ignored: the maker is quoting only
+  the side that shrinks its position, as designed, and the calls start again with the
+  first full requote after the market opens. A failed call is logged without the address
+  and never stops the maker.
 - **The position limit counts everything.** The position and a side's resting levels
   together never pass the limit: the level that would is cut to what is left and later ones
   are left out.
