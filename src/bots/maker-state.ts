@@ -178,6 +178,9 @@ export class MakerLedger {
     private faulted: boolean,
   ) {}
 
+  /** A hard stop was asked for, saved or not, and no later write has moved the maker off it. */
+  private hardStopIntent = false;
+
   static async open(path: string): Promise<MakerLedger> {
     const marker = await readMarker(path);
     let loaded: MakerState;
@@ -230,6 +233,7 @@ export class MakerLedger {
    * sees the soft stop: it may shrink what it holds and open nothing new.
    */
   get hedgeMode(): MakerMode {
+    if (this.hardStopIntent) return this.current.mode;
     return this.faulted && this.current.mode === "stopped" ? "reduce" : this.current.mode;
   }
 
@@ -245,6 +249,8 @@ export class MakerLedger {
     const resumes = change.mode === "run";
     const next = { ...this.current, ...change };
     if (this.recoveryRequired && !resumes) next.mode = "stopped";
+    // Set before the write: a hard stop whose save fails is still a decision to stop.
+    if (change.mode === "stopped") this.hardStopIntent = true;
     const { dayStartEquity, peakEquity, spotBaseAtStart } = next;
     const text = JSON.stringify({
       ...next,
@@ -283,7 +289,12 @@ export class MakerLedger {
       this.faulted = false;
     }
     if (change.mode === "stopped") this.faulted = false;
+    if (next.mode !== "stopped") this.hardStopIntent = false;
     this.current = next;
+    if (this.recoveryRequired && change.lastCommandAtMs !== undefined && !resumes) {
+      // A newer command is saved: a resume still waiting for its marker to go must not pass any more.
+      await writeMarker(this.path, FAILED_MARKER).catch(() => {});
+    }
   }
 
   /**
@@ -293,6 +304,10 @@ export class MakerLedger {
   async canRetryResume(requestedAtMs: number): Promise<boolean> {
     if (!this.recoveryRequired) return false;
     const marker = await readMarker(this.path).catch(() => null);
-    return marker?.phase === "resumed" && marker.commandTs === requestedAtMs;
+    return (
+      marker?.phase === "resumed" &&
+      marker.commandTs === requestedAtMs &&
+      this.current.lastCommandAtMs === requestedAtMs
+    );
   }
 }

@@ -423,6 +423,23 @@ describe("the hedge controller", () => {
       expect(said.alerts.filter((line) => line.includes("unmanaged"))).toHaveLength(0);
     });
 
+    it("still reads a hard stop as stopped when its own save fails", async () => {
+      const dir = join(root, "hard-stop-unsaved");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ mode: "stopped", reason: "the loss limit" })).rejects.toThrow();
+      expect(ledger.hedgeMode).toBe("stopped");
+      const { venue, state, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+
+      await tick();
+
+      expect(venue.placed).toHaveLength(0);
+    });
+
     it("still abandons the hedge at an intentional hard stop", async () => {
       const dir = join(root, "intentional");
       await mkdir(dir, { recursive: true });

@@ -2070,6 +2070,29 @@ describe("a maker whose state cannot be saved fails closed", () => {
     await expect(access(markerOf(dir))).rejects.toThrow();
   });
 
+  it("refuses a stale resume once a newer stop is saved, before and after a restart", async () => {
+    const { dir, ledger, clock } = await rig("persist-stale-after-stop");
+    const quiet = { alert: () => {}, notice: () => {} };
+    const risk = new MakerRisk(ledger, clock, PERP, quiet);
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    const resume = { mode: "run", requestedAtMs: 5 } as const;
+    removal.fails = true;
+    await expect(risk.follow(resume, dollars(1_000))).rejects.toThrow(StatePersistenceError);
+
+    await risk.follow({ mode: "stopped", requestedAtMs: 6 }, dollars(1_000));
+    await risk.follow(resume, dollars(1_000));
+    expect(ledger.state.mode).toBe("stopped");
+
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    removal.fails = false;
+    const again = new MakerRisk(restarted, clock, PERP, quiet);
+    await again.follow(resume, dollars(1_000));
+    expect(restarted.state.mode).toBe("stopped");
+    expect(restarted.state.lastCommandAtMs).toBe(6);
+  });
+
   it("does not let an old run command resume a maker whose marker says failed", async () => {
     const { dir, ledger, clock } = await rig("persist-stale-run");
     await breakWrites(dir);
