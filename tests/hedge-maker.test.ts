@@ -176,6 +176,10 @@ describe("the maker and its hedge", () => {
     const orders = book.take();
     expect(orders.length).toBeGreaterThan(0);
     expect(orders.every((order) => order.side === "sell")).toBe(true);
+    expect(orders.every((order) => order.type === "postOnly" && order.reduceOnly !== true)).toBe(
+      true,
+    );
+    expect(orders.reduce((sum, order) => sum + order.size, 0n)).toBeLessThanOrEqual(dollars(0.5));
     const blindAlerts = said.alerts.filter((line) => line.includes("hedge is blind"));
     expect(blindAlerts).toHaveLength(1);
     expect(blindAlerts[0]).toMatch(/^ALERT /);

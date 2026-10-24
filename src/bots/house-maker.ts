@@ -420,10 +420,14 @@ export class HouseMaker {
    * Throws `QuotesHeld`, having sent nothing, while the venue says it would
    * refuse the quotes: cancelling and sending a ladder it refuses would only
    * empty the book. Its next tick after the venue takes quotes again requotes.
-   * The exception is a market that is only reduce-only: the venue still takes
-   * orders flagged reduce-only there, so the maker cancels what it has and
-   * quotes the side that shrinks its position, flagged, which is the side
-   * users need to close theirs.
+   * The exception is a market that is only reduce-only, when the maker is
+   * flattening: the venue still takes reduce-only orders there, and the
+   * flattening order is one. A reduce-only order never rests and cannot be
+   * post-only, so there is no passive quote to make in such a market: it holds
+   * like any other refusal. Under a risk rule that only reduces, the maker
+   * quotes the side that shrinks its position as plain post-only orders, which
+   * together never exceed the position. While an order of unknown outcome holds
+   * it, only the flattening order goes out.
    * With the risk rules, a failure while sending orders that it does not
    * understand makes the maker fall back (see `stopAfter`) and is thrown on. So
    * does an order the venue answers with a refusal, unless it is a post-only
@@ -474,15 +478,17 @@ export class HouseMaker {
       if (heldProblem !== undefined) throw heldProblem;
       return;
     }
-    // A held maker places only what the risk rules dictate to shrink its position, never a new ladder.
-    if (held && !plan.reduceOnly && !plan.flatten) {
+    // A held maker places only the order that flattens its position: an order of unknown outcome and a
+    // passive shrink ladder could together take it past flat.
+    if (held && !plan.flatten) {
       this.lastQuoted = null;
       if (heldProblem !== undefined) throw heldProblem;
       return;
     }
     const refused = market.quotesRefusedBecause;
     const venueReducesOnly = refused !== undefined && market.takesReduceOnlyOrders === true;
-    if (refused !== undefined && !venueReducesOnly) {
+    // A reduce-only market takes only reduce-only orders, which never rest, so only a flatten can go out there.
+    if (refused !== undefined && !(venueReducesOnly && plan.flatten)) {
       this.lastQuoted = null;
       throw new QuotesHeld(this.options.market, refused);
     }
@@ -509,11 +515,13 @@ export class HouseMaker {
     this.standing = false;
     const position = this.inventory(await venue.traderState(this.trader));
     const orders = this.ordersFor(next, market, position);
+    // The risk intent: the maker is reducing only. Only the orders that cross carry the flag to the venue.
     const flagged = next.reduceOnly || next.flatten === true;
+    const crossing = next.flatten === true;
     this.standing = true;
     // Fixed once, here: the hold on disk and every order sent carry this same absolute expiry.
     const expiresAtMs = this.options.clock.nowMs() + this.expiresInSeconds * 1_000;
-    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged, expiresAtMs));
+    const dispatching = orders.length > 0 && (await this.recordDispatch(crossing, expiresAtMs));
     // A risk-reducing send under a hold extends that hold, and the orders it places are added to it.
     const heldSend = orders.length > 0 && !dispatching && flagged && this.hold !== null;
     const sentIds: string[] = [];
@@ -530,7 +538,7 @@ export class HouseMaker {
         }
         const sent: NewOrder = {
           ...order,
-          ...(flagged ? { reduceOnly: true } : {}),
+          ...(crossing ? { reduceOnly: true } : {}),
           expiresInSeconds: this.expiresInSeconds,
           expiresAtMs,
         };
@@ -618,8 +626,9 @@ export class HouseMaker {
    * Writes the ladder about to go out to the ledger as a hold, before any order is sent, so a crash
    * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
    * Returns whether a record was written (not when the maker is held already, or has no ledger).
-   * A risk-reducing ladder sent while held extends the hold in the ledger instead, and sends nothing
-   * if that write fails: it can never be bounded, since a reduce-only order has no expiry.
+   * `flagged` is whether the orders go out reduce-only. A flagged send while held extends the hold in
+   * the ledger instead, and sends nothing if that write fails: it can never be bounded, since a
+   * reduce-only order has no expiry. A passive shrink ladder is not flagged: it expires like any ladder.
    */
   private async recordDispatch(flagged: boolean, expiresAtMs: number): Promise<boolean> {
     const { ledger, clock } = this.options;
