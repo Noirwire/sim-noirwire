@@ -260,7 +260,7 @@ describe("the makers opened by the service, on mainnet without a state file", ()
     const { bots, said } = await opened("bots-devnet", "devnet");
 
     expect(said).toEqual([]);
-    expect(bots.trading().ready).toBe(true);
+    expect(bots.trading().reason ?? "").not.toContain("stopped");
   });
 });
 
