@@ -151,11 +151,14 @@ const failedMarkerPath = (statePath: string): string => `${statePath}.failed`;
 interface Marker {
   phase: "failed" | "resumed";
   commandTs: number | null;
+  /** When a start without a saved state recorded its stop: only a command made after it may resume. */
+  stoppedAtMs?: number;
 }
 
 const markerSchema = z.object({
   phase: z.enum(["failed", "resumed"]),
   commandTs: z.number().nullable(),
+  stoppedAtMs: z.number().optional(),
 });
 
 const FAILED_MARKER: Marker = { phase: "failed", commandTs: null };
@@ -298,9 +301,16 @@ export class MakerLedger {
     };
     if (marker === null && missing && options.requireSavedState) {
       // The marker goes down first: a start that cannot record this must not run at all.
-      await writeMarker(path, FAILED_MARKER);
+      // A command file left over from before this stop must not count as the operator's resume.
+      const stoppedAtMs = Date.now();
+      await writeMarker(path, { ...FAILED_MARKER, stoppedAtMs });
       const ledger = withSavedIntent(
-        new MakerLedger(path, { ...loaded, mode: "stopped", reason: NO_SAVED_STATE }, true, true),
+        new MakerLedger(
+          path,
+          { ...loaded, mode: "stopped", reason: NO_SAVED_STATE, lastCommandAtMs: stoppedAtMs },
+          true,
+          true,
+        ),
       );
       ledger.startedWithoutState = true;
       return ledger;
@@ -332,6 +342,7 @@ export class MakerLedger {
       ...loaded,
       mode: "stopped",
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
+      lastCommandAtMs: Math.max(loaded.lastCommandAtMs, marker.stoppedAtMs ?? 0),
     };
     return withSavedIntent(new MakerLedger(path, held, true, true));
   }

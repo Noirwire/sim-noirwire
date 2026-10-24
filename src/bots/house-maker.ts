@@ -314,12 +314,17 @@ export class HouseMaker {
     return this.hold?.sinceMs ?? null;
   }
 
+  /** Cancels the venue was asked for and has not answered, though the maker stopped waiting. */
+  private cancelsInFlight = 0;
+
   private async cancelQuotes(venue: Venue): Promise<void> {
-    await withinDeadline(
-      venue.cancelAll(this.trader, this.options.market),
-      this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS,
-      "the cancel",
-    );
+    const call = venue.cancelAll(this.trader, this.options.market);
+    this.cancelsInFlight += 1;
+    const settled = (): void => {
+      this.cancelsInFlight -= 1;
+    };
+    call.then(settled, settled);
+    await withinDeadline(call, this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS, "the cancel");
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
@@ -418,12 +423,7 @@ export class HouseMaker {
       // The mode could not be saved, so the ledger holds the hard stop in memory: take the quotes off now.
       if (error instanceof StatePersistenceError) {
         await this.withdrawOrAlert(venue).catch(() => {});
-        if (!error.durableEvidence) {
-          safety?.alert(
-            "its state could not be saved and neither could the recovery marker, so nothing on disk says " +
-              "it must not quote. It stays stopped in memory and quotes nothing. Fix the disk before it is restarted.",
-          );
-        }
+        this.alertUnrecorded(error);
       }
       throw error;
     }
@@ -460,6 +460,12 @@ export class HouseMaker {
     if (!this.dueForRequote(next, now)) return;
 
     try {
+      // A cancel still out would remove the ladder placed below when it lands, so nothing is placed until it ends.
+      if (this.cancelsInFlight > 0) {
+        throw new Error(
+          "an earlier cancel did not answer and is still out, so a new ladder could be cancelled by it",
+        );
+      }
       await this.cancelQuotes(venue);
     } catch (error) {
       // Unconfirmed: the quotes may stand, nothing new goes out, and the next tick tries the cancel again.
@@ -474,12 +480,17 @@ export class HouseMaker {
     const orders = this.ordersFor(next, market, position);
     const flagged = next.reduceOnly || next.flatten === true;
     this.standing = true;
+    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged));
     let leftOut = 0;
     let unknownReason: string | undefined;
     let sawUnknown = false;
+    let cutShort = false;
     try {
       for (const order of orders) {
-        if (epoch !== this.epoch) return;
+        if (epoch !== this.epoch) {
+          cutShort = true;
+          break;
+        }
         const sent: NewOrder = {
           ...order,
           ...(flagged ? { reduceOnly: true } : {}),
@@ -499,9 +510,12 @@ export class HouseMaker {
         leftOut += 1;
       }
     } catch (error) {
+      // The record of the ladder in flight stays on disk: a failed order may still have been sent.
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
+    if (dispatching && this.hold === null) await this.saveHold(null);
+    if (cutShort) return;
     if (sawUnknown) {
       this.lastQuoted = null;
       await this.withdraw(venue).catch(() => {});
@@ -547,6 +561,40 @@ export class HouseMaker {
     };
     this.hold = hold;
     await this.saveHold(hold);
+  }
+
+  /**
+   * Writes the ladder about to go out to the ledger as a hold, before any order is sent, so a crash
+   * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
+   * Returns whether a record was written (not when the maker is held already, or has no ledger).
+   */
+  private async recordDispatch(flagged: boolean): Promise<boolean> {
+    const { ledger, clock } = this.options;
+    if (!ledger || this.hold !== null) return false;
+    const now = clock.nowMs();
+    try {
+      await ledger.update({
+        hold: {
+          orderIds: [],
+          sinceMs: now,
+          lastAtMs: now,
+          untilMs: flagged ? null : now + this.expiresInSeconds * 1_000,
+          seatClearAtMs: null,
+        },
+      });
+    } catch (error) {
+      if (error instanceof StatePersistenceError) this.alertUnrecorded(error);
+      throw error;
+    }
+    return true;
+  }
+
+  private alertUnrecorded(error: StatePersistenceError): void {
+    if (error.durableEvidence) return;
+    this.options.safety?.alert(
+      "its state could not be saved and neither could the recovery marker, so nothing on disk says " +
+        "it must not quote. It stays stopped in memory and quotes nothing. Fix the disk before it is restarted.",
+    );
   }
 
   /** Keeps `hold` in the ledger. A write that fails has stopped the maker there, and is told to the operator. */

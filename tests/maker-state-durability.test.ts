@@ -13,8 +13,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       disk.fails ? Promise.reject(new Error("EROFS: the disk is read-only")) : actual.open(...args),
   };
 });
+import { MakerRisk } from "../src/bots/maker-risk.js";
 import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
+import { ManualClock } from "../src/engine/clock.js";
 import { MARKETS } from "../src/engine/markets.js";
 import type { Venue } from "../src/engine/types.js";
 import { placingOrdersThrough } from "../src/engine/venue-orders.js";
@@ -160,6 +162,31 @@ describe("a missing state file on mainnet", () => {
     expect(resumed.state.mode).toBe("run");
     expect(resumed.startedWithoutState).toBe(false);
     expect(await exists(`${path}.failed`)).toBe(false);
+  });
+
+  it("is not resumed by a command made before the stop, only by one made after it", async () => {
+    const dir = await freshDir("mainnet-missing-stale-resume");
+    const path = makerStatePath(dir, PERP);
+    const staleAtMs = Date.now() - 60_000;
+    const ledger = await MakerLedger.open(path, { requireSavedState: true });
+    const risk = new MakerRisk(ledger, new ManualClock(Date.now()), PERP, {
+      alert: () => {},
+      notice: () => {},
+    });
+
+    await risk.follow({ mode: "run", requestedAtMs: staleAtMs }, dollars(1_000));
+    expect(ledger.state.mode).toBe("stopped");
+
+    const restarted = await MakerLedger.open(path, { requireSavedState: true });
+    const again = new MakerRisk(restarted, new ManualClock(Date.now()), PERP, {
+      alert: () => {},
+      notice: () => {},
+    });
+    await again.follow({ mode: "run", requestedAtMs: staleAtMs }, dollars(1_000));
+    expect(restarted.state.mode).toBe("stopped");
+
+    await again.follow({ mode: "run", requestedAtMs: Date.now() + 1 }, dollars(1_000));
+    expect(restarted.state.mode).toBe("run");
   });
 
   it("does not start at all when the marker cannot be written", async () => {

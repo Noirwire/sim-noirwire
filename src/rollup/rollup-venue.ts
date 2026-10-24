@@ -502,11 +502,13 @@ export class RollupVenue implements Venue {
   }
 
   async cancelAll(trader: TraderKey, market: MarketId): Promise<number> {
+    // Only the orders that stood when this cancel was issued end with it, however late it completes.
+    const fence = this.secrets.mark();
     const cancelled = await this.whileAwake(async () =>
       (await this.bots.trader(trader)).cancelAll(this.market(market).chain.marketId),
     );
     if (cancelled === null) return 0;
-    this.secrets.retireAll(market, trader, Date.now());
+    this.secrets.retireAll(market, trader, Date.now(), fence);
     return Number(cancelled);
   }
 

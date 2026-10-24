@@ -6,6 +6,8 @@ interface BotOrder {
   trader: TraderKey;
   secret: Uint8Array;
   retiredAtMs: number | null;
+  /** Counts the orders added, so a cancel can tell the ones it was issued over from later ones. */
+  sequence: number;
 }
 
 const KEEP_AFTER_RETIRED_MS = 10_000;
@@ -18,9 +20,16 @@ const KEEP_AFTER_RETIRED_MS = 10_000;
  */
 export class BotOrderSecrets {
   private readonly orders: BotOrder[] = [];
+  private added = 0;
 
   add(market: MarketId, trader: TraderKey, secret: Uint8Array): void {
-    this.orders.push({ market, trader, secret, retiredAtMs: null });
+    this.added += 1;
+    this.orders.push({ market, trader, secret, retiredAtMs: null, sequence: this.added });
+  }
+
+  /** The orders added so far, to fence a cancel with. */
+  mark(): number {
+    return this.added;
   }
 
   retire(secret: Uint8Array, atMs: number): void {
@@ -29,10 +38,18 @@ export class BotOrderSecrets {
     }
   }
 
-  /** Every live order of `trader` on `market` was cancelled at `atMs`. */
-  retireAll(market: MarketId, trader: TraderKey, atMs: number): void {
+  /**
+   * Every live order of `trader` on `market` that was added by `fence` (a `mark`) was cancelled at
+   * `atMs`. A later order was placed after the cancel was issued, so it is not covered.
+   */
+  retireAll(market: MarketId, trader: TraderKey, atMs: number, fence = Infinity): void {
     for (const order of this.orders) {
-      if (order.market === market && order.trader === trader && order.retiredAtMs === null) {
+      if (
+        order.market === market &&
+        order.trader === trader &&
+        order.retiredAtMs === null &&
+        order.sequence <= fence
+      ) {
         order.retiredAtMs = atMs;
       }
     }

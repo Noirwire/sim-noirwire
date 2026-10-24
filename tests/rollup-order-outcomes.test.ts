@@ -14,6 +14,7 @@ import { dollars } from "./helpers.js";
 
 const fakeTrader = vi.hoisted(() => ({
   place: undefined as undefined | (() => Promise<unknown>),
+  cancel: undefined as undefined | (() => Promise<unknown>),
   failToOpen: false,
   /** While set, opening the trader waits for it. */
   opening: undefined as undefined | Promise<void>,
@@ -28,6 +29,7 @@ vi.mock("../src/rollup/bot-accounts.js", () => ({
       await fakeTrader.opening;
       return {
         address: "owner",
+        cancelAll: () => fakeTrader.cancel?.(),
         place: () => {
           fakeTrader.placed += 1;
           return fakeTrader.place?.();
@@ -115,7 +117,39 @@ beforeEach(() => {
   fakeTrader.place = undefined;
   fakeTrader.failToOpen = false;
   fakeTrader.opening = undefined;
+  fakeTrader.cancel = undefined;
   fakeTrader.placed = 0;
+});
+
+describe("a cancel that completes late", () => {
+  it("ends only the orders that stood when it was issued, not a ladder placed after", async () => {
+    const { venue, secrets } = venueWith();
+    const book = venue as unknown as {
+      secrets: { forgetEndedBefore(market: string, tapeReadAtMs: number): void };
+    };
+    const rested = () =>
+      Promise.resolve<PlaceOutcome>({
+        status: "rested",
+        filled: 0n,
+        rested: 1n,
+        sendToResultMs: 1,
+      });
+    fakeTrader.place = rested;
+    await venue.placeOrder(TRADER, order());
+
+    let complete: (cancelled: bigint) => void = () => {};
+    fakeTrader.cancel = () => new Promise<bigint>((resolve) => (complete = resolve));
+    const cancelling = venue.cancelAll(TRADER, "NSOL-PERP");
+    await Promise.resolve();
+    await venue.placeOrder(TRADER, order());
+    expect(secrets()).toHaveLength(2);
+
+    complete(1n);
+    await cancelling;
+    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 1_000_000);
+
+    expect(secrets()).toHaveLength(1);
+  });
 });
 
 describe("an order the program never answers", () => {
