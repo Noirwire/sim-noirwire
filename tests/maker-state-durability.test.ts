@@ -1,5 +1,7 @@
-import { access, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 /** While `fails` is set, no file can be opened for writing, as on a disk that has gone read-only. */
@@ -15,7 +17,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 import { MakerRisk } from "../src/bots/maker-risk.js";
 import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
-import { loadConfig } from "../src/config/config.js";
+import { type Config, loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { MARKETS } from "../src/engine/markets.js";
 import type { Venue } from "../src/engine/types.js";
@@ -213,7 +215,7 @@ describe("a missing state file on mainnet", () => {
 });
 
 describe("the makers opened by the service, on mainnet without a state file", () => {
-  const opened = async (name: string, network: string) => {
+  const opened = async (name: string, network: string, extra: Partial<Config> = {}) => {
     const { venue } = makeVenue();
     const counting: Venue = placingOrdersThrough(venue, (trader, order) =>
       venue.placeOrder(trader, order),
@@ -242,6 +244,7 @@ describe("the makers opened by the service, on mainnet without a state file", ()
         DATA_DIR: await freshDir(name),
       }),
       NETWORK: network,
+      ...extra,
     };
     const said: string[] = [];
     const problems = { onError: (what: string) => said.push(what), onRecovered: () => {} };
@@ -280,6 +283,109 @@ describe("the makers opened by the service, on mainnet without a state file", ()
       vi.unstubAllGlobals();
       vi.useRealTimers();
     }
+  });
+
+  describe("and the keeper's heartbeat", () => {
+    const heartbeatOf = async (name: string, content: string | null): Promise<string> => {
+      const path = join(await freshDir(name), "keeper-heartbeat");
+      if (content !== null) await writeFile(path, content);
+      return path;
+    };
+
+    /** Opens a devnet maker with the heartbeat wired, runs the readiness loop on real time, and answers what it settles on. */
+    const settled = async (name: string, file: string | undefined, network = "devnet") => {
+      const { bots } = await opened(name, network, {
+        KEEPER_HEARTBEAT_FILE: file,
+        HOUSE_MAKER_TICK_MS: 20,
+      });
+      const loops = bots.start();
+      try {
+        await vi.waitFor(() =>
+          expect(bots.trading().reason ?? "").not.toContain("has not been read yet"),
+        );
+        return bots.trading();
+      } finally {
+        for (const loop of loops) loop.stop();
+      }
+    };
+
+    it("is ready when the heartbeat is fresh", async () => {
+      const file = await heartbeatOf("keeper-fresh", `${Date.now()}\n`);
+
+      expect(await settled("keeper-fresh-bots", file)).toEqual({ ready: true });
+    });
+
+    it("is not ready when the last healthy sweep is older than the max age", async () => {
+      const file = await heartbeatOf("keeper-stale", String(Date.now() - 60_000));
+
+      const trading = await settled("keeper-stale-bots", file);
+
+      expect(trading.ready).toBe(false);
+      expect(trading.reason).toMatch(/keeper has not completed a healthy sweep for 6\ds/);
+    });
+
+    it("is not ready when the file is missing", async () => {
+      const file = await heartbeatOf("keeper-missing", null);
+
+      expect(await settled("keeper-missing-bots", file)).toEqual({
+        ready: false,
+        reason: "keeper heartbeat unreadable",
+      });
+    });
+
+    it.each([
+      ["text", "soon"],
+      ["empty", ""],
+      ["negative", "-5"],
+      ["fractional", "1.5"],
+      ["beyond a safe integer", "99999999999999999999"],
+      ["far in the future", String(Date.now() + 10 * 60_000)],
+    ])("is not ready when the heartbeat is malformed: %s", async (what, content) => {
+      const file = await heartbeatOf(`keeper-malformed-${what.replaceAll(" ", "-")}`, content);
+
+      expect(await settled(`keeper-malformed-${what.replaceAll(" ", "-")}-bots`, file)).toEqual({
+        ready: false,
+        reason: "keeper heartbeat is malformed",
+      });
+    });
+
+    it("is unchanged off mainnet when no heartbeat file is configured", async () => {
+      expect(await settled("keeper-unset-devnet", undefined)).toEqual({ ready: true });
+    });
+
+    it("is not ready on mainnet when no heartbeat file is configured", async () => {
+      const { bots } = await opened("keeper-unset-mainnet", "mainnet");
+
+      expect(bots.trading().reason).toContain("keeper heartbeat is not configured");
+    });
+
+    it("is not ready, within the read deadline, when reading the file hangs", async () => {
+      const file = await heartbeatOf("keeper-hang", null);
+      await promisify(execFile)("mkfifo", [file]);
+      vi.useFakeTimers();
+      vi.stubGlobal("fetch", () => Promise.reject(new Error("no network in this test")));
+      try {
+        const { bots } = await opened("keeper-hang-bots", "devnet", {
+          KEEPER_HEARTBEAT_FILE: file,
+        });
+        const loops = bots.start();
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(bots.trading().reason).toContain("keeper heartbeat has not been read yet");
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        for (const loop of loops) loop.stop();
+
+        expect(bots.trading()).toMatchObject({
+          ready: false,
+          reason: expect.stringContaining("keeper heartbeat unreadable"),
+        });
+      } finally {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+        await (await open(file, "w")).close();
+      }
+    });
   });
 });
 

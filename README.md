@@ -124,6 +124,7 @@ start when a required one is missing or a key is not the one the deployment name
 | `IDLE_AFTER_MS`                                                          | no         | How long the service keeps trading after the last request, with no socket (10 minutes)                                                                       |
 | `IDLE_AFTER_LAST_SOCKET_MS`                                              | no         | How long it keeps trading after the last stream socket closes (15 seconds)                                                                                   |
 | `HEALTHCHECK_URL`                                                        | no         | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                                                                  |
+| `KEEPER_HEARTBEAT_FILE`, `KEEPER_HEARTBEAT_MAX_AGE_MS`                   | mainnet    | The keeper writes the time of its last healthy sweep (Unix ms) here; trading is not ready when it is old or missing (30 s)                                   |
 | `HEDGE_ENABLED`                                                          | no         | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                                                             |
 | `HEDGE_VENUE_MODULE`, `HEDGE_VENUE_*`                                    | with hedge | Absolute path of the hedge venue module (required with `HEDGE_ENABLED=1`, ignored otherwise); every other `HEDGE_VENUE_*` is passed to it without the prefix |
 | `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no         | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                                                                |
@@ -327,7 +328,9 @@ elsewhere is off by default and on mainnet cannot be set to 0):
 - **No liquidator here on mainnet, on purpose.** This service never runs a liquidator on
   mainnet (`LIQUIDATOR_ENABLED=1` is refused at start). Liquidation of under-margined
   seats is the order book repository's keeper, which runs separately and which this
-  service neither starts nor checks. A stopped maker does not stop that keeper, but users
+  service does not start. It does watch the keeper's heartbeat file
+  (`KEEPER_HEARTBEAT_FILE`): trading is not ready when the keeper has not completed a
+  healthy sweep within `KEEPER_HEARTBEAT_MAX_AGE_MS`. A stopped maker does not stop that keeper, but users
   cannot close against a stopped maker, so a hard stop leaves them to be liquidated or to
   wait.
 - **Errors it does not understand.** While sending orders, any failure other than the

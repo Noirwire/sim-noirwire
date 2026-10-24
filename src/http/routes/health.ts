@@ -12,8 +12,8 @@ import type { AppContext } from "../context.js";
  * While awake the answer also carries `trading: { ready, reason? }`, which is
  * not `ok`: a blind hedge or a stopped maker makes it not ready but leaves the
  * status code alone, so a probe does not restart a process that restarting
- * cannot help. A lagging hedge counts as ready; the liquidation keeper is
- * not covered. The service alerts on the transition itself. A probe that
+ * cannot help. A lagging hedge counts as ready. The liquidation keeper is
+ * covered through its heartbeat: a stale or missing one makes it not ready. The service alerts on the transition itself. A probe that
  * should page on it reads `/v1/health/trading`, which answers 503 while an
  * awake service is not ready and 200 otherwise.
  */

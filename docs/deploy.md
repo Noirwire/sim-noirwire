@@ -290,8 +290,10 @@ up the address limit for everybody that day.
 
 **No liquidator runs here, on purpose.** Mainnet mode never starts one
 (`LIQUIDATOR_ENABLED=1` is refused at start). Liquidating under-margined seats is the
-order book repository's keeper, which runs separately and which this service neither
-starts nor checks: confirm it is running before the maker holds a position.
+order book repository's keeper, which runs separately and which this service does not
+start. Mount the keeper's heartbeat file read-only and set `KEEPER_HEARTBEAT_FILE` to it:
+without it mainnet trading is never ready, and a heartbeat older than
+`KEEPER_HEARTBEAT_MAX_AGE_MS` (30 s) makes it not ready too.
 
 Do not set the faucet, noise taker, liquidator, oracle or `DEV_TRADING` variables, nor an
 inline `GATE_SECRET_KEY`, `BOT_TRADER_SEEDS` or `DEPLOYMENT_JSON`: the service refuses to
