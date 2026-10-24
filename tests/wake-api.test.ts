@@ -272,6 +272,29 @@ describe("/v1/health", () => {
     expect(recovered.trading).toEqual({ ready: true });
   });
 
+  it("answers the trading probe 503 with the reason while awake and not ready, 200 otherwise", async () => {
+    const { setup, activity } = await serviceOn(true);
+    const asleep = await app?.inject({ url: "/v1/health/trading" });
+    expect(asleep?.statusCode).toBe(200);
+    expect(JSON.parse(asleep?.body ?? "{}")).toEqual({ awake: false, ready: true });
+
+    activity.touch();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    setup.trading = { ready: false, reason: "NSOL-PERP maker is stopped" };
+    const notReady = await app?.inject({ url: "/v1/health/trading" });
+    expect(notReady?.statusCode).toBe(503);
+    expect(JSON.parse(notReady?.body ?? "{}")).toEqual({
+      awake: true,
+      ready: false,
+      reason: "NSOL-PERP maker is stopped",
+    });
+
+    setup.trading = { ready: true };
+    const ready = await app?.inject({ url: "/v1/health/trading" });
+    expect(ready?.statusCode).toBe(200);
+    expect(JSON.parse(ready?.body ?? "{}")).toEqual({ awake: true, ready: true });
+  });
+
   it("answers 503 with the reason while the start-up work is refused, asleep or not", async () => {
     const { setup } = await serviceOn(true);
     setup.startUp = { ready: false, problem: "failed to get info about account: 403 Forbidden" };

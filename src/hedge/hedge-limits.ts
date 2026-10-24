@@ -13,6 +13,9 @@ export const HEDGE_LIMITS = {
   retryAfterRefusalMs: 5_000,
 } as const;
 
+/** A hedge position left open under a stopped maker is alerted again this often until it is closed or the maker runs. */
+export const UNMANAGED_ALERT_REPEAT_MS = 10 * 60_000;
+
 /** Every call to the hedge venue gets this long to answer before the controller stops waiting for it. */
 export const VENUE_CALL_TIMEOUT_MS = 8_000;
 

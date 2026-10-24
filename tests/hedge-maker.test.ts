@@ -214,6 +214,7 @@ describe("the maker and its hedge", () => {
     await controller.tick();
     await warmUp();
     book.position = dollars(1);
+    hedgeVenue.position = dollars(-1);
 
     await requestMode(dir, "reduce", clock.nowMs());
     await tick();

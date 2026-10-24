@@ -873,12 +873,17 @@ describe("a spot house maker's starting base", () => {
 });
 
 describe("the makers opened by the service", () => {
-  const openedWith = async (market: (typeof MARKETS)[number], over: Record<string, string>) => {
+  const openedWith = async (
+    market: (typeof MARKETS)[number],
+    over: Record<string, string>,
+    marketsOf?: (real: Venue["markets"]) => Venue["markets"],
+  ) => {
     const { venue } = makeVenue();
     const sent = { cancels: 0 };
     const counting: Venue = {
       ...placingOrdersThrough(venue, (trader, order) => venue.placeOrder(trader, order)),
       cancelAll: async () => (sent.cancels += 1),
+      ...(marketsOf ? { markets: marketsOf(() => venue.markets()) } : {}),
     };
     const wiring = {
       venue: counting,
@@ -916,6 +921,31 @@ describe("the makers opened by the service", () => {
     const loops = bots.start();
     expect(loops.length).toBeGreaterThan(0);
     for (const loop of loops) loop.stop();
+  });
+
+  it("is not ready to trade while the venue would refuse the maker's quotes, and ready again once it takes them", async () => {
+    const stale = { why: "its mark is 90 s old (StalePrice, 6038): is the price crank running?" };
+    const { opened } = await openedWith(
+      MARKETS[0],
+      { HOUSE_MAKER_RISK_RULES: "1", HOUSE_MAKER_TICK_MS: "20" },
+      (real) => async () =>
+        (await real()).map((info) =>
+          stale.why ? { ...info, quotesRefusedBecause: stale.why } : info,
+        ),
+    );
+    const bots = await opened;
+    expect(bots.trading()).toEqual({ ready: true });
+
+    const loops = bots.start();
+    try {
+      await vi.waitFor(() => expect(bots.trading().ready).toBe(false));
+      expect(bots.trading().reason).toContain("StalePrice");
+
+      stale.why = "";
+      await vi.waitFor(() => expect(bots.trading()).toEqual({ ready: true }));
+    } finally {
+      for (const loop of loops) loop.stop();
+    }
   });
 
   it("refuses the risk rules on a market it has no reference price for", async () => {
