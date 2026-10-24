@@ -127,7 +127,8 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
   oracle health and position cap, and the exchange's pause and USDC guard. While a market
   would refuse a resting order that adds exposure (a stale mark, paused, reduce-only,
   dislocated, the exchange paused or its USDC guard tripped), the house maker holds its
-  quotes: it cancels nothing, sends nothing and logs why, and requotes on its first tick
+  quotes: it sends nothing and logs why (a reduce-only market first cancels what stands,
+  once, since only a flatten may trade there), and requotes on its first tick
   after the market takes quotes again. Each side of its ladder stops at the market's
   position cap, which counts the position on that side, the open orders there and the
   new order together.

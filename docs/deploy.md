@@ -355,14 +355,14 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   short grace, and have it message you when the calls stop. That also fires when the
   maker is stopped, flattening or reducing, or the prices are pulled for long, which is
   the point. **A page during a reduce-only market is expected, not a fault:** the maker
-  is doing what it should (quoting only the side that shrinks its position, flagged
-  reduce-only) and silences the heartbeat on purpose. Check the market's status first; if
+  is doing what it should (it pulled its quotes; only a flatten reduces the position)
+  and silences the heartbeat on purpose. Check the market's status first; if
   it is reduce-only the page is that, and it clears by itself with the first full
   two-sided requote after the market opens again. The address is never logged; if a call
   fails the log says `health check ping failing` with what to check, and quoting goes on.
-- **Two stops, and what each does to users.** The soft stop keeps quoting the side that
-  shrinks the maker's position, so users can still close against it. The hard stop quotes
-  nothing, so **users cannot close their positions until the maker is resumed**; the
+- **Two stops, and what each does to users.** The soft stop pulls the maker's
+  quotes and places none; only a flatten reduces its position. The hard stop quotes
+  nothing as well, so **users cannot close their positions until the maker is resumed**; the
   exchange admin can pause the market in the meantime, and a restart does not resume it,
   since the stop is kept in `DATA_DIR`. Nothing starts the hard stop where the soft stop
   would do. A loss limit flattens (below), an error it does not understand or a control
@@ -396,8 +396,8 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
     the last good price known (the mark alone if there never was one), and a flattening gets
     three minutes before it stops the maker, not ten.
 - **A reduce-only market.** If the exchange admin sets the market to reduce-only, the
-  maker keeps quoting the side that shrinks its position, flagged reduce-only, and
-  cancels the rest. No heartbeat is sent meanwhile, on purpose, so the outside monitor
+  maker cancels what it has and holds, placing nothing: the program never rests a
+  reduce-only order, so only a flatten still goes out. No heartbeat is sent meanwhile, on purpose, so the outside monitor
   pages for as long as the market is reduce-only: that page means the market is
   reduce-only and the maker is working as designed. Any other reason the program refuses
   quotes (paused, a stale mark, a dislocation, a tripped USDC guard) holds all quotes back.
@@ -443,15 +443,15 @@ optional:
 
 - `HEDGE_SOFT_UNHEDGED_NUSD` (100): unhedged exposure from which the hedge is lagging and the
   maker quotes 10 bps wider.
-- `HEDGE_HARD_UNHEDGED_NUSD` (250): from which the hedge is blind and the maker quotes only
-  the side that shrinks its position. Must be above the soft limit, or the start is refused.
+- `HEDGE_HARD_UNHEDGED_NUSD` (250): from which the hedge is blind and the maker pulls
+  its quotes; only a flatten reduces the position. Must be above the soft limit, or the start is refused.
 - `HEDGE_CONFIRM_TIMEOUT_SECONDS` (60): without a venue confirmation for this long the hedge
   is lagging, and with no answer from the venue at all for this long it is blind.
 - `HEDGE_MAX_LEVERAGE` (3): the hedge position never grows past the hedge account's margin
   times this.
 
-A blind hedge takes a flat maker fully dark: with no position there is no side that shrinks it,
-so it quotes nothing. The same holds at startup, before the hedge venue has answered once. This
+A blind hedge takes the maker fully dark: it pulls its quotes whatever its position, so it
+quotes nothing. The same holds at startup, before the hedge venue has answered once. This
 is an intended fail-safe. To start the maker without the hedge, unset `HEDGE_ENABLED` (or set it
 to `0`) and restart the service.
 
