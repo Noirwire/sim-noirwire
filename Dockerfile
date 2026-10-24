@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build: all dependencies, compile TypeScript to dist/.
-FROM node:24-alpine AS build
+FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 # The order book client is a release file kept in vendor/.
@@ -14,7 +14,7 @@ COPY src ./src
 RUN npm run build
 
 # Production dependencies only.
-FROM node:24-alpine AS deps
+FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY vendor ./vendor
@@ -22,7 +22,7 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # Run: the compiled code and its production dependencies, as a user that
 # owns nothing in the image.
-FROM node:24-alpine AS run
+FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS run
 ENV NODE_ENV=production
 WORKDIR /app
 RUN mkdir -p /app/data && chown -R node:node /app/data
