@@ -10,6 +10,7 @@ import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
 import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/types.js";
 import { HedgeController, type HedgeStatus } from "../src/hedge/hedge-controller.js";
+import { UnknownOrderStore, hedgeOrderPath } from "../src/hedge/unknown-order-store.js";
 import type { Reference } from "../src/prices/reference-price.js";
 import { HedgeNotAvailable, openBots } from "../src/wiring/bots.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
@@ -92,6 +93,7 @@ const rig = async (name: string) => {
     makerMode: () => ledger.state.mode,
     voice,
     market: PERP,
+    unknownOrders: new UnknownOrderStore(hedgeOrderPath(dir, PERP)),
     settings: {
       softUnhedgedNotional: dollars(100),
       hardUnhedgedNotional: dollars(250),

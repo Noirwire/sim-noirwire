@@ -2,6 +2,7 @@ import { makerTraderKey } from "../bots/bot-traders.js";
 import { FundingUpdater } from "../bots/funding-updater.js";
 import { HedgeController, type HedgeGate } from "../hedge/hedge-controller.js";
 import type { HedgeVenue } from "../hedge/hedge-venue.js";
+import { UnknownOrderStore, hedgeOrderPath } from "../hedge/unknown-order-store.js";
 import { healthPing } from "../bots/health-ping.js";
 import { HouseMaker } from "../bots/house-maker.js";
 import { Liquidator } from "../bots/liquidator.js";
@@ -95,6 +96,7 @@ const hedgeController = (
     makerMode: () => ledger.hedgeMode,
     voice: makerVoice(problems),
     market: market.id,
+    unknownOrders: new UnknownOrderStore(hedgeOrderPath(config.DATA_DIR, market.id)),
     settings: {
       softUnhedgedNotional: config.HEDGE_SOFT_UNHEDGED_NUSD,
       hardUnhedgedNotional: config.HEDGE_HARD_UNHEDGED_NUSD,
