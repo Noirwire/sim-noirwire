@@ -13,6 +13,7 @@ import type {
   Venue,
 } from "../engine/types.js";
 import { rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
+import { withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
@@ -56,6 +57,11 @@ const MS_PER_SECOND = 1_000;
 const DRAIN_WITHIN_MS = 2_000;
 /** How long an order of unknown outcome may hold its bot's tick before it is reported as still unknown. */
 export const SETTLEMENT_DEADLINE_MS = 30_000;
+/**
+ * How long the program may take to take an order before its outcome is reported as unknown. A late
+ * answer after that is dropped: the order is never reported as placed by it.
+ */
+export const PLACE_DEADLINE_MS = 20_000;
 /** The program gives a bot's order no tag: its fills are recognised by receipt instead. */
 const NO_TAG = 0n;
 
@@ -401,24 +407,32 @@ export class RollupVenue implements Venue {
     let outcome: PlaceOutcome;
     let owner = "";
     let dispatched = false;
+    // Set once the deadline has passed: work that has not been handed to the program by then never is.
+    let abandoned = false;
     try {
-      outcome = await this.whileAwake(async () => {
-        const programTrader = await this.bots.trader(trader);
-        owner = programTrader.address;
-        dispatched = true;
-        return programTrader.place(market.chain.marketId, {
-          side: order.side,
-          type: order.type,
-          ...sendable,
-          reduceOnly: order.reduceOnly ?? false,
-          secret,
-          restingExpirySeconds:
-            rests && !order.reduceOnly && order.expiresInSeconds !== undefined
-              ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
-              : undefined,
-        });
-      });
+      outcome = await withinDeadline(
+        this.whileAwake(async () => {
+          const programTrader = await this.bots.trader(trader);
+          if (abandoned) throw new Error("the order was abandoned before it was sent");
+          owner = programTrader.address;
+          dispatched = true;
+          return programTrader.place(market.chain.marketId, {
+            side: order.side,
+            type: order.type,
+            ...sendable,
+            reduceOnly: order.reduceOnly ?? false,
+            secret,
+            restingExpirySeconds:
+              rests && !order.reduceOnly && order.expiresInSeconds !== undefined
+                ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
+                : undefined,
+          });
+        }),
+        PLACE_DEADLINE_MS,
+        "placing the order",
+      );
     } catch (error) {
+      abandoned = true;
       const reason = error instanceof Error ? error.message : String(error);
       // Once the order was handed to the program it may still fill, and its fills are told by this secret.
       if (dispatched) return unknownOrder(orderId, NO_TAG, order, reason);
