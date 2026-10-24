@@ -201,6 +201,11 @@ export interface OpenedBots {
   tradingWhileAsleep(): TradingReadiness;
   /** Takes every maker's quotes off the venue. Call it once the loops have stopped. */
   withdrawQuotes(): Promise<void>;
+  /**
+   * Reads every hedge account once, with the venue call deadlines, for the asleep readiness answer. Call it
+   * once the loops have stopped. A read that fails leaves that hedge unconfirmed, which is not ready.
+   */
+  confirmHedgesBeforeSleep(): Promise<void>;
 }
 
 /**
@@ -373,10 +378,17 @@ export const openBots = async (
       }
     });
   };
-  const unmanagedHedges = (): string[] =>
-    hedges
+  const confirmHedgesBeforeSleep = async (): Promise<void> => {
+    await Promise.all(hedges.map(({ controller }) => controller.confirmBeforeSleep()));
+  };
+  const unmanagedHedges = (): string[] => [
+    ...hedges
       .filter(({ controller }) => controller.hasUnmanagedPosition)
-      .map(({ market }) => `${market} maker is stopped with an open hedge position`);
+      .map(({ market }) => `${market} maker is stopped with an open hedge position`),
+    ...hedges
+      .filter(({ controller }) => controller.unconfirmedWhileAsleep)
+      .map(({ market }) => `${market} hedge position could not be confirmed before sleep`),
+  ];
   const readinessOf = (problems: string[]): TradingReadiness =>
     problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
   const trading = (): TradingReadiness =>
@@ -396,5 +408,5 @@ export const openBots = async (
       ...[...quotesRefused].map(([market, why]) => `${market} quotes would be refused: ${why}`),
     ]);
   const tradingWhileAsleep = (): TradingReadiness => readinessOf(unmanagedHedges());
-  return { start, trading, tradingWhileAsleep, withdrawQuotes };
+  return { start, trading, tradingWhileAsleep, withdrawQuotes, confirmHedgesBeforeSleep };
 };
