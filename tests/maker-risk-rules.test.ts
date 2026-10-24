@@ -182,6 +182,8 @@ class Book {
   failCancelling: Error | null = null;
   /** The venue never answers a cancel. */
   hangCancelling = false;
+  /** Order calls the venue gave up on that may still land. */
+  unsettled = 0;
   /** The venue answers every order with a refusal, giving this reason. */
   rejecting: string | null = null;
   rejectedCount = 0;
@@ -198,6 +200,7 @@ class Book {
   asVenue(): Venue {
     return {
       markets: async () => [this.info()],
+      unsettledPlaces: () => this.unsettled,
       cancelAll: async () => {
         if (this.hangCancelling) return new Promise<number>(() => {});
         if (this.failCancelling) throw this.failCancelling;
@@ -2389,6 +2392,31 @@ describe("an order of unknown outcome holds the maker across a restart", () => {
       await restarted.maker.tick(venue);
     }
     expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("keeps the hold, durably, past the expiry and an empty seat while a place call the venue gave up on is unsettled", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue } = await rig("hold-unsettled");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the call timed out";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    const { untilMs } = await holdOnDisk(dir);
+    book.unknownBecause = null;
+    book.unsettled = 1;
+
+    const restarted = await open();
+    clock.advance(untilMs - clock.nowMs() + 60_000);
+    await restarted.maker.tick(venue);
+    await restarted.maker.tick(venue);
+
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+    expect((await holdOnDisk(dir)).seatClearAtMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    book.unsettled = 0;
+    await restarted.maker.tick(venue);
+    expect(restarted.maker.quarantinedSinceMs).toBeNull();
+    expect(await holdOnDisk(dir)).toBeNull();
   });
 
   it("keeps the hold, and records it, while a cancel or a read of the seat keeps failing after the restart", async () => {

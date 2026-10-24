@@ -33,6 +33,7 @@ export const placingOrdersThrough = (venue: Venue, placeOrder: Venue["placeOrder
   traderState: (trader) => venue.traderState(trader),
   updateFunding: (market) => venue.updateFunding(market),
   liquidate: (liquidator, target, market) => venue.liquidate(liquidator, target, market),
+  unsettledPlaces: (trader) => venue.unsettledPlaces?.(trader) ?? 0,
   onFill: (listener) => venue.onFill(listener),
 });
 

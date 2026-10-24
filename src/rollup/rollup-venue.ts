@@ -130,6 +130,8 @@ export class RollupVenue implements Venue {
   /** Every key's connection, opened again after a rest. */
   private readonly sessions: Session[] = [];
   private stopped = false;
+  /** Per bot trader, the place calls handed to the program that have not settled. */
+  private readonly placesInFlight = new Map<TraderKey, number>();
   /**
    * The generation now current: everything that sends is made for it and ends
    * with it. Undefined while the service rests, when nothing may send.
@@ -385,6 +387,22 @@ export class RollupVenue implements Venue {
     return this.whileAwake(() => this.bots.topUp(trader, token, amount));
   }
 
+  /** Counts `placing` against `trader` until it resolves or rejects, whatever deadline its caller gave up at. */
+  private trackUntilSettled(trader: TraderKey, placing: Promise<unknown>): void {
+    this.placesInFlight.set(trader, (this.placesInFlight.get(trader) ?? 0) + 1);
+    const settled = (): void => {
+      const left = (this.placesInFlight.get(trader) ?? 1) - 1;
+      if (left > 0) this.placesInFlight.set(trader, left);
+      else this.placesInFlight.delete(trader);
+    };
+    placing.then(settled, settled);
+  }
+
+  /** How many calls handing an order to the program for `trader` have not yet resolved or rejected. */
+  unsettledPlaces(trader: TraderKey): number {
+    return this.placesInFlight.get(trader) ?? 0;
+  }
+
   async placeOrder(trader: TraderKey, order: NewOrder): Promise<PlaceResult> {
     this.ordersPlaced += 1;
     const orderId = `${trader}#${this.ordersPlaced}`;
@@ -416,7 +434,7 @@ export class RollupVenue implements Venue {
           if (abandoned) throw new Error("the order was abandoned before it was sent");
           owner = programTrader.address;
           dispatched = true;
-          return programTrader.place(market.chain.marketId, {
+          const placing = programTrader.place(market.chain.marketId, {
             side: order.side,
             type: order.type,
             ...sendable,
@@ -427,6 +445,8 @@ export class RollupVenue implements Venue {
                 ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
                 : undefined,
           });
+          this.trackUntilSettled(trader, placing);
+          return placing;
         }),
         PLACE_DEADLINE_MS,
         "placing the order",

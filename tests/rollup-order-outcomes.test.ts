@@ -146,6 +146,33 @@ describe("an order the program never answers", () => {
     expect(secrets()).toHaveLength(1);
   });
 
+  it("counts as unsettled until the program's own answer or failure, not the deadline", async () => {
+    vi.useFakeTimers();
+    const { venue } = venueWith();
+    let answer: (outcome: PlaceOutcome) => void = () => {};
+    let fail: (error: Error) => void = () => {};
+    fakeTrader.place = () => new Promise<PlaceOutcome>((resolve) => (answer = resolve));
+
+    const first = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS);
+    await first;
+    expect(venue.unsettledPlaces(TRADER)).toBe(1);
+    expect(venue.unsettledPlaces("bot:other")).toBe(0);
+
+    answer({ status: "rested", filled: 0n, rested: 1n, sendToResultMs: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(venue.unsettledPlaces(TRADER)).toBe(0);
+
+    fakeTrader.place = () => new Promise<PlaceOutcome>((_, reject) => (fail = reject));
+    const second = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS);
+    await second;
+    expect(venue.unsettledPlaces(TRADER)).toBe(1);
+    fail(new Error("the connection dropped"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(venue.unsettledPlaces(TRADER)).toBe(0);
+  });
+
   it("is a clean rejection, and is never sent later, when the trader was still being opened", async () => {
     vi.useFakeTimers();
     const { venue } = venueWith();

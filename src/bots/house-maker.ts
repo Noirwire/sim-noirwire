@@ -590,6 +590,8 @@ export class HouseMaker {
     if (held.seatClearAtMs === null) {
       await this.saveHold((this.hold = { ...held, seatClearAtMs: now }));
     }
+    // A call the venue gave up waiting for can still land its order, so nothing releases the hold meanwhile.
+    if ((venue.unsettledPlaces?.(this.trader) ?? 0) > 0) return false;
     if (held.untilMs === null) {
       const state = this.options.ledger?.state;
       const reviewed = state?.mode === "run" && state.lastCommandAtMs > held.lastAtMs;
