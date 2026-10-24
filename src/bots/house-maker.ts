@@ -222,8 +222,9 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
 /**
  * The one order that works `position` down to flat: reduce-only, for the whole
  * position, at a price `giveBps` through `centre` and no further. It crosses
- * whatever rests inside that price and waits for the rest, so the maker pays
- * at most `giveBps` to get out and never chases a price beyond it.
+ * whatever rests inside that price, and the program drops what it did not fill,
+ * so the maker pays at most `giveBps` to get out and never chases a price
+ * beyond it.
  */
 export const flattenOrders = (
   shape: Pick<LadderShape, "market" | "lotSize">,
@@ -250,24 +251,6 @@ export const flattenOrders = (
   ];
 };
 
-/**
- * The orders that shrink `position` and no others: the side opposite to it,
- * nearest level first, together never more than the position itself, so
- * filling them all brings the maker to flat and not past it.
- */
-export const onlyReducing = (orders: NewOrder[], position: bigint, lotSize: bigint): NewOrder[] => {
-  const side: NewOrder["side"] | null = position > 0n ? "sell" : position < 0n ? "buy" : null;
-  let room = roundDownToStep(absBigInt(position), lotSize);
-  const kept: NewOrder[] = [];
-  for (const order of orders) {
-    if (order.side !== side || room <= 0n) continue;
-    const size = minBigInt(order.size, room);
-    kept.push({ ...order, size });
-    room -= size;
-  }
-  return kept;
-};
-
 type Quoting = Extract<Plan, { action: "quote" }>;
 
 /** With no risk rules the maker quotes around the venue's mark, as it always has. */
@@ -290,7 +273,8 @@ const aroundMark = (mark: bigint): Quoting => ({
  * With `safety` it follows the risk rules: it quotes around the reference
  * price, widens and pulls as the rules say, flattens its position past its
  * loss limits, and falls back to the soft stop on an error it does not
- * understand.
+ * understand. A plan that only reduces pulls the quotes and leaves the book
+ * empty: only a flatten trades the position down.
  */
 export class HouseMaker {
   readonly trader: TraderKey;
@@ -376,6 +360,29 @@ export class HouseMaker {
     this.standing = false;
   }
 
+  /**
+   * Takes what stands off the venue before anything new is placed. Unconfirmed, the quotes may stand,
+   * nothing new goes out, the operator is told once, and the next tick tries the cancel again.
+   */
+  private async cancelStanding(venue: Venue): Promise<void> {
+    try {
+      // A cancel still out would remove the ladder placed after it when it lands, so nothing is placed until it ends.
+      if (this.cancelsInFlight > 0) {
+        throw new Error(
+          "an earlier cancel did not answer and is still out, so a new ladder could be cancelled by it",
+        );
+      }
+      await this.cancelQuotes(venue);
+    } catch (error) {
+      this.lastQuoted = null;
+      this.standing = true;
+      this.alertCancelUnconfirmed(error);
+      throw error;
+    }
+    this.cancelAlerted = false;
+    this.standing = false;
+  }
+
   /** The operator is told once that a cancel is unconfirmed, until one is confirmed. */
   private alertCancelUnconfirmed(error: unknown): void {
     if (this.cancelAlerted) return;
@@ -420,10 +427,17 @@ export class HouseMaker {
    * Throws `QuotesHeld`, having sent nothing, while the venue says it would
    * refuse the quotes: cancelling and sending a ladder it refuses would only
    * empty the book. Its next tick after the venue takes quotes again requotes.
-   * The exception is a market that is only reduce-only: the venue still takes
-   * orders flagged reduce-only there, so the maker cancels what it has and
-   * quotes the side that shrinks its position, flagged, which is the side
-   * users need to close theirs.
+   * A plan that only reduces (the soft stop, a blind hedge) pulls the quotes:
+   * it cancels what stands and places nothing, since a resting order cannot be
+   * made to shrink a position and could open exposure the other way after a
+   * fill. Only a flatten trades the position down, with one crossing limit
+   * order flagged reduce-only, which the program enforces when it fills. While
+   * an order of unknown outcome holds the maker, only that order goes out.
+   * A market that is only reduce-only cancels what stands and then holds
+   * (throwing `QuotesHeld`) unless the maker is flattening, since the venue
+   * still takes reduce-only orders there and the flattening order is one. A
+   * failed cancel is handled as any requote's is, and once nothing stands the
+   * later ticks do not cancel again.
    * With the risk rules, a failure while sending orders that it does not
    * understand makes the maker fall back (see `stopAfter`) and is thrown on. So
    * does an order the venue answers with a refusal, unless it is a post-only
@@ -474,48 +488,36 @@ export class HouseMaker {
       if (heldProblem !== undefined) throw heldProblem;
       return;
     }
-    // A held maker places only what the risk rules dictate to shrink its position, never a new ladder.
-    if (held && !plan.reduceOnly && !plan.flatten) {
+    // A held maker places only the order that flattens its position, which the program holds to reduce-only.
+    if (held && !plan.flatten) {
       this.lastQuoted = null;
       if (heldProblem !== undefined) throw heldProblem;
       return;
     }
     const refused = market.quotesRefusedBecause;
     const venueReducesOnly = refused !== undefined && market.takesReduceOnlyOrders === true;
-    if (refused !== undefined && !venueReducesOnly) {
+    // A reduce-only market takes only reduce-only orders, which never rest, so only a flatten can go out there.
+    // Anything else pulls what is standing first: old two-sided quotes would still fill there.
+    if (refused !== undefined && !(venueReducesOnly && plan.flatten)) {
       this.lastQuoted = null;
+      if (venueReducesOnly && this.standing) await this.cancelStanding(venue);
       throw new QuotesHeld(this.options.market, refused);
     }
     const next: Quoting = venueReducesOnly ? { ...plan, reduceOnly: true } : plan;
     const now = this.options.clock.nowMs();
     if (!this.dueForRequote(next, now)) return;
 
-    try {
-      // A cancel still out would remove the ladder placed below when it lands, so nothing is placed until it ends.
-      if (this.cancelsInFlight > 0) {
-        throw new Error(
-          "an earlier cancel did not answer and is still out, so a new ladder could be cancelled by it",
-        );
-      }
-      await this.cancelQuotes(venue);
-    } catch (error) {
-      // Unconfirmed: the quotes may stand, nothing new goes out, and the next tick tries the cancel again.
-      this.lastQuoted = null;
-      this.standing = true;
-      this.alertCancelUnconfirmed(error);
-      throw error;
-    }
-    this.cancelAlerted = false;
-    this.standing = false;
+    await this.cancelStanding(venue);
     const position = this.inventory(await venue.traderState(this.trader));
     const orders = this.ordersFor(next, market, position);
-    const flagged = next.reduceOnly || next.flatten === true;
-    this.standing = true;
+    // Only a flatten sends orders under a reduce-only plan, and every one of them is flagged reduce-only.
+    const flattening = next.flatten === true;
+    this.standing = orders.length > 0;
     // Fixed once, here: the hold on disk and every order sent carry this same absolute expiry.
     const expiresAtMs = this.options.clock.nowMs() + this.expiresInSeconds * 1_000;
-    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged, expiresAtMs));
-    // A risk-reducing send under a hold extends that hold, and the orders it places are added to it.
-    const heldSend = orders.length > 0 && !dispatching && flagged && this.hold !== null;
+    const dispatching = orders.length > 0 && (await this.recordDispatch(flattening, expiresAtMs));
+    // A flattening send under a hold extends that hold, and the orders it places are added to it.
+    const heldSend = orders.length > 0 && !dispatching && flattening && this.hold !== null;
     const sentIds: string[] = [];
     let leftOut = 0;
     let unknownReason: string | undefined;
@@ -530,7 +532,7 @@ export class HouseMaker {
         }
         const sent: NewOrder = {
           ...order,
-          ...(flagged ? { reduceOnly: true } : {}),
+          ...(flattening ? { reduceOnly: true } : {}),
           expiresInSeconds: this.expiresInSeconds,
           expiresAtMs,
         };
@@ -580,7 +582,7 @@ export class HouseMaker {
     }
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
-    safety?.requoteSucceeded();
+    if (orders.length > 0) safety?.requoteSucceeded();
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
 
@@ -618,16 +620,17 @@ export class HouseMaker {
    * Writes the ladder about to go out to the ledger as a hold, before any order is sent, so a crash
    * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
    * Returns whether a record was written (not when the maker is held already, or has no ledger).
-   * A risk-reducing ladder sent while held extends the hold in the ledger instead, and sends nothing
-   * if that write fails: it can never be bounded, since a reduce-only order has no expiry.
+   * `flattening` is whether the orders go out reduce-only: only the flattening order does. Such a send
+   * while held extends the hold in the ledger instead, and sends nothing if that write fails: it can
+   * never be bounded, since a reduce-only order has no expiry. A ladder expires like any quote.
    */
-  private async recordDispatch(flagged: boolean, expiresAtMs: number): Promise<boolean> {
+  private async recordDispatch(flattening: boolean, expiresAtMs: number): Promise<boolean> {
     const { ledger, clock } = this.options;
     if (!ledger) return false;
     const now = clock.nowMs();
     const held = this.hold ?? ledger.state.hold;
     if (held !== null) {
-      if (!flagged) return false;
+      if (!flattening) return false;
       const extended: UnresolvedHold = {
         ...held,
         lastAtMs: now,
@@ -649,7 +652,7 @@ export class HouseMaker {
           orderIds: [],
           sinceMs: now,
           lastAtMs: now,
-          untilMs: flagged ? null : holdLapsesAtMs(expiresAtMs),
+          untilMs: flattening ? null : holdLapsesAtMs(expiresAtMs),
           seatClearAtMs: null,
         },
       });
@@ -778,9 +781,12 @@ export class HouseMaker {
     return safety.assess(mark, seat.equity, this.inventory(seat));
   }
 
-  /** The orders `plan` asks for: the one that flattens the position, the side that shrinks it, or both sides. */
+  /**
+   * The orders `plan` asks for: the one that flattens the position, none while the plan only reduces
+   * (a resting order cannot be made to shrink a position, so the quotes are pulled), or both sides.
+   */
   private ordersFor(plan: Quoting, market: MarketInfo, position: bigint): NewOrder[] {
-    const { safety, lotSize } = this.options;
+    const { safety } = this.options;
     if (plan.flatten) {
       return flattenOrders(this.options, {
         centre: plan.centre,
@@ -789,11 +795,12 @@ export class HouseMaker {
         giveBps: MAKER_LIMITS.flattenGiveBps,
       });
     }
+    if (plan.reduceOnly) return [];
     const spreadBps = Math.ceil(
       Math.max(this.options.spreadBps, safety ? MAKER_LIMITS.minHalfSpreadBps : 0) +
         plan.extraSpreadBps,
     );
-    const ladder = ladderOrders(
+    return ladderOrders(
       { ...this.options, spreadBps },
       {
         mark: plan.centre,
@@ -804,7 +811,6 @@ export class HouseMaker {
         minEdgeBps: safety ? MAKER_LIMITS.minHalfSpreadBps : undefined,
       },
     );
-    return plan.reduceOnly ? onlyReducing(ladder, position, lotSize) : ladder;
   }
 
   /**

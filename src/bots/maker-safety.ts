@@ -20,7 +20,7 @@ export type Plan =
       centre: bigint;
       /** Added to every level's half-spread. */
       extraSpreadBps: number;
-      /** Quote only the side that shrinks the position. */
+      /** Only reduce: pull the quotes and place none (only `flatten` trades the position down). */
       reduceOnly: boolean;
       /** Work the position down to flat with reduce-only orders at a bounded price through `centre`. */
       flatten?: boolean;
@@ -185,8 +185,7 @@ export class MakerSafety {
 
   /**
    * The hedge's status, said aloud when it changes. A lagging hedge widens the
-   * quotes; a blind one lets the maker quote only the side that shrinks its
-   * position. Both end by themselves once the venue confirms the hedge again.
+   * quotes; a blind one makes the maker pull its quotes. Both end by themselves once the venue confirms the hedge again.
    */
   private followHedge(): HedgeStatus {
     const status = this.options.hedge?.status() ?? "ok";
@@ -196,8 +195,8 @@ export class MakerSafety {
     if (status === "blind") {
       voice.alert(
         `ALERT ${market} maker: its hedge is blind (the hedge venue cannot be reached, or the unhedged ` +
-          "exposure is past the hard limit). It stops growing its position and quotes only the side " +
-          "that shrinks it, until the hedge is confirmed again.",
+          "exposure is past the hard limit). It stops growing its position and pulls its quotes, " +
+          "until the hedge is confirmed again.",
       );
     } else if (status === "lagging") {
       voice.notice(

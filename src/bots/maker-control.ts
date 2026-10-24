@@ -36,7 +36,7 @@ export type KillSwitchRequest =
 
 export const KILL_SWITCH_USAGE = [
   `Usage: node dist/kill-switch.js reduce | resume | stop ${CONFIRM_STOP_FLAG}`,
-  "  reduce: the soft stop. The maker cancels the quotes that would grow its position and keeps quoting the side that shrinks it, so users can still close",
+  "  reduce: the soft stop. The maker pulls its quotes and places none; only a flatten reduces its position",
   `  stop: the hard stop. The maker cancels every quote and quotes nothing, so users cannot close until it is resumed. It is refused without ${CONFIRM_STOP_FLAG}`,
   "  resume: the maker quotes both sides again, and its loss limits count from its equity now",
   "Run it on the machine the service runs on, with the same DATA_DIR as the service.",
@@ -53,8 +53,7 @@ export const killSwitchRequest = (args: string[]): KillSwitchRequest => {
     return {
       ok: true,
       mode: "reduce",
-      meaning:
-        "the maker cancels the quotes that would grow its position and keeps quoting the side that shrinks it",
+      meaning: "the maker pulls its quotes and places none; only a flatten reduces its position",
     };
   }
   if (word === "resume") {
