@@ -40,9 +40,10 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
       .send({ ok, ...base, ...readiness, ...tradingField, ...(reason === null ? {} : { reason }) });
   });
 
-  // For a probe that pages on a status code: 503 while an awake service is not quoting under a working hedge.
+  // For a probe that pages on a status code: 503 while an awake service is not quoting under a working hedge,
+  // and while an asleep one still holds a hedge position nobody manages.
   app.get("/v1/health/trading", { config: { wakes: false } }, async (_request, reply) => {
-    const trading = ctx.activity.awake ? ctx.trading?.() : undefined;
+    const trading = ctx.activity.awake ? ctx.trading?.() : ctx.tradingWhileAsleep?.();
     return reply.status(trading && !trading.ready ? 503 : 200).send({
       awake: ctx.activity.awake,
       ready: trading?.ready ?? true,

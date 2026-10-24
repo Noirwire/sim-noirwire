@@ -262,6 +262,7 @@ export const startApp = async (
     activity,
     startUp: config.VENUE === "rollup" ? startUp : undefined,
     trading: () => bots?.trading() ?? { ready: false, reason: "the bots are not open yet" },
+    tradingWhileAsleep: () => bots?.tradingWhileAsleep() ?? { ready: true },
   });
   await server.listen({ port: config.PORT, host: config.HOST });
   const address = server.server.address();
