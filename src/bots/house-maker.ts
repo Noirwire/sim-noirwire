@@ -116,6 +116,14 @@ const mergedExpiry = (hold: UnresolvedHold | null, untilMs: number | null): numb
   return Math.max(hold.untilMs, untilMs);
 };
 
+/**
+ * When an order sent with the absolute expiry `expiresAtMs` can no longer fill, by the host's clock. The
+ * chain takes whole seconds and expires an order only once its time is past that second, so the order
+ * is live to the end of it, and the host clock may be ahead of the chain's by the skew allowance.
+ */
+export const holdLapsesAtMs = (expiresAtMs: number): number =>
+  (Math.floor(expiresAtMs / 1_000) + 1) * 1_000 + MAKER_LIMITS.chainClockSkewMs;
+
 /** An order may have been executed although the venue never said so: the maker sends nothing until it has looked. */
 export class OrderOutcomeUnknown extends Error {
   constructor(market: MarketId, reason: string | undefined) {
@@ -557,7 +565,7 @@ export class HouseMaker {
     const bounded = resting && !order.reduceOnly && order.expiresInSeconds !== undefined;
     const lastsMs = ledger ? null : UNKNOWN_ORDER_QUARANTINE_MS;
     const until = bounded
-      ? (order.expiresAtMs ?? now + (order.expiresInSeconds ?? 0) * 1_000)
+      ? holdLapsesAtMs(order.expiresAtMs ?? now + (order.expiresInSeconds ?? 0) * 1_000)
       : lastsMs === null
         ? null
         : now + lastsMs;
@@ -588,7 +596,7 @@ export class HouseMaker {
           orderIds: [],
           sinceMs: now,
           lastAtMs: now,
-          untilMs: flagged ? null : expiresAtMs,
+          untilMs: flagged ? null : holdLapsesAtMs(expiresAtMs),
           seatClearAtMs: null,
         },
       });

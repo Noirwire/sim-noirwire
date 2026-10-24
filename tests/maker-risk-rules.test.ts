@@ -20,6 +20,7 @@ import {
   type HouseMakerOptions,
   QuotesHeld,
   flattenOrders,
+  holdLapsesAtMs,
   ladderOrders,
   onlyReducing,
 } from "../src/bots/house-maker.js";
@@ -1223,7 +1224,7 @@ describe("a house maker that stops or fails", () => {
 
       await requestMode(dir, "run", clock.nowMs() + 1);
       book.failPlacing = null;
-      await tick(30);
+      await tick(60);
       book.failPlacing = failure;
       await expect(tick(11)).rejects.toThrow("something new");
       for (let error = 1; error <= 4; error += 1) {
@@ -2067,6 +2068,10 @@ describe("an order whose outcome is unknown", () => {
     expect(maker.quarantinedSinceMs).not.toBeNull();
 
     await tick(11);
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    await tick(40);
     expect(maker.quarantinedSinceMs).toBeNull();
     expect(book.take().length).toBeGreaterThan(0);
   });
@@ -2173,7 +2178,7 @@ describe("an order whose outcome is unknown", () => {
 
       book.failCancelling = null;
       await tick(11);
-      await tick(11);
+      await tick(40);
       expect(book.take().length).toBeGreaterThan(0);
     },
   );
@@ -2661,8 +2666,9 @@ describe("a ladder is recorded before any order of it is sent", () => {
 
     const orders = book.take();
     expect(orders.length).toBeGreaterThan(1);
-    expect(new Set(orders.map((order) => order.expiresAtMs))).toEqual(new Set([seen[0].untilMs]));
-    expect(seen.every((hold) => hold.untilMs === seen[0].untilMs)).toBe(true);
+    const expiry = orders[0].expiresAtMs ?? 0;
+    expect(new Set(orders.map((order) => order.expiresAtMs))).toEqual(new Set([expiry]));
+    expect(seen.every((hold) => hold.untilMs === holdLapsesAtMs(expiry))).toBe(true);
   });
 
   it("takes the ladder off, throws, and sends no heartbeat when the record of it cannot be cleared", async () => {

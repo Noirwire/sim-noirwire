@@ -421,6 +421,20 @@ export class RollupVenue implements Venue {
         "a resting order needs an expiry of its own, so it cannot outlive the bot that placed it",
       );
     }
+    const expiresAtMs = order.expiresAtMs;
+    const lapsed =
+      rests &&
+      !order.reduceOnly &&
+      expiresAtMs !== undefined &&
+      Math.floor(expiresAtMs / MS_PER_SECOND) <= Math.floor(Date.now() / MS_PER_SECOND) + 1;
+    if (lapsed) {
+      return rejectedOrder(
+        orderId,
+        NO_TAG,
+        order,
+        "the order's expiry is already past or within a second, so it was not sent",
+      );
+    }
     const secret = newOrderSecret();
     this.secrets.add(order.market, trader, secret);
     let outcome: PlaceOutcome;

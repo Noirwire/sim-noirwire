@@ -57,6 +57,8 @@ export const MAKER_LIMITS = {
 
   /** A resting quote lives at most the requote interval plus this long. */
   expiryMarginSeconds: 10,
+  /** How far the host clock may run ahead of the chain's: 30 s is far above the drift of a synced host, and costs only a longer hold. */
+  chainClockSkewMs: 30_000,
   /** The longest the requote interval may be set to, so a quote never lives long. */
   maxRequoteIntervalMs: 30_000,
 } as const;

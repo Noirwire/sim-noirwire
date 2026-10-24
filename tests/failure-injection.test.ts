@@ -185,6 +185,8 @@ class World {
   refusedBecause: string | null = null;
   placeFaults: PlaceFault[] = [];
   cancelFault: CancelFault | null = null;
+  /** How far the chain's clock runs behind the host's. */
+  chainBehindMs = 0;
   generation = 0;
   placeCalls = 0;
   cancelCalls = 0;
@@ -327,8 +329,10 @@ class World {
   /** An order rests until the absolute expiry it carries, as the venue takes it; one without falls back to its length from the send. */
   private land(order: NewOrder, late: boolean, sentAtMs: number): void {
     const expiresAtMs = order.expiresAtMs ?? sentAtMs + (order.expiresInSeconds ?? 0) * SECOND;
-    if (expiresAtMs <= Date.now()) return;
-    this.resting.push({ expiresAtMs, order });
+    // The chain takes whole seconds, expires an order once its time is past that second, and reads its own clock.
+    const liveUntilMs = (Math.floor(expiresAtMs / SECOND) + 1) * SECOND + this.chainBehindMs;
+    if (liveUntilMs <= Date.now()) return;
+    this.resting.push({ expiresAtMs: liveUntilMs, order });
     if (this.liveResting().length > LADDER_SIZE) {
       this.violate(
         `I1: ${this.liveResting().length} orders rest after a landing, more than one ladder`,
@@ -1025,6 +1029,20 @@ describe("the process restarts", () => {
     await t.step(60);
 
     expect(t.world.violations("I1")).toEqual([]);
+    t.stopLoops();
+  });
+
+  it("stays held past the expiry when the host clock is ahead of the chain's", async () => {
+    const t = await rig("restart-chain-behind", { requoteMs: LONG_REQUOTE_MS });
+    t.world.chainBehindMs = 20_000;
+    t.world.placeFaults.push({ kind: "late", landsAfterMs: 35_000 });
+    await t.step(25);
+
+    await t.restart();
+    await t.step(120);
+
+    expect(t.world.violations("I1")).toEqual([]);
+    expect(t.world.violations("I3")).toEqual([]);
     t.stopLoops();
   });
 });
