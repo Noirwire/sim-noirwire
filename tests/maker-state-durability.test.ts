@@ -260,7 +260,26 @@ describe("the makers opened by the service, on mainnet without a state file", ()
     const { bots, said } = await opened("bots-devnet", "devnet");
 
     expect(said).toEqual([]);
-    expect(bots.trading().reason ?? "").not.toContain("stopped");
+    expect(bots.trading().reason).not.toContain("stopped");
+    expect(bots.trading().reason).toContain("the market has not been read yet");
+  });
+
+  it("reports a devnet maker ready once the first market read has worked", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", () => Promise.reject(new Error("no network in this test")));
+    try {
+      const { bots } = await opened("bots-devnet-ready", "devnet");
+      const loops = bots.start();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      for (const loop of loops) loop.stop();
+
+      expect(bots.trading().reason ?? "").not.toContain("stopped");
+      expect(bots.trading().reason ?? "").not.toContain("the market has not been read yet");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 });
 
