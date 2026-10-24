@@ -4,6 +4,9 @@ type Seen = { at: "none" } | { at: "ts"; ms: number } | { at: "problem"; reason:
 
 const DIGITS = /^\d+$/;
 
+/** The problem before the first read: normal for a moment after a start or a wake, so it is not worth an alert. */
+export const KEEPER_NOT_READ_YET = "keeper heartbeat has not been read yet";
+
 /**
  * What the liquidation keeper, which runs outside this process, last said about itself: the Unix
  * time in ms of its last healthy sweep, as decimal text in a file. `poll` reads the file and never
@@ -47,7 +50,7 @@ export class KeeperHeartbeat {
   /** Why the keeper counts as not running, or undefined when it is fine or not part of this deployment. */
   problem(): string | undefined {
     if (!this.read) return this.required ? "keeper heartbeat is not configured" : undefined;
-    if (this.seen.at === "none") return "keeper heartbeat has not been read yet";
+    if (this.seen.at === "none") return KEEPER_NOT_READ_YET;
     if (this.seen.at === "problem") return this.seen.reason;
     const age = this.clock.nowMs() - this.seen.ms;
     if (age < -this.maxAgeMs) return "keeper heartbeat is malformed";

@@ -118,6 +118,7 @@ const makerSafety = (
   reference: ReferencePrice,
   control: MakerControl,
   problems: BotProblems,
+  keeper: KeeperHeartbeat,
   hedge?: HedgeGate,
 ): MakerSafety => {
   if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
@@ -135,6 +136,7 @@ const makerSafety = (
     voice,
     market: market.id,
     hedge,
+    keeper,
   });
 };
 
@@ -192,7 +194,9 @@ const noiseTaker = (
  * would refuse the maker's quotes counts as not ready too, which covers a stale mark (a price crank
  * that is down) and a dislocated or paused market. The liquidation keeper runs outside this
  * process, so it is covered through its heartbeat file (`KEEPER_HEARTBEAT_FILE`): a stale, missing
- * or malformed heartbeat is not ready, and so is no file configured on mainnet.
+ * or malformed heartbeat is not ready, and so is no file configured on mainnet. The same heartbeat
+ * also acts: while it is not fresh, every maker stops growing its position and quotes only the side
+ * that shrinks it, as for a blind hedge.
  */
 export interface TradingReadiness {
   ready: boolean;
@@ -246,6 +250,21 @@ export const openBots = async (
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)
     : undefined;
+  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
+  // Readiness is a synchronous function of cached state, so the file is read by the readiness loop, not by `trading()`.
+  // Every maker's safety reads the same heartbeat.
+  const keeper = new KeeperHeartbeat(
+    keeperFile
+      ? () =>
+          readWithinDeadline(
+            () => readFile(keeperFile, "utf8"),
+            "the keeper heartbeat file was not read",
+          )
+      : undefined,
+    isMainnet(config),
+    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+    systemClock,
+  );
   for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
     // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.
@@ -270,7 +289,7 @@ export const openBots = async (
     if (hedge) hedges.push({ market: market.id, controller: hedge });
     const safety =
       reference && ledger
-        ? makerSafety(market, ledger, reference, control, problems, hedge)
+        ? makerSafety(market, ledger, reference, control, problems, keeper, hedge)
         : undefined;
     const maker = houseMaker(config, market, sizes, { safety, ledger, afterRequote });
     await maker.ensureOpen(botVenue);
@@ -307,20 +326,6 @@ export const openBots = async (
     for (const { id } of botMarkets) quotesRefused.set(id, MARKET_NOT_READ_YET);
   };
   markNotRead();
-  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
-  // Readiness is a synchronous function of cached state, so the file is read by the readiness loop, not by `trading()`.
-  const keeper = new KeeperHeartbeat(
-    keeperFile
-      ? () =>
-          readWithinDeadline(
-            () => readFile(keeperFile, "utf8"),
-            "the keeper heartbeat file was not read",
-          )
-      : undefined,
-    isMainnet(config),
-    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
-    systemClock,
-  );
   const readQuotesRefused = async (): Promise<void> => {
     let infos: Awaited<ReturnType<typeof botVenue.markets>>;
     try {

@@ -293,7 +293,10 @@ up the address limit for everybody that day.
 order book repository's keeper, which runs separately and which this service does not
 start. Mount the keeper's heartbeat file read-only and set `KEEPER_HEARTBEAT_FILE` to it:
 without it mainnet trading is never ready, and a heartbeat older than
-`KEEPER_HEARTBEAT_MAX_AGE_MS` (30 s) makes it not ready too.
+`KEEPER_HEARTBEAT_MAX_AGE_MS` (30 s) makes it not ready too. While the heartbeat is not
+fresh each maker also stops growing its position and quotes only the side that shrinks it,
+as for a blind hedge: a flat maker quotes nothing. A line that says the liquidation keeper is
+not sweeping starts with `ALERT`, and a notice follows when the heartbeat is fresh again.
 
 Do not set the faucet, noise taker, liquidator, oracle or `DEV_TRADING` variables, nor an
 inline `GATE_SECRET_KEY`, `BOT_TRADER_SEEDS` or `DEPLOYMENT_JSON`: the service refuses to
