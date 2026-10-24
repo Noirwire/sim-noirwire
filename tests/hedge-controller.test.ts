@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import type { MakerMode } from "../src/bots/maker-state.js";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { MakerLedger, type MakerMode, makerStatePath } from "../src/bots/maker-state.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { HedgeController } from "../src/hedge/hedge-controller.js";
 import { errorClass } from "../src/hedge/call-deadline.js";
@@ -26,7 +28,7 @@ const manualTimers = () => {
   };
 };
 
-const rig = (settled = true) => {
+const rig = (settled = true, modeOf?: () => MakerMode) => {
   const timers = manualTimers();
   const clock = new ManualClock(START_MS);
   const venue = new FakeHedgeVenue();
@@ -43,7 +45,7 @@ const rig = (settled = true) => {
     clock,
     reference: { read: async () => state.reference },
     makerPosition: () => (state.hangMaker ? NEVER() : Promise.resolve(state.maker)),
-    makerMode: () => state.mode,
+    makerMode: () => (modeOf ? modeOf() : state.mode),
     voice: {
       alert: (message) => said.alerts.push(message),
       notice: (message) => said.notices.push(message),
@@ -628,6 +630,164 @@ describe("the hedge controller", () => {
       state.mode = "run";
       await tick();
       expect(venue.placed).toHaveLength(1);
+    });
+  });
+
+  describe("when the maker's state cannot be saved", () => {
+    const root = join("data-test", `hedge-fault-${Date.now()}`);
+    afterAll(() => rm(root, { recursive: true, force: true }));
+
+    const faultedLedger = async (name: string): Promise<MakerLedger> => {
+      const dir = join(root, name);
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ peakEquity: dollars(1_000) })).rejects.toThrow();
+      return ledger;
+    };
+
+    it("still shrinks the hedge as the maker shrinks, and opens nothing new", async () => {
+      const ledger = await faultedLedger("shrinks");
+      expect(ledger.state.mode).toBe("stopped");
+      const { venue, state, said, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+
+      state.maker = dollars(5);
+      await tick();
+      expect(venue.placed).toHaveLength(0);
+
+      state.maker = dollars(0.4);
+      await tick();
+      expect(venue.placed).toMatchObject([{ side: "buy", size: dollars(0.6), reduceOnly: true }]);
+      expect(said.alerts.filter((line) => line.includes("unmanaged"))).toHaveLength(0);
+    });
+
+    it("still reads a hard stop as stopped when its own save fails", async () => {
+      const dir = join(root, "hard-stop-unsaved");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ mode: "stopped", reason: "the loss limit" })).rejects.toThrow();
+      expect(ledger.hedgeMode).toBe("stopped");
+      const { venue, state, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+
+      await tick();
+
+      expect(venue.placed).toHaveLength(0);
+    });
+
+    it("keeps a hard stop saved while the marker stood as stopped after a restart, but a marker alone as reduce", async () => {
+      const dir = join(root, "stop-saved-under-marker");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ peakEquity: dollars(1_000) })).rejects.toThrow();
+      await rm(path, { recursive: true });
+      await ledger.update({ mode: "stopped", reason: "the kill switch", lastCommandAtMs: 7 });
+
+      const restarted = await MakerLedger.open(path);
+      expect(restarted.hedgeMode).toBe("stopped");
+      const { venue, state, tick } = rig(true, () => restarted.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+      await tick();
+      expect(venue.placed).toHaveLength(0);
+
+      await rm(path);
+      await writeFile(
+        path,
+        JSON.stringify({
+          mode: "run",
+          reason: null,
+          flattenStartedAtMs: null,
+          day: null,
+          dayStartEquity: null,
+          peakEquity: null,
+          lastCommandAtMs: 7,
+          spotBaseAtStart: null,
+        }),
+      );
+      const markerOnly = await MakerLedger.open(path);
+      expect(markerOnly.state.mode).toBe("stopped");
+      expect(markerOnly.hedgeMode).toBe("reduce");
+    });
+
+    it("maps a soft stop saved while the marker stood to reduce after a restart", async () => {
+      const dir = join(root, "soft-saved-under-marker");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const ledger = await MakerLedger.open(path);
+      await mkdir(path);
+      await expect(ledger.update({ peakEquity: dollars(1_000) })).rejects.toThrow();
+      await rm(path, { recursive: true });
+      await ledger.update({ mode: "reduce", reason: "the kill switch", lastCommandAtMs: 7 });
+
+      const restarted = await MakerLedger.open(path);
+
+      expect(restarted.state.mode).toBe("stopped");
+      expect(restarted.hedgeMode).toBe("reduce");
+    });
+
+    it("reads a stopped state file from before the field as a hard stop", async () => {
+      const dir = join(root, "old-file");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const old = {
+        mode: "stopped",
+        reason: "the kill switch stopped it",
+        flattenStartedAtMs: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 3,
+        spotBaseAtStart: null,
+      };
+      await writeFile(path, JSON.stringify(old));
+      await writeFile(`${path}.failed`, JSON.stringify({ phase: "failed", commandTs: null }));
+      expect((await MakerLedger.open(path)).hedgeMode).toBe("stopped");
+
+      await writeFile(path, JSON.stringify({ ...old, mode: "run" }));
+      expect((await MakerLedger.open(path)).hedgeMode).toBe("reduce");
+    });
+
+    it("keeps a saved stop's intent through a plain open and a later non-mode update", async () => {
+      const dir = join(root, "plain-open");
+      await mkdir(dir, { recursive: true });
+      const path = makerStatePath(dir, MARKET);
+      const old = {
+        mode: "stopped",
+        reason: "the kill switch stopped it",
+        flattenStartedAtMs: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 3,
+        spotBaseAtStart: null,
+      };
+      await writeFile(path, JSON.stringify(old));
+      const ledger = await MakerLedger.open(path);
+      await ledger.update({ peakEquity: 5n });
+      await writeFile(`${path}.failed`, JSON.stringify({ phase: "failed", commandTs: null }));
+      expect((await MakerLedger.open(path)).hedgeMode).toBe("stopped");
+    });
+
+    it("still abandons the hedge at an intentional hard stop", async () => {
+      const dir = join(root, "intentional");
+      await mkdir(dir, { recursive: true });
+      const ledger = await MakerLedger.open(makerStatePath(dir, MARKET));
+      await ledger.update({ mode: "stopped", reason: "the kill switch stopped it" });
+      const { venue, state, tick } = rig(true, () => ledger.hedgeMode);
+      venue.position = dollars(-1);
+      state.maker = dollars(0.4);
+
+      await tick();
+
+      expect(venue.placed).toHaveLength(0);
     });
   });
 });

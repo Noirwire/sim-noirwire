@@ -1,6 +1,20 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { access, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+/** While `fails` is set, removing a recovery marker is refused, as a failing disk would. */
+const removal = vi.hoisted(() => ({ fails: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rm: (path: Parameters<typeof actual.rm>[0], options?: Parameters<typeof actual.rm>[1]) =>
+      removal.fails && String(path).endsWith(".failed")
+        ? Promise.reject(new Error("EBUSY: the disk refused the removal"))
+        : actual.rm(path, options),
+  };
+});
 import {
   HouseMaker,
   type HouseMakerOptions,
@@ -18,7 +32,7 @@ import {
 } from "../src/bots/maker-control.js";
 import { MakerRisk } from "../src/bots/maker-risk.js";
 import { MakerSafety, worstEquity } from "../src/bots/maker-safety.js";
-import { MakerLedger, makerStatePath } from "../src/bots/maker-state.js";
+import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
 import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/types.js";
@@ -175,6 +189,9 @@ class Book {
   /** Why the market would refuse a resting order, and whether it still takes reduce-only ones. */
   refusedBecause: string | null = null;
   takesReduceOnly = false;
+  /** Like the venue: a reduce-only order is refused while the position is flat. */
+  refusesReduceOnlyWhenFlat = false;
+  markMissing = false;
 
   asVenue(): Venue {
     return {
@@ -196,6 +213,17 @@ class Book {
             remainingSize: order.size,
             reason: this.unknownBecause,
             outcomeUnknown: true,
+          };
+        }
+        if (this.refusesReduceOnlyWhenFlat && order.reduceOnly === true && this.position === 0n) {
+          this.rejectedCount += 1;
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: "ReduceOnlyWouldIncrease",
           };
         }
         if (this.rejecting !== null) {
@@ -231,7 +259,7 @@ class Book {
       tickSize: dollars(0.01),
       lotSize: dollars(0.001),
       maxLeverage: 5,
-      markPrice: this.mark,
+      markPrice: this.markMissing ? null : this.mark,
       markPriceUpdatedAtMs: 0,
       change24h: null,
       volume24h: 0n,
@@ -1142,6 +1170,16 @@ describe("a house maker that stops or fails", () => {
   });
 });
 
+const SKEW_SHAPE = {
+  market: PERP,
+  levels: 1,
+  spreadBps: 15,
+  levelStepBps: 5,
+  baseSizePerLevel: 1n,
+  maxSkewBps: 20,
+  lotSize: 1n,
+};
+
 const sidesOf = (orders: NewOrder[]): Set<string> => new Set(orders.map((order) => order.side));
 
 describe("a house maker past a loss limit flattens its position", () => {
@@ -1993,4 +2031,322 @@ describe("an order whose outcome is unknown", () => {
       expect(book.take().length).toBeGreaterThan(0);
     },
   );
+});
+
+describe("every order of a reduce-only plan carries the reduce-only flag", () => {
+  it("flags the soft stop's orders, so a fill between the position read and the order cannot flip it", async () => {
+    const { warmUp, book, dir, clock, tick, ledger } = await rig("reduce-flag-race");
+    book.position = dollars(0.5);
+    book.refusesReduceOnlyWhenFlat = true;
+    await warmUp();
+    book.take();
+
+    await requestMode(dir, "reduce", clock.nowMs() + 1);
+    book.beforePlacing = async () => {
+      book.position = 0n;
+    };
+    await tick();
+
+    expect(book.orders).toHaveLength(0);
+    expect(book.rejectedCount).toBeGreaterThan(0);
+    expect(ledger.state.mode).toBe("reduce");
+  });
+
+  it("flags them when no race happens either", async () => {
+    const { warmUp, book, dir, clock, tick } = await rig("reduce-flag-plain");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+
+    await requestMode(dir, "reduce", clock.nowMs() + 1);
+    await tick();
+
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(0);
+    expect(orders.every((order) => order.reduceOnly === true)).toBe(true);
+  });
+});
+
+describe("a maker whose state cannot be saved fails closed", () => {
+  /** A directory where the state file goes: the temporary file is written, but the rename onto it fails. */
+  const breakWrites = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
+    await rm(makerStatePath(dir, PERP), { force: true });
+    await mkdir(makerStatePath(dir, PERP));
+  };
+  const repairWrites = (dir: string) => rm(makerStatePath(dir, PERP), { recursive: true });
+  const markerOf = (dir: string) => `${makerStatePath(dir, PERP)}.failed`;
+  /** A marker path that cannot be checked: a link that points at itself. */
+  const unreadableMarker = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
+    await rm(markerOf(dir), { recursive: true, force: true });
+    await symlink(basename(markerOf(dir)), markerOf(dir));
+  };
+
+  it("cancels its quotes at once, and stays stopped on later ticks", async () => {
+    const { warmUp, book, dir, tick, ledger } = await rig("persist-fails");
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    await breakWrites(dir);
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    expect(ledger.state.mode).toBe("stopped");
+    book.equity = dollars(1_000);
+    await tick(30);
+    expect(book.orders).toHaveLength(0);
+    expect(ledger.state.mode).toBe("stopped");
+  });
+
+  it("starts a restarted maker stopped, and only an explicit resume clears that", async () => {
+    const { warmUp, book, dir, clock, tick, open, venue } = await rig("persist-restart");
+    await warmUp();
+    book.take();
+    await breakWrites(dir);
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+
+    const restarted = await open();
+    expect(restarted.ledger.state.mode).toBe("stopped");
+    book.equity = dollars(1_000);
+    clock.advance(30_000);
+    await restarted.maker.tick(venue);
+    expect(restarted.ledger.state.mode).toBe("stopped");
+    expect(book.orders).toHaveLength(0);
+
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    clock.advance(1_000);
+    await restarted.maker.tick(venue);
+    expect(restarted.ledger.state.mode).toBe("run");
+    const again = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(again.state.mode).toBe("run");
+  });
+
+  it("keeps the marker while only other changes are written", async () => {
+    const { dir, ledger } = await rig("persist-marker-stays");
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+
+    await ledger.update({ mode: "reduce", reason: "other" });
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("stopped");
+  });
+
+  it("refuses to open while the marker cannot be checked", async () => {
+    const { dir } = await rig("marker-unreadable");
+    await unreadableMarker(dir);
+
+    await expect(MakerLedger.open(makerStatePath(dir, PERP))).rejects.toThrow("recovery marker");
+  });
+
+  it("refuses the start after the state and the marker both failed to write", async () => {
+    const { dir, ledger } = await rig("persist-both-fail");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await breakWrites(dir);
+    await mkdir(markerOf(dir));
+
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("ALERT"), expect.anything());
+    logged.mockRestore();
+    await unreadableMarker(dir);
+    await expect(MakerLedger.open(makerStatePath(dir, PERP))).rejects.toThrow("recovery marker");
+  });
+
+  it("stays stopped with a recovery-required reason when the marker cannot be removed, and runs the same resume again", async () => {
+    const { dir, ledger, clock } = await rig("persist-rm-fails");
+    const said: string[] = [];
+    const risk = new MakerRisk(ledger, clock, PERP, {
+      alert: (message) => said.push(message),
+      notice: (message) => said.push(message),
+    });
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    const resume = { mode: "run", requestedAtMs: 5 } as const;
+    removal.fails = true;
+
+    await expect(risk.follow(resume, dollars(1_000))).rejects.toThrow(StatePersistenceError);
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.reason).toContain("recovery marker could not be removed");
+    expect(await ledger.canRetryResume(5)).toBe(true);
+    expect(JSON.parse(await readFile(markerOf(dir), "utf8"))).toEqual({
+      phase: "resumed",
+      commandTs: 5,
+    });
+
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(restarted.state.mode).toBe("stopped");
+    removal.fails = false;
+    const again = new MakerRisk(restarted, clock, PERP, {
+      alert: (message) => said.push(message),
+      notice: (message) => said.push(message),
+    });
+    await again.follow(resume, dollars(1_000));
+    expect(restarted.state.mode).toBe("run");
+    expect(await restarted.canRetryResume(5)).toBe(false);
+    expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.mode).toBe("run");
+  });
+
+  it("finishes a saved resume at the next start once the marker can be removed", async () => {
+    const { dir, ledger, clock } = await rig("persist-finish-on-open");
+    const risk = new MakerRisk(ledger, clock, PERP, { alert: () => {}, notice: () => {} });
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    removal.fails = true;
+    await expect(risk.follow({ mode: "run", requestedAtMs: 5 }, dollars(1_000))).rejects.toThrow(
+      StatePersistenceError,
+    );
+
+    const held = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(held.state.mode).toBe("stopped");
+    expect(held.state.reason).toContain("recovery marker could not be removed");
+    removal.fails = false;
+    const finished = await MakerLedger.open(makerStatePath(dir, PERP));
+
+    expect(finished.state.mode).toBe("run");
+    await expect(access(markerOf(dir))).rejects.toThrow();
+  });
+
+  it("refuses a stale resume once a newer stop is saved, before and after a restart", async () => {
+    const { dir, ledger, clock } = await rig("persist-stale-after-stop");
+    const quiet = { alert: () => {}, notice: () => {} };
+    const risk = new MakerRisk(ledger, clock, PERP, quiet);
+    await breakWrites(dir);
+    await expect(ledger.update({ mode: "reduce" })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    const resume = { mode: "run", requestedAtMs: 5 } as const;
+    removal.fails = true;
+    await expect(risk.follow(resume, dollars(1_000))).rejects.toThrow(StatePersistenceError);
+
+    await risk.follow({ mode: "stopped", requestedAtMs: 6 }, dollars(1_000));
+    await risk.follow(resume, dollars(1_000));
+    expect(ledger.state.mode).toBe("stopped");
+
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    removal.fails = false;
+    const again = new MakerRisk(restarted, clock, PERP, quiet);
+    await again.follow(resume, dollars(1_000));
+    expect(restarted.state.mode).toBe("stopped");
+    expect(restarted.state.lastCommandAtMs).toBe(6);
+  });
+
+  it("does not let an old run command resume a maker whose marker says failed", async () => {
+    const { dir, ledger, clock } = await rig("persist-stale-run");
+    await breakWrites(dir);
+    await expect(ledger.update({ peakEquity: 1n })).rejects.toThrow(StatePersistenceError);
+    await repairWrites(dir);
+    await writeFile(
+      makerStatePath(dir, PERP),
+      JSON.stringify({
+        mode: "run",
+        reason: null,
+        flattenStartedAtMs: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 5,
+        spotBaseAtStart: null,
+      }),
+    );
+    const restarted = await MakerLedger.open(makerStatePath(dir, PERP));
+    const risk = new MakerRisk(restarted, clock, PERP, { alert: () => {}, notice: () => {} });
+
+    await risk.follow({ mode: "run", requestedAtMs: 5 }, dollars(1_000));
+    expect(restarted.state.mode).toBe("stopped");
+
+    await risk.follow({ mode: "run", requestedAtMs: 6 }, dollars(1_000));
+    expect(restarted.state.mode).toBe("run");
+  });
+
+  it("does not keep a mode in memory that is not on disk", async () => {
+    const { dir, ledger } = await rig("persist-memory");
+    await breakWrites(dir);
+
+    await expect(ledger.update({ mode: "reduce", reason: "test" })).rejects.toThrow(
+      StatePersistenceError,
+    );
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(ledger.state.lastCommandAtMs).toBe(0);
+  });
+
+  it("writes the state to a file a restart reads back", async () => {
+    const { dir, ledger } = await rig("persist-ok");
+
+    await ledger.update({ mode: "reduce", reason: "test" });
+
+    const reopened = await MakerLedger.open(makerStatePath(dir, PERP));
+    expect(reopened.state.mode).toBe("reduce");
+  });
+});
+
+describe("a stopped maker keeps trying to cancel", () => {
+  it("retries a failed cancel on later ticks even when the mark is missing, and alerts once", async () => {
+    const { warmUp, book, dir, clock, tick, said } = await rig("stopped-cancel-retry");
+    await warmUp();
+    book.take();
+    const cancelsBefore = book.cancels;
+
+    book.failCancelling = new Error("the rollup did not answer");
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+    await expect(tick()).rejects.toThrow("did not answer");
+    book.markMissing = true;
+    await expect(tick()).rejects.toThrow("did not answer");
+
+    expect(book.cancels).toBe(cancelsBefore);
+    expect(said.alerts.filter((alert) => alert.includes("cancel was not confirmed"))).toHaveLength(
+      1,
+    );
+
+    book.failCancelling = null;
+    await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
+  });
+});
+
+describe("the skew uses exact integer ratios", () => {
+  it("skews a position of half the limit the same at any scale", () => {
+    const shape = { ...SKEW_SHAPE };
+    const small = ladderOrders(shape, {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      position: 1n,
+      positionLimit: 2n,
+    });
+    const huge = ladderOrders(shape, {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      position: 10n ** 30n,
+      positionLimit: 2n * 10n ** 30n,
+    });
+
+    expect(pricesOf(huge, "buy")[0]).toBe(pricesOf(small, "buy")[0]);
+    expect(pricesOf(huge, "sell")[0]).toBe(pricesOf(small, "sell")[0]);
+  });
+
+  it("caps the skew at the limit however large the position is", () => {
+    const base = {
+      mark: dollars(150),
+      tickSize: dollars(0.01),
+      positionLimit: 10n ** 30n,
+    };
+    const full = ladderOrders(SKEW_SHAPE, { ...base, position: 10n ** 30n });
+    const beyond = ladderOrders(SKEW_SHAPE, { ...base, position: 10n ** 40n });
+    const nearly = ladderOrders(SKEW_SHAPE, { ...base, position: 9n * 10n ** 29n });
+
+    expect(pricesOf(beyond, "sell")[0]).toBe(pricesOf(full, "sell")[0]);
+    expect(pricesOf(nearly, "sell")[0]).toBeGreaterThan(pricesOf(full, "sell")[0]);
+  });
 });

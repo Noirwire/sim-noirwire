@@ -48,7 +48,13 @@ export default defineConfig([
     },
   },
   {
-    files: ["scripts/**", "src/main.ts", "src/app.ts", "src/kill-switch.ts"],
+    files: [
+      "scripts/**",
+      "src/main.ts",
+      "src/app.ts",
+      "src/kill-switch.ts",
+      "src/bots/maker-state.ts",
+    ],
     rules: { "no-console": "off" },
   },
   globalIgnores(["docker/**", "dist/**", "coverage/**", "data/**", "node_modules/**"]),
