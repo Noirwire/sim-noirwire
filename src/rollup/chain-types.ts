@@ -122,13 +122,6 @@ export interface PlaceOutcome {
 export const executed = (outcome: PlaceOutcome): boolean =>
   !["expired", "invalid", "failed", "unknown"].includes(outcome.status);
 
-/**
- * `nothing` covers a seat that is not open, has no position, is healthy, or is past the worst price.
- * `refused`: the program refused the liquidator itself, as when the seat is its own.
- */
-export type LiquidationOutcome =
-  "liquidated" | "nothing" | "stalePrice" | "liquidatorMarginInsufficient" | "refused" | "noResult";
-
 export interface SeatView {
   seat: number;
   collateral: bigint;
