@@ -12,8 +12,10 @@ import type { AppContext } from "../context.js";
  * While awake the answer also carries `trading: { ready, reason? }`, which is
  * not `ok`: a blind hedge or a stopped maker makes it not ready but leaves the
  * status code alone, so a probe does not restart a process that restarting
- * cannot help. A lagging hedge counts as ready; the keeper and the price
- * crank are not covered. The service alerts on the transition itself.
+ * cannot help. A lagging hedge counts as ready; the liquidation keeper is
+ * not covered. The service alerts on the transition itself. A probe that
+ * should page on it reads `/v1/health/trading`, which answers 503 while an
+ * awake service is not ready and 200 otherwise.
  */
 export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void => {
   app.get("/v1/health", { config: { wakes: false } }, async (_request, reply) => {
@@ -36,5 +38,16 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
     return reply
       .status(ok ? 200 : 503)
       .send({ ok, ...base, ...readiness, ...tradingField, ...(reason === null ? {} : { reason }) });
+  });
+
+  // For a probe that pages on a status code: 503 while an awake service is not quoting under a working hedge,
+  // and while an asleep one still holds a hedge position nobody manages.
+  app.get("/v1/health/trading", { config: { wakes: false } }, async (_request, reply) => {
+    const trading = ctx.activity.awake ? ctx.trading?.() : ctx.tradingWhileAsleep?.();
+    return reply.status(trading && !trading.ready ? 503 : 200).send({
+      awake: ctx.activity.awake,
+      ready: trading?.ready ?? true,
+      ...(trading?.reason === undefined ? {} : { reason: trading.reason }),
+    });
   });
 };

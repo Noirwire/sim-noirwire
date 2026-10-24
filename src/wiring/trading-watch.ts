@@ -17,6 +17,9 @@ const REPEAT_ESCALATION_MS = 10 * 60_000;
  *
  * It stays quiet until it has first read trading as ready: a hedge that is blind while it settles
  * after a wake is not an outage. A hold that never ends is still alerted by the escalation.
+ *
+ * One watch serves the whole process. A service that sleeps and wakes while trading stays not ready
+ * keeps the time the hold began, so awake spans shorter than the escalation delay still add up to an alert.
  */
 export class TradingWatch {
   private seeded = false;
@@ -29,6 +32,14 @@ export class TradingWatch {
     private readonly voice: MakerVoice,
     private readonly clock: Clock,
   ) {}
+
+  /**
+   * Call on each wake. A hedge that reads blind while it settles is not an outage, so a watch that
+   * last saw trading ready waits for it to be ready again. A hold already under way is untouched.
+   */
+  resume(): void {
+    if (this.ready) this.seeded = false;
+  }
 
   check(): void {
     const now = this.trading();

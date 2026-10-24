@@ -27,6 +27,7 @@ interface Setup {
   releaseWake: () => void;
   readiness: Readiness;
   trading: { ready: boolean; reason?: string };
+  tradingWhileAsleep: { ready: boolean; reason?: string };
   startUp: { ready: boolean; problem: string | null };
   venue: Venue;
 }
@@ -68,6 +69,7 @@ const serviceOn = async (
     releaseWake: () => release(),
     readiness: { ...READY },
     trading: { ready: true },
+    tradingWhileAsleep: { ready: true },
     startUp: { ready: true, problem: null },
     venue: over.venue ?? new MemoryVenue({ clock }),
   };
@@ -81,6 +83,7 @@ const serviceOn = async (
     hub: new Hub(),
     activity,
     trading: () => setup.trading,
+    tradingWhileAsleep: () => setup.tradingWhileAsleep,
     ...(rollupShaped
       ? {
           readiness: () => setup.readiness,
@@ -270,6 +273,52 @@ describe("/v1/health", () => {
     setup.trading = { ready: true };
     const recovered = JSON.parse((await app?.inject({ url: "/v1/health" }))?.body ?? "{}");
     expect(recovered.trading).toEqual({ ready: true });
+  });
+
+  it("answers the trading probe 503 with the reason while awake and not ready, 200 otherwise", async () => {
+    const { setup, activity } = await serviceOn(true);
+    const asleep = await app?.inject({ url: "/v1/health/trading" });
+    expect(asleep?.statusCode).toBe(200);
+    expect(JSON.parse(asleep?.body ?? "{}")).toEqual({ awake: false, ready: true });
+
+    activity.touch();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    setup.trading = { ready: false, reason: "NSOL-PERP maker is stopped" };
+    const notReady = await app?.inject({ url: "/v1/health/trading" });
+    expect(notReady?.statusCode).toBe(503);
+    expect(JSON.parse(notReady?.body ?? "{}")).toEqual({
+      awake: true,
+      ready: false,
+      reason: "NSOL-PERP maker is stopped",
+    });
+
+    setup.trading = { ready: true };
+    const ready = await app?.inject({ url: "/v1/health/trading" });
+    expect(ready?.statusCode).toBe(200);
+    expect(JSON.parse(ready?.body ?? "{}")).toEqual({ awake: true, ready: true });
+  });
+
+  it("answers the trading probe 503 while asleep with an unmanaged hedge position, and does not wake", async () => {
+    const { setup, activity } = await serviceOn(true);
+    setup.trading = { ready: false, reason: "not read yet" };
+    setup.tradingWhileAsleep = {
+      ready: false,
+      reason: "NSOL-PERP maker is stopped with an open hedge position",
+    };
+
+    const held = await app?.inject({ url: "/v1/health/trading" });
+    expect(held?.statusCode).toBe(503);
+    expect(JSON.parse(held?.body ?? "{}")).toEqual({
+      awake: false,
+      ready: false,
+      reason: "NSOL-PERP maker is stopped with an open hedge position",
+    });
+    expect(activity.awake).toBe(false);
+
+    setup.tradingWhileAsleep = { ready: true };
+    const plain = await app?.inject({ url: "/v1/health/trading" });
+    expect(plain?.statusCode).toBe(200);
+    expect(JSON.parse(plain?.body ?? "{}")).toEqual({ awake: false, ready: true });
   });
 
   it("answers 503 with the reason while the start-up work is refused, asleep or not", async () => {

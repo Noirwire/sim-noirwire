@@ -10,6 +10,7 @@ import {
   HEDGE_LIMITS,
   type HedgeSettings,
   LATE_DISPATCH_QUARANTINE_MS,
+  UNMANAGED_ALERT_REPEAT_MS,
   UNRESOLVED_HOLD_BLIND_MS,
   VENUE_CALL_TIMEOUT_MS,
 } from "./hedge-limits.js";
@@ -79,7 +80,8 @@ const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").r
  *
  * It opens no new hedge exposure while the maker is at a soft stop or
  * flattening, and trades nothing at all once the maker is stopped, when it
- * says the hedge position is unmanaged.
+ * says the hedge position is unmanaged, and says so again every 10 minutes
+ * while a position stays open.
  */
 export class HedgeController implements HedgeGate {
   private rules: HedgeMarketRules | null = null;
@@ -92,7 +94,8 @@ export class HedgeController implements HedgeGate {
   private lastReadAtMs: number | null = null;
   private confirmedAtMs: number | null = null;
   private holdUntilMs = 0;
-  private unmanagedAnnounced = false;
+  private unmanagedAlertedAtMs: number | null = null;
+  private unmanaged = false;
   private orders = 0;
   private readonly startedAtMs: number;
   private restartNoticeSent = false;
@@ -109,6 +112,11 @@ export class HedgeController implements HedgeGate {
   /** When the venue last confirmed the hedge: a position that moved, or one that left nothing to hedge. */
   get lastConfirmedAtMs(): number | null {
     return this.confirmedAtMs;
+  }
+
+  /** Whether the maker is stopped while the hedge account still holds a position nobody manages. */
+  get hasUnmanagedPosition(): boolean {
+    return this.unmanaged;
   }
 
   status(): HedgeStatus {
@@ -150,7 +158,8 @@ export class HedgeController implements HedgeGate {
       this.announceUnmanaged(account.position);
       return;
     }
-    this.unmanagedAnnounced = false;
+    this.unmanaged = false;
+    this.unmanagedAlertedAtMs = null;
     const reference = await this.options.reference.read();
     if (reference.ok) {
       this.lastPrice = reference.price;
@@ -351,8 +360,15 @@ export class HedgeController implements HedgeGate {
   }
 
   private announceUnmanaged(position: bigint): void {
-    if (this.unmanagedAnnounced) return;
-    this.unmanagedAnnounced = true;
+    this.unmanaged = position !== 0n;
+    if (!this.unmanaged) {
+      this.unmanagedAlertedAtMs = null;
+      return;
+    }
+    const nowMs = this.options.clock.nowMs();
+    const last = this.unmanagedAlertedAtMs;
+    if (last !== null && nowMs - last < UNMANAGED_ALERT_REPEAT_MS) return;
+    this.unmanagedAlertedAtMs = nowMs;
     this.options.voice.alert(
       `ALERT ${this.options.market} hedge: the maker is stopped, so the controller trades nothing. ` +
         `The hedge position of ${sol(position)} SOL on the venue is left as it is and is unmanaged. ` +
