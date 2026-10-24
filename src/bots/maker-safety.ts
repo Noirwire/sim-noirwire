@@ -4,6 +4,7 @@ import type { HedgeGate, HedgeStatus } from "../hedge/hedge-controller.js";
 import { HEDGE_LIMITS } from "../hedge/hedge-limits.js";
 import { firstLine } from "../logging/first-line.js";
 import type { Reference } from "../prices/reference-price.js";
+import { KEEPER_NOT_READ_YET } from "../wiring/keeper-heartbeat.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
 import type { ControlCommand, MakerControl } from "./maker-control.js";
 import type { MakerRisk, MakerVoice } from "./maker-risk.js";
@@ -114,13 +115,17 @@ export interface MakerSafetyOptions {
   market: string;
   /** Where the maker's exposure is hedged outside. Without it the maker is unhedged, as it always was. */
   hedge?: HedgeGate;
+  /** Whether the liquidation keeper is sweeping. Without it the maker does not look, as it never did. */
+  keeper?: { problem(): string | undefined };
 }
 
 /**
  * What the risk rules say about quoting right now: the price to quote around
  * and how much wider than usual, or why not to quote. It follows the
  * operator's commands and the loss limits first, since they decide whether
- * the maker may quote at all.
+ * the maker may quote at all. A blind hedge, or a liquidation keeper that is
+ * not sweeping, makes it pull its quotes and place none until it is back; only
+ * a flatten trades the position down.
  */
 export class MakerSafety {
   private readonly history = new PriceHistory();
@@ -128,6 +133,8 @@ export class MakerSafety {
   private lastGood: GoodReference | null = null;
   private pulled = false;
   private hedgeStatus: HedgeStatus = "ok";
+  /** Whether the keeper's problem has been said aloud and not yet cleared. */
+  private keeperAlerted = false;
 
   constructor(private readonly options: MakerSafetyOptions) {}
 
@@ -173,12 +180,13 @@ export class MakerSafety {
     if (this.pulled) this.options.voice.notice(`${this.options.market} maker is quoting again`);
     this.pulled = false;
     const hedge = this.followHedge();
+    const keeperDown = this.followKeeper();
     const widenForHedge = hedge === "lagging" ? HEDGE_LIMITS.laggingExtraSpreadBps : 0;
     return {
       action: "quote",
       centre: reference.price,
       extraSpreadBps: volatility * MAKER_LIMITS.volatilityShare + widenForLag + widenForHedge,
-      reduceOnly: risk.mode !== "run" || hedge === "blind",
+      reduceOnly: risk.mode !== "run" || hedge === "blind" || keeperDown,
       flatten: risk.mode === "flatten",
     };
   }
@@ -206,6 +214,42 @@ export class MakerSafety {
       voice.notice(`${market} maker: its hedge is confirmed again, so it quotes normally`);
     }
     return status;
+  }
+
+  /**
+   * Whether the keeper is down, said aloud once when it goes down and once when it is back, however
+   * the problem's wording changes in between. A keeper not read yet is down too (the maker fails
+   * closed), but it is the normal state just after a start or a wake, so it says nothing by itself.
+   */
+  private followKeeper(): boolean {
+    const problem = this.options.keeper?.problem();
+    const { voice, market } = this.options;
+    if (problem === undefined) {
+      if (this.keeperAlerted) {
+        voice.notice(
+          `${market} maker: the liquidation keeper is sweeping again, so the keeper no longer limits its quotes`,
+        );
+      }
+      this.keeperAlerted = false;
+      return false;
+    }
+    if (problem !== KEEPER_NOT_READ_YET && !this.keeperAlerted) {
+      this.keeperAlerted = true;
+      voice.alert(
+        `ALERT ${market} maker: the liquidation keeper is not sweeping (${problem}). It pulls its quotes ` +
+          "and places none until the keeper's heartbeat is fresh again; only a flatten trades the position down.",
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Whether the maker may still place a ladder that grows its position: a second look at the
+   * keeper just before the orders go out, since `assess` looked once at the start of the tick.
+   * It says the same things aloud as `assess` does, and only once between them.
+   */
+  mayGrow(): boolean {
+    return !this.followKeeper();
   }
 
   /**

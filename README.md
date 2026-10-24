@@ -331,7 +331,10 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   seats is the order book repository's keeper, which runs separately and which this
   service does not start. It does watch the keeper's heartbeat file
   (`KEEPER_HEARTBEAT_FILE`): trading is not ready when the keeper has not completed a
-  healthy sweep within `KEEPER_HEARTBEAT_MAX_AGE_MS`. A stopped maker does not stop that keeper, but users
+  healthy sweep within `KEEPER_HEARTBEAT_MAX_AGE_MS`, and every maker pulls its quotes
+  and places none, with one `ALERT` line, until the heartbeat is fresh again (a notice says
+  so); only a flatten trades the position down. The first second after a start
+  or a wake, before the heartbeat has been read, is reduce-only too, but says nothing. A stopped maker does not stop that keeper, but users
   cannot close against a stopped maker, so a hard stop leaves them to be liquidated or to
   wait.
 - **Errors it does not understand.** While sending orders, any failure other than the

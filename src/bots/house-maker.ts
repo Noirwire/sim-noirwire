@@ -510,6 +510,11 @@ export class HouseMaker {
     await this.cancelStanding(venue);
     const position = this.inventory(await venue.traderState(this.trader));
     const orders = this.ordersFor(next, market, position);
+    // The cancel above ran, so nothing stands: the next tick's plan takes the reduce-only path.
+    if (safety && !next.reduceOnly && !safety.mayGrow()) {
+      this.lastQuoted = null;
+      return;
+    }
     // Only a flatten sends orders under a reduce-only plan, and every one of them is flagged reduce-only.
     const flattening = next.flatten === true;
     this.standing = orders.length > 0;

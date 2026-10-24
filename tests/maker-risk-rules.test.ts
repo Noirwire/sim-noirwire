@@ -48,6 +48,7 @@ import {
 import { MARKETS } from "../src/engine/markets.js";
 import { ORDER_EXPIRY_TOO_NEAR, placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
+import { KEEPER_NOT_READ_YET } from "../src/wiring/keeper-heartbeat.js";
 import { TradingWatch } from "../src/wiring/trading-watch.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
@@ -353,6 +354,8 @@ const rig = async (
     notice: (message: string) => said.notices.push(message),
   };
   const feed = { reference: { ok: true, price: dollars(150) } as Reference };
+  /** What the liquidation keeper's heartbeat says: nothing wrong until a test sets a problem. */
+  const keeper = { problem: undefined as string | undefined };
   const open = async () => {
     const ledger = await MakerLedger.open(makerStatePath(dir, PERP));
     const safety = new MakerSafety({
@@ -362,6 +365,7 @@ const rig = async (
       clock,
       voice,
       market: PERP,
+      keeper: { problem: () => keeper.problem },
     });
     const maker = new HouseMaker({
       market: PERP,
@@ -397,7 +401,7 @@ const rig = async (
     await maker.tick(venue);
     for (let second = 0; second < 10; second += 1) await tick();
   };
-  return { dir, clock, book, said, feed, maker, ledger, venue, tick, warmUp, open };
+  return { dir, clock, book, said, feed, keeper, maker, ledger, venue, tick, warmUp, open };
 };
 
 describe("a house maker's quotes expire by themselves", () => {
@@ -1810,6 +1814,198 @@ describe("the heartbeat of a maker that is not quoting freely", () => {
     await tick(11);
     await tick(11);
     expect(beats).toBe(3);
+  });
+});
+
+describe("a house maker while the liquidation keeper is not sweeping", () => {
+  const STALE = (seconds: number) => `keeper has not completed a healthy sweep for ${seconds}s`;
+  const keeperAlerts = (said: { alerts: string[] }) =>
+    said.alerts.filter((line) => line.includes("liquidation keeper"));
+
+  it("quotes both sides while the keeper is fine", async () => {
+    const { book, said, warmUp } = await rig("keeper-fine");
+
+    await warmUp();
+
+    expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
+    expect(keeperAlerts(said)).toEqual([]);
+  });
+
+  it("cancels the standing ladder and places none, with one ALERT that does not repeat as the age grows", async () => {
+    const { book, keeper, said, tick, warmUp } = await rig("keeper-stale");
+    book.position = dollars(0.5);
+    await warmUp();
+    expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
+    const cancelsBefore = book.cancels;
+
+    keeper.problem = STALE(31);
+    await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    await tick();
+    keeper.problem = STALE(45);
+    await tick();
+    await tick();
+
+    expect(book.take()).toEqual([]);
+    const alerts = keeperAlerts(said);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatch(/^ALERT /);
+    expect(alerts[0]).toContain(STALE(31));
+  });
+
+  it("quotes both sides again once the heartbeat is fresh, with one notice", async () => {
+    const { book, keeper, said, tick, warmUp } = await rig("keeper-recovers");
+    await warmUp();
+    book.position = dollars(0.5);
+    book.take();
+    keeper.problem = STALE(31);
+    await tick();
+    await tick();
+    expect(book.take()).toEqual([]);
+
+    keeper.problem = undefined;
+    await tick();
+    await tick();
+
+    expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
+    expect(said.notices.filter((line) => line.includes("keeper is sweeping again"))).toHaveLength(
+      1,
+    );
+    expect(keeperAlerts(said)).toHaveLength(1);
+  });
+
+  it("alerts again for a second outage after the recovery", async () => {
+    const { keeper, said, tick, warmUp } = await rig("keeper-twice");
+    await warmUp();
+
+    keeper.problem = STALE(31);
+    await tick();
+    keeper.problem = undefined;
+    await tick();
+    keeper.problem = STALE(31);
+    await tick();
+
+    expect(keeperAlerts(said)).toHaveLength(2);
+  });
+
+  it("places nothing before the heartbeat has been read, but says nothing", async () => {
+    const { book, keeper, said, tick, warmUp } = await rig("keeper-not-read");
+    await warmUp();
+    book.take();
+
+    book.position = dollars(0.5);
+    keeper.problem = KEEPER_NOT_READ_YET;
+    await tick();
+    await tick();
+    expect(book.take()).toEqual([]);
+
+    keeper.problem = undefined;
+    await tick();
+    await tick();
+
+    expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
+    expect(keeperAlerts(said)).toEqual([]);
+    expect(said.notices.filter((line) => line.includes("keeper"))).toEqual([]);
+  });
+
+  it("still alerts when a real problem follows the not-read state", async () => {
+    const { keeper, said, tick, warmUp } = await rig("keeper-unread-then-gone");
+    await warmUp();
+
+    keeper.problem = KEEPER_NOT_READ_YET;
+    await tick();
+    keeper.problem = "keeper heartbeat unreadable";
+    await tick();
+
+    expect(keeperAlerts(said)).toHaveLength(1);
+  });
+
+  it("places nothing, and alerts once, when the keeper turns stale between the assessment and the placing", async () => {
+    const { book, keeper, said, tick, venue, maker, clock, warmUp } = await rig("keeper-race");
+    await warmUp();
+    book.take();
+    let reads = 0;
+    const racing: typeof venue = {
+      ...venue,
+      traderState: async (trader) => {
+        reads += 1;
+        // The first read is the assessment's; the keeper goes stale after it.
+        if (reads === 2) keeper.problem = STALE(31);
+        return venue.traderState(trader);
+      },
+    };
+
+    clock.advance(11_000);
+    await maker.tick(racing);
+
+    expect(reads).toBe(2);
+    expect(book.take()).toEqual([]);
+    expect(keeperAlerts(said)).toHaveLength(1);
+
+    await tick();
+    await tick();
+
+    expect(book.take()).toEqual([]);
+    expect(keeperAlerts(said)).toHaveLength(1);
+  });
+
+  it("quotes as before when it is given no keeper", async () => {
+    const { dir, clock, ledger, said } = await rig("keeper-none");
+    const voice = {
+      alert: (message: string) => said.alerts.push(message),
+      notice: (message: string) => said.notices.push(message),
+    };
+    const safety = new MakerSafety({
+      reference: { read: async () => ({ ok: true, price: dollars(150) }) },
+      risk: new MakerRisk(ledger, clock, PERP, voice),
+      control: new MakerControl(controlPath(dir)),
+      clock,
+      voice,
+      market: PERP,
+    });
+
+    for (let second = 0; second < 11; second += 1) {
+      clock.advance(1_000);
+      await safety.assess(dollars(150), dollars(1_000), dollars(0.5));
+    }
+
+    expect(await safety.assess(dollars(150), dollars(1_000), dollars(0.5))).toMatchObject({
+      action: "quote",
+      reduceOnly: false,
+    });
+  });
+
+  it("leaves a flattening and a stop as they were", async () => {
+    const stopped = await rig("keeper-down-stopped");
+    await stopped.warmUp();
+    stopped.keeper.problem = STALE(31);
+    await requestMode(stopped.dir, "stopped", stopped.clock.nowMs() + 1);
+    await stopped.tick(2);
+    stopped.book.take();
+    await stopped.tick();
+    expect(stopped.book.take()).toEqual([]);
+    expect(stopped.ledger.state.mode).toBe("stopped");
+
+    const flattening = await rig("keeper-down-flatten");
+    flattening.book.position = dollars(0.5);
+    await flattening.warmUp();
+    flattening.keeper.problem = STALE(31);
+    flattening.book.take();
+    flattening.book.equity = dollars(969);
+    await flattening.tick(11);
+    expect(flattening.ledger.state.mode).toBe("flatten");
+    expect(flattening.book.take()).toEqual([
+      {
+        market: PERP,
+        side: "sell",
+        type: "limit",
+        price: dollars(149.63),
+        size: dollars(0.5),
+        reduceOnly: true,
+        expiresInSeconds: 20,
+        expiresAtMs: expect.any(Number),
+      },
+    ]);
   });
 });
 
