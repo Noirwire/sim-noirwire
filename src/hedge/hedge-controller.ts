@@ -63,6 +63,8 @@ interface UnexplainedOrder {
   alerted: boolean;
   /** The order's call may still be dispatched late until then, so nothing clears the hold before it. */
   quarantinedUntilMs: number;
+  /** The order's own call. While it has not settled it may still dispatch, so nothing clears the hold. */
+  call: { live: boolean };
 }
 
 const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
@@ -210,6 +212,7 @@ export class HedgeController implements HedgeGate {
         cancelled: true,
         alerted: false,
         quarantinedUntilMs: 0,
+        call: { live: false },
       };
     }
   }
@@ -233,8 +236,14 @@ export class HedgeController implements HedgeGate {
   /** Whether the venue took the order. A refusal or an unclear answer holds back the next order. */
   private async send(order: HedgeOrder, positionBefore: bigint): Promise<boolean> {
     const { venue, voice, market, clock } = this.options;
+    const call = { live: true };
+    const placing = (async () => venue.placeIoc(order))();
+    const settle = () => {
+      call.live = false;
+    };
+    placing.then(settle, settle);
     try {
-      const ack = await this.within("an order", () => venue.placeIoc(order));
+      const ack = await this.within("an order", () => placing);
       if (ack.status === "accepted") return true;
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.retryAfterRefusalMs;
       voice.notice(`${market} hedge order refused by the venue: ${ack.reason}`);
@@ -251,6 +260,7 @@ export class HedgeController implements HedgeGate {
         cancelled: false,
         alerted: false,
         quarantinedUntilMs: clock.nowMs() + LATE_DISPATCH_QUARANTINE_MS,
+        call,
       };
       await this.cancelUnexplained(this.unexplained);
     }
@@ -277,13 +287,14 @@ export class HedgeController implements HedgeGate {
    * explained when the hedge position moved, or when the venue's fills show its client id and the
    * position has caught up. With neither, it is explained as not filled only once its cancel went
    * through and the settle time has passed. A cancel that fails is retried every tick. An order
-   * whose call timed out or failed is held in either case until its late-dispatch quarantine ends.
+   * whose call timed out or failed is held in either case until its late-dispatch quarantine ends
+   * and its call has settled, because a call still running may dispatch at any time.
    */
   private async stillUnexplained(account: HedgeAccount): Promise<boolean> {
     const order = this.unexplained;
     if (!order) return false;
     const { venue, clock } = this.options;
-    const quarantined = clock.nowMs() < order.quarantinedUntilMs;
+    const quarantined = order.call.live || clock.nowMs() < order.quarantinedUntilMs;
     if (account.position !== order.positionBefore && !quarantined) {
       this.unexplained = null;
       return false;
