@@ -2,14 +2,7 @@ import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import type { MakerVoice } from "../bots/maker-risk.js";
 import type { MakerMode } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
-import {
-  absBigInt,
-  maxBigInt,
-  minBigInt,
-  mulDivScale,
-  roundDownToStep,
-  toDecimalString,
-} from "../engine/money.js";
+import { absBigInt, mulDivScale, toDecimalString } from "../engine/money.js";
 import type { Reference } from "../prices/reference-price.js";
 import { type Schedule, errorClass, realSchedule, withinDeadline } from "./call-deadline.js";
 import { decideHedge } from "./hedge-decision.js";
@@ -69,19 +62,13 @@ interface UnexplainedOrder {
   clientId: string;
   sentAtMs: number;
   positionBefore: bigint;
-  /** How far the position may still move from `positionBefore` if every unexplained order filled in full. */
-  moveMin: bigint;
-  moveMax: bigint;
   cancelled: boolean;
   alerted: boolean;
   /** The order's call may still be dispatched late until then, so nothing clears the hold before it. */
   quarantinedUntilMs: number;
   /** The order's own call. While it has not settled it may still dispatch, so nothing clears the hold. */
-  call: { readonly live: boolean };
+  call: { live: boolean };
 }
-
-/** The signed change an order makes to the hedge position if it fills in full. */
-const signedSize = (order: HedgeOrder): bigint => (order.side === "buy" ? order.size : -order.size);
 
 const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
 
@@ -213,7 +200,7 @@ export class HedgeController implements HedgeGate {
       this.lastPriceAtMs = clock.nowMs();
     }
     if (this.settlingAfterStart()) return;
-    const unexplained = await this.stillUnexplained(account);
+    if (await this.stillUnexplained(account)) return;
     if (clock.nowMs() < this.holdUntilMs) return;
 
     const decision = decideHedge({
@@ -225,13 +212,11 @@ export class HedgeController implements HedgeGate {
       rules,
       reference,
       priceBandBps: HEDGE_LIMITS.priceBandBps,
-      // While an order is unexplained the hedge may only shrink.
-      mayGrow: mode === "run" && !unexplained,
+      mayGrow: mode === "run",
     });
     if (decision.action === "none") {
       // A fresh venue read with the exposure inside the soft limit is a confirmation, whatever held the order.
       if (
-        !unexplained &&
         decision.reason !== "no trusted price" &&
         this.unhedgedNotional() < this.options.settings.softUnhedgedNotional
       ) {
@@ -240,127 +225,39 @@ export class HedgeController implements HedgeGate {
       return;
     }
 
-    const size = unexplained
-      ? this.safeShrinkSize(decision, account.position, rules)
-      : decision.size;
-    if (size <= 0n) return;
     this.orders += 1;
     const order = {
       clientId: `hedge-${this.options.market}-${clock.nowMs()}-${this.orders}`,
       side: decision.side,
-      size,
+      size: decision.size,
       limitPrice: decision.limitPrice,
       reduceOnly: decision.reduceOnly,
     };
-    await this.sendOrder(order, account, maker);
-  }
-
-  /**
-   * How much of a shrinking order may go out while an order is unexplained. It must keep the hedge
-   * on the same side of zero whether that order filled or not, in either direction, so the size is
-   * cut to the smallest position the hedge could really be at. Zero when the order is not a
-   * reduce-only shrink, when the possible positions straddle zero, or when what is left is under the
-   * venue's minimum.
-   */
-  private safeShrinkSize(
-    decision: { size: bigint; reduceOnly: boolean },
-    position: bigint,
-    rules: HedgeMarketRules,
-  ): bigint {
-    const held = this.unexplained;
-    if (!held || !decision.reduceOnly || position === 0n) return 0n;
-    const reachable = [position, position + held.moveMin, position + held.moveMax];
-    const sign = position > 0n ? 1n : -1n;
-    if (reachable.some((at) => at * sign <= 0n)) return 0n;
-    const smallest = reachable.map((at) => absBigInt(at)).reduce(minBigInt);
-    const size = roundDownToStep(minBigInt(decision.size, smallest), rules.sizeIncrement);
-    if (this.lastPrice === null || mulDivScale(size, this.lastPrice) < rules.minOrderNotional) {
-      return 0n;
-    }
-    return size;
-  }
-
-  /**
-   * Saves, sends and settles one order. When an order of unknown outcome is already held, this is a
-   * shrink: the saved record widens by what the shrink could do before it is sent, so a restart
-   * sizes against the worst case, and the held order stays the one that is reconciled. A shrink the
-   * position shows (moving no further than its size) is taken out of the held order's reference
-   * position; one that is refused is taken back; anything else keeps the wider bounds.
-   */
-  private async sendOrder(order: HedgeOrder, account: HedgeAccount, maker: bigint): Promise<void> {
-    const { clock } = this.options;
-    const held = this.unexplained;
-    const delta = signedSize(order);
     const sentAtMs = clock.nowMs();
-    const widened = {
-      moveMin: (held?.moveMin ?? 0n) + minBigInt(0n, delta),
-      moveMax: (held?.moveMax ?? 0n) + maxBigInt(0n, delta),
-    };
-    const record: UnknownOrderRecord = held
-      ? {
-          clientId: held.clientId,
-          sentAtMs: held.sentAtMs,
-          positionBefore: held.positionBefore,
-          quarantinedUntilMs: Math.max(
-            held.quarantinedUntilMs,
-            sentAtMs + LATE_DISPATCH_QUARANTINE_MS,
-          ),
-          ...widened,
-        }
-      : {
-          clientId: order.clientId,
-          sentAtMs,
-          positionBefore: account.position,
-          quarantinedUntilMs: sentAtMs + LATE_DISPATCH_QUARANTINE_MS,
-          ...widened,
-        };
-    if (!(await this.saveBeforeSending(record))) return;
-    const outcome = await this.send(order, account.position, widened);
+    const saved = await this.saveBeforeSending({
+      clientId: order.clientId,
+      sentAtMs,
+      positionBefore: account.position,
+      quarantinedUntilMs: sentAtMs + LATE_DISPATCH_QUARANTINE_MS,
+    });
+    if (!saved) return;
+    const accepted = await this.send(order, account.position);
     const after = await this.readVenue();
     if (after) this.noteAccount(after, maker);
-    const moved = after ? after.position - account.position : 0n;
-    const unmoved = moved === 0n;
-
-    if (!held) {
-      if (outcome === "accepted" && !unmoved) await this.forgetSavedOrder();
-      // An accepted order that has not moved the position may still fill: wait for the venue to show it.
-      if (outcome === "accepted" && unmoved) {
-        this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
-        this.unexplained ??= {
-          clientId: order.clientId,
-          sentAtMs: clock.nowMs(),
-          positionBefore: account.position,
-          ...widened,
-          cancelled: true,
-          alerted: false,
-          quarantinedUntilMs: 0,
-          call: { live: false },
-        };
-      }
-      return;
-    }
-
-    const shown =
-      outcome === "accepted" &&
-      (delta > 0n ? moved > 0n && moved <= delta : moved < 0n && moved >= delta);
-    if (shown || outcome === "refused") {
-      if (shown) held.positionBefore += moved;
-      await this.options.unknownOrders
-        .save({
-          clientId: held.clientId,
-          sentAtMs: held.sentAtMs,
-          positionBefore: held.positionBefore,
-          quarantinedUntilMs: held.quarantinedUntilMs,
-          moveMin: held.moveMin,
-          moveMax: held.moveMax,
-        })
-        .catch(() => {});
-      return;
-    }
-    held.moveMin = widened.moveMin;
-    held.moveMax = widened.moveMax;
-    if (outcome === "accepted") {
+    const unmoved = !after || after.position === account.position;
+    if (accepted && !unmoved) await this.forgetSavedOrder();
+    // An accepted order that has not moved the position may still fill: wait for the venue to show it.
+    if (accepted && unmoved) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
+      this.unexplained ??= {
+        clientId: order.clientId,
+        sentAtMs: clock.nowMs(),
+        positionBefore: account.position,
+        cancelled: true,
+        alerted: false,
+        quarantinedUntilMs: 0,
+        call: { live: false },
+      };
     }
   }
 
@@ -379,8 +276,6 @@ export class HedgeController implements HedgeGate {
           clientId: saved.clientId,
           sentAtMs: saved.sentAtMs,
           positionBefore: saved.positionBefore,
-          moveMin: saved.moveMin,
-          moveMax: saved.moveMax,
           cancelled: false,
           alerted: false,
           quarantinedUntilMs: saved.quarantinedUntilMs,
@@ -453,16 +348,8 @@ export class HedgeController implements HedgeGate {
     return true;
   }
 
-  /**
-   * What became of the order: taken, refused, or of unknown outcome. A refusal or an unclear answer
-   * holds back the next order. An unclear answer to a shrink sent while an older order is still
-   * unexplained joins that order's hold instead of replacing it.
-   */
-  private async send(
-    order: HedgeOrder,
-    positionBefore: bigint,
-    move: { moveMin: bigint; moveMax: bigint },
-  ): Promise<"accepted" | "refused" | "unknown"> {
+  /** Whether the venue took the order. A refusal or an unclear answer holds back the next order. */
+  private async send(order: HedgeOrder, positionBefore: bigint): Promise<boolean> {
     const { venue, voice, market, clock } = this.options;
     const call = { live: true };
     const placing = (async () => venue.placeIoc(order))();
@@ -472,11 +359,10 @@ export class HedgeController implements HedgeGate {
     placing.then(settle, settle);
     try {
       const ack = await this.within("an order", () => placing);
-      if (ack.status === "accepted") return "accepted";
+      if (ack.status === "accepted") return true;
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.retryAfterRefusalMs;
       voice.notice(`${market} hedge order refused by the venue: ${ack.reason}`);
-      if (!this.unexplained) await this.forgetSavedOrder();
-      return "refused";
+      await this.forgetSavedOrder();
     } catch (error) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
       voice.notice(
@@ -488,42 +374,18 @@ export class HedgeController implements HedgeGate {
           "No hedge order is sent until the venue's position or fills explain it. " +
           "Check the hedge account by hand if it stays unexplained.",
       );
-      const quarantinedUntilMs = clock.nowMs() + LATE_DISPATCH_QUARANTINE_MS;
-      const earlier = this.unexplained;
-      if (earlier) {
-        const earlierCall = earlier.call;
-        earlier.call = {
-          get live() {
-            return earlierCall.live || call.live;
-          },
-        };
-        earlier.quarantinedUntilMs = Math.max(earlier.quarantinedUntilMs, quarantinedUntilMs);
-        earlier.cancelled = false;
-        const cancelled = await this.within("a cancel", () => venue.cancel(order.clientId)).then(
-          () => true,
-          () => false,
-        );
-        if (!cancelled) {
-          voice.alert(
-            `ALERT ${market} hedge: a shrinking order of unknown outcome could not be cancelled. ` +
-              "No hedge order is sent until the venue's position or fills explain it. Check the hedge account by hand.",
-          );
-        }
-        return "unknown";
-      }
       this.unexplained = {
         clientId: order.clientId,
         sentAtMs: clock.nowMs(),
         positionBefore,
-        ...move,
         cancelled: false,
         alerted: false,
-        quarantinedUntilMs,
+        quarantinedUntilMs: clock.nowMs() + LATE_DISPATCH_QUARANTINE_MS,
         call,
       };
       await this.cancelUnexplained(this.unexplained);
     }
-    return "unknown";
+    return false;
   }
 
   /** Cancels the order by its client id. A cancel that fails stays unresolved, is retried, and is an ALERT. */

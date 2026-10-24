@@ -165,37 +165,11 @@ describe("a hedge order of unknown outcome and an oversized hedge", () => {
     return { venue, path, ...t };
   };
 
-  it("shrinks by no more than the smallest position the hedge could really hold, if the unknown order grew it", async () => {
-    // Read -2; the lost sell of 1 may have taken it to -3. Wanting a buy of 2 is safe: -3 + 2 stays short.
+  it("sends nothing, not even a shrink, while an order is unexplained", async () => {
     const { venue } = await afterLostOrder(
-      "shrink-short",
+      "no-shrink",
       { hedge: dollars(-2), maker: dollars(2) },
       { maker: dollars(3) },
-      { maker: 0n },
-    );
-
-    expect(venue.placed).toHaveLength(2);
-    expect(venue.placed[1]).toMatchObject({ side: "buy", size: dollars(2), reduceOnly: true });
-  });
-
-  it("cuts the shrink so it cannot cross zero if the unknown order shrank the hedge too", async () => {
-    // Read -2; the lost buy of 1 may have taken it to -1. A buy of 2 could cross zero, so only 1 goes.
-    const { venue } = await afterLostOrder(
-      "shrink-cut",
-      { hedge: dollars(-2), maker: dollars(1) },
-      { maker: dollars(1) },
-      { maker: 0n },
-    );
-
-    expect(venue.placed).toHaveLength(2);
-    expect(venue.placed[1]).toMatchObject({ side: "buy", size: dollars(1), reduceOnly: true });
-  });
-
-  it("sends nothing when the possible positions reach zero", async () => {
-    const { venue } = await afterLostOrder(
-      "shrink-straddles",
-      { hedge: dollars(-1), maker: 0n },
-      { maker: 0n },
       { maker: 0n },
     );
 
@@ -213,24 +187,6 @@ describe("a hedge order of unknown outcome and an oversized hedge", () => {
     for (let at = 0; at < 20; at += 1) await t.tick();
 
     expect(venue.placed).toHaveLength(1);
-  });
-
-  it("saves the wider bounds before a shrink is sent, and sends nothing when that save fails", async () => {
-    const { clock, venue, path } = await fresh("shrink-save");
-    const t = process_(venue, clock, new FailAfterFirstSave(path));
-    venue.position = dollars(-2);
-    t.maker.position = dollars(3);
-    clock.advance(HEDGE_LIMITS.settleAfterUnknownMs);
-    venue.freezeAccount();
-    venue.script({ lost: true });
-    await t.tick();
-    t.maker.mode = "reduce";
-    t.maker.position = 0n;
-
-    for (let at = 0; at < 20; at += 1) await t.tick();
-
-    expect(venue.placed).toHaveLength(1);
-    expect(t.said.alerts.some((line) => line.includes("could not be saved"))).toBe(true);
   });
 });
 
@@ -258,14 +214,3 @@ describe("a hedge order of unknown outcome under a hard stop", () => {
     expect(venue.placed).toHaveLength(1);
   });
 });
-
-/** Takes the first write and refuses the rest. */
-class FailAfterFirstSave extends UnknownOrderStore {
-  private saved = false;
-
-  override async save(record: Parameters<UnknownOrderStore["save"]>[0]): Promise<void> {
-    if (this.saved) throw new Error("EROFS: the disk is read-only");
-    this.saved = true;
-    await super.save(record);
-  }
-}
