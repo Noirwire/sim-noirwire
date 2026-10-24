@@ -480,7 +480,9 @@ export class HouseMaker {
     const orders = this.ordersFor(next, market, position);
     const flagged = next.reduceOnly || next.flatten === true;
     this.standing = true;
-    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged));
+    // Fixed once, here: the hold on disk and every order sent carry this same absolute expiry.
+    const expiresAtMs = this.options.clock.nowMs() + this.expiresInSeconds * 1_000;
+    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged, expiresAtMs));
     let leftOut = 0;
     let unknownReason: string | undefined;
     let sawUnknown = false;
@@ -495,6 +497,7 @@ export class HouseMaker {
           ...order,
           ...(flagged ? { reduceOnly: true } : {}),
           expiresInSeconds: this.expiresInSeconds,
+          expiresAtMs,
         };
         const placed = await venue.placeOrder(this.trader, sent);
         if (placed.outcomeUnknown) {
@@ -514,7 +517,7 @@ export class HouseMaker {
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
-    if (dispatching && this.hold === null) await this.saveHold(null);
+    if (dispatching && this.hold === null) await this.clearDispatch(venue);
     if (cutShort) return;
     if (sawUnknown) {
       this.lastQuoted = null;
@@ -545,12 +548,12 @@ export class HouseMaker {
     const { ledger } = this.options;
     const resting = order.type === "limit" || order.type === "postOnly";
     const bounded = resting && !order.reduceOnly && order.expiresInSeconds !== undefined;
-    const lastsMs = bounded
-      ? (order.expiresInSeconds ?? 0) * 1_000
-      : ledger
+    const lastsMs = ledger ? null : UNKNOWN_ORDER_QUARANTINE_MS;
+    const until = bounded
+      ? (order.expiresAtMs ?? now + (order.expiresInSeconds ?? 0) * 1_000)
+      : lastsMs === null
         ? null
-        : UNKNOWN_ORDER_QUARANTINE_MS;
-    const until = lastsMs === null ? null : now + lastsMs;
+        : now + lastsMs;
     const before = this.hold;
     const hold: UnresolvedHold = {
       orderIds: [...(before?.orderIds ?? []), orderId].slice(-HELD_ORDER_IDS),
@@ -568,7 +571,7 @@ export class HouseMaker {
    * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
    * Returns whether a record was written (not when the maker is held already, or has no ledger).
    */
-  private async recordDispatch(flagged: boolean): Promise<boolean> {
+  private async recordDispatch(flagged: boolean, expiresAtMs: number): Promise<boolean> {
     const { ledger, clock } = this.options;
     if (!ledger || this.hold !== null) return false;
     const now = clock.nowMs();
@@ -578,7 +581,7 @@ export class HouseMaker {
           orderIds: [],
           sinceMs: now,
           lastAtMs: now,
-          untilMs: flagged ? null : now + this.expiresInSeconds * 1_000,
+          untilMs: flagged ? null : expiresAtMs,
           seatClearAtMs: null,
         },
       });
@@ -587,6 +590,21 @@ export class HouseMaker {
       throw error;
     }
     return true;
+  }
+
+  /**
+   * Ends the record of the ladder just sent. If that cannot be written the ledger has stopped the
+   * maker, so the ladder is taken off at once and the failure is thrown: this is no good requote.
+   */
+  private async clearDispatch(venue: Venue): Promise<void> {
+    try {
+      await this.options.ledger?.update({ hold: null });
+    } catch (error) {
+      this.lastQuoted = null;
+      if (error instanceof StatePersistenceError) this.alertUnrecorded(error);
+      await this.withdrawOrAlert(venue).catch(() => {});
+      throw error;
+    }
   }
 
   private alertUnrecorded(error: StatePersistenceError): void {

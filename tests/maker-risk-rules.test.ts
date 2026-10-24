@@ -1356,6 +1356,7 @@ describe("a house maker past a loss limit flattens its position", () => {
         size: dollars(0.5),
         reduceOnly: true,
         expiresInSeconds: 20,
+        expiresAtMs: expect.any(Number),
       },
     ]);
     expect(said.alerts).toHaveLength(1);
@@ -2645,6 +2646,46 @@ describe("an order of unknown outcome holds the maker across a restart", () => {
 describe("a ladder is recorded before any order of it is sent", () => {
   const holdOnDisk = async (dir: string) =>
     JSON.parse(await readFile(makerStatePath(dir, PERP), "utf8")).hold;
+
+  it("sends every order with the very expiry the hold carries, even when the orders go out late", async () => {
+    const { warmUp, book, tick, dir, clock } = await rig("ladder-expiry");
+    await warmUp();
+    book.take();
+    const seen: { untilMs: number }[] = [];
+    book.beforePlacing = async () => {
+      seen.push(await holdOnDisk(dir));
+      clock.advance(30_000);
+    };
+
+    await tick(11);
+
+    const orders = book.take();
+    expect(orders.length).toBeGreaterThan(1);
+    expect(new Set(orders.map((order) => order.expiresAtMs))).toEqual(new Set([seen[0].untilMs]));
+    expect(seen.every((hold) => hold.untilMs === seen[0].untilMs)).toBe(true);
+  });
+
+  it("takes the ladder off, throws, and sends no heartbeat when the record of it cannot be cleared", async () => {
+    let heartbeats = 0;
+    const { warmUp, book, tick, dir, ledger } = await rig("ladder-clear-fails", {
+      afterRequote: () => (heartbeats += 1),
+    });
+    await warmUp();
+    book.take();
+    const heartbeatsBefore = heartbeats;
+    const cancelsBefore = book.cancels;
+    book.beforePlacing = async () => {
+      book.beforePlacing = null;
+      await rm(makerStatePath(dir, PERP), { force: true });
+      await mkdir(makerStatePath(dir, PERP));
+    };
+
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+
+    expect(heartbeats).toBe(heartbeatsBefore);
+    expect(book.cancels).toBe(cancelsBefore + 2);
+    expect(ledger.state.mode).toBe("stopped");
+  });
 
   it("has the hold on disk while the orders go out, and clears it once they are all answered", async () => {
     const { warmUp, book, tick, dir, maker } = await rig("ladder-recorded");
