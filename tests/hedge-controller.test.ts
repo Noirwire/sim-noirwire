@@ -6,6 +6,7 @@ import { ManualClock } from "../src/engine/clock.js";
 import { HedgeController } from "../src/hedge/hedge-controller.js";
 import { errorClass } from "../src/hedge/call-deadline.js";
 import { HEDGE_LIMITS, LATE_DISPATCH_QUARANTINE_MS } from "../src/hedge/hedge-limits.js";
+import type { SavedOrders, UnknownOrderRecord } from "../src/hedge/unknown-order-store.js";
 import type { Reference } from "../src/prices/reference-price.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
 import { dollars } from "./helpers.js";
@@ -24,6 +25,20 @@ const manualTimers = () => {
     fireAll: () => {
       for (const fire of [...pending]) fire();
       pending.clear();
+    },
+  };
+};
+
+/** A saved order that lives in memory only, for tests that are not about the disk. */
+const inMemoryOrders = (): SavedOrders => {
+  let held: UnknownOrderRecord | null = null;
+  return {
+    read: async () => held,
+    save: async (record) => {
+      held = record;
+    },
+    clear: async () => {
+      held = null;
     },
   };
 };
@@ -51,6 +66,7 @@ const rig = (settled = true, modeOf?: () => MakerMode) => {
       notice: (message) => said.notices.push(message),
     },
     market: MARKET,
+    unknownOrders: inMemoryOrders(),
     schedule: timers.schedule,
     settings: {
       softUnhedgedNotional: dollars(100),

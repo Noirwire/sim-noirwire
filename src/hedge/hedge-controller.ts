@@ -15,6 +15,7 @@ import {
   VENUE_CALL_TIMEOUT_MS,
 } from "./hedge-limits.js";
 import type { HedgeAccount, HedgeMarketRules, HedgeOrder, HedgeVenue } from "./hedge-venue.js";
+import type { SavedOrders, UnknownOrderRecord } from "./unknown-order-store.js";
 
 /**
  * How well the maker's exposure is hedged. `ok`: hedged, or too little left to
@@ -44,6 +45,8 @@ export interface HedgeControllerOptions {
   callTimeoutMs?: number;
   /** Starts the deadline timers; a test supplies its own. */
   schedule?: Schedule;
+  /** Where an order that may have reached the venue is kept, so a restart does not send a second one on top of it. */
+  unknownOrders: SavedOrders;
 }
 
 /** The venue answered its health check with "not trading". Its own reason is not logged. */
@@ -101,6 +104,12 @@ export class HedgeController implements HedgeGate {
   private orders = 0;
   private readonly startedAtMs: number;
   private restartNoticeSent = false;
+  /** Whether the saved order has been read back. Until it has, no order is sent. */
+  private savedOrderRead = false;
+  /** The saved order cannot be read, so the hedge cannot tell whether an order is still out. */
+  private savedOrderUnreadable = false;
+  private savedOrderAlerted = false;
+  private saveFailureAlerted = false;
 
   constructor(private readonly options: HedgeControllerOptions) {
     this.startedAtMs = options.clock.nowMs();
@@ -147,6 +156,7 @@ export class HedgeController implements HedgeGate {
     if (!this.reachable || lastRead === null || now - lastRead > settings.confirmTimeoutMs) {
       return "blind";
     }
+    if (this.savedOrderUnreadable) return "blind";
     if (now < this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return "blind";
     // A hold that nothing has resolved is never released by age, but it is no longer a hedge anyone can trust.
     if (this.unexplained && now - this.unexplained.sentAtMs > UNRESOLVED_HOLD_BLIND_MS) {
@@ -169,6 +179,7 @@ export class HedgeController implements HedgeGate {
       this.reachable = false;
       throw error;
     }
+    if (!(await this.restoreSavedOrder())) return;
     const account = await this.readVenue();
     const { rules } = this;
     if (!account || !rules) return;
@@ -177,6 +188,8 @@ export class HedgeController implements HedgeGate {
     const mode = makerMode();
     if (mode === "stopped") {
       this.announceUnmanaged(account.position);
+      // Nothing new is sent, but an order of unknown outcome is still cancelled and reconciled.
+      await this.stillUnexplained(account);
       return;
     }
     this.unmanaged = false;
@@ -220,11 +233,21 @@ export class HedgeController implements HedgeGate {
       limitPrice: decision.limitPrice,
       reduceOnly: decision.reduceOnly,
     };
+    const sentAtMs = clock.nowMs();
+    const saved = await this.saveBeforeSending({
+      clientId: order.clientId,
+      sentAtMs,
+      positionBefore: account.position,
+      quarantinedUntilMs: sentAtMs + LATE_DISPATCH_QUARANTINE_MS,
+    });
+    if (!saved) return;
     const accepted = await this.send(order, account.position);
     const after = await this.readVenue();
     if (after) this.noteAccount(after, maker);
+    const unmoved = !after || after.position === account.position;
+    if (accepted && !unmoved) await this.forgetSavedOrder();
     // An accepted order that has not moved the position may still fill: wait for the venue to show it.
-    if (accepted && (!after || after.position === account.position)) {
+    if (accepted && unmoved) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
       this.unexplained ??= {
         clientId: order.clientId,
@@ -236,6 +259,77 @@ export class HedgeController implements HedgeGate {
         call: { live: false },
       };
     }
+  }
+
+  /**
+   * Reads the saved order once, at the first tick. An order of unknown outcome from before a restart
+   * is held again, with the quarantine it had, so it is reconciled against the venue's fills before
+   * anything is sent. A file that cannot be read means nothing is sent, and says so once.
+   */
+  private async restoreSavedOrder(): Promise<boolean> {
+    const { unknownOrders, voice, market } = this.options;
+    if (this.savedOrderRead) return true;
+    try {
+      const saved = await unknownOrders.read();
+      if (saved) {
+        this.unexplained = {
+          clientId: saved.clientId,
+          sentAtMs: saved.sentAtMs,
+          positionBefore: saved.positionBefore,
+          cancelled: false,
+          alerted: false,
+          quarantinedUntilMs: saved.quarantinedUntilMs,
+          call: { live: false },
+        };
+        voice.notice(
+          `${market} hedge found an order of unknown outcome from before the restart. ` +
+            "It is not sent again, and no new order goes out until the venue's fills have explained it.",
+        );
+      }
+    } catch (error) {
+      this.savedOrderUnreadable = true;
+      if (!this.savedOrderAlerted) {
+        this.savedOrderAlerted = true;
+        voice.alert(
+          `ALERT ${market} hedge: the saved order file cannot be read (${errorClass(error)}), ` +
+            "so the hedge sends nothing. Check the file in the data directory, then restart.",
+        );
+      }
+      return false;
+    }
+    this.savedOrderUnreadable = false;
+    this.savedOrderRead = true;
+    return true;
+  }
+
+  /**
+   * Writes the order to disk before it is sent. When that fails the order is not sent, and the first
+   * failure is an alert.
+   */
+  private async saveBeforeSending(record: UnknownOrderRecord): Promise<boolean> {
+    const { unknownOrders, voice, market } = this.options;
+    try {
+      await unknownOrders.save(record);
+    } catch (error) {
+      if (!this.saveFailureAlerted) {
+        this.saveFailureAlerted = true;
+        voice.alert(
+          `ALERT ${market} hedge: the order could not be saved to disk (${errorClass(error)}), ` +
+            "so it is not sent. The hedge sends nothing until the disk takes a write.",
+        );
+      }
+      return false;
+    }
+    this.saveFailureAlerted = false;
+    return true;
+  }
+
+  /**
+   * Marks the saved order as explained. A failure here is harmless: the next order overwrites the
+   * file before it is sent, and a restart that reads a stale one only holds back for its quarantine.
+   */
+  private async forgetSavedOrder(): Promise<void> {
+    await this.options.unknownOrders.clear().catch(() => {});
   }
 
   /**
@@ -268,11 +362,17 @@ export class HedgeController implements HedgeGate {
       if (ack.status === "accepted") return true;
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.retryAfterRefusalMs;
       voice.notice(`${market} hedge order refused by the venue: ${ack.reason}`);
+      await this.forgetSavedOrder();
     } catch (error) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
       voice.notice(
         `${market} hedge order has an unknown outcome (${errorClass(error)}). ` +
           "It is not sent again until the venue's position or fills have explained it.",
+      );
+      voice.alert(
+        `ALERT ${market} hedge: an order has an unknown outcome (${errorClass(error)}). ` +
+          "No hedge order is sent until the venue's position or fills explain it. " +
+          "Check the hedge account by hand if it stays unexplained.",
       );
       this.unexplained = {
         clientId: order.clientId,
@@ -318,6 +418,7 @@ export class HedgeController implements HedgeGate {
     const quarantined = order.call.live || clock.nowMs() < order.quarantinedUntilMs;
     if (account.position !== order.positionBefore && !quarantined) {
       this.unexplained = null;
+      await this.forgetSavedOrder();
       return false;
     }
     if (!order.cancelled) await this.cancelUnexplained(order);
@@ -331,6 +432,7 @@ export class HedgeController implements HedgeGate {
       clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs
     ) {
       this.unexplained = null;
+      await this.forgetSavedOrder();
       return false;
     }
     return true;

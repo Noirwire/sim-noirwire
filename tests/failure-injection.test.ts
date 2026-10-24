@@ -1079,8 +1079,7 @@ describe("the hedge goes wrong", () => {
     t.stopLoops();
   });
 
-  // BUG: a hedge order of unknown outcome is told as a notice; only a failed cancel raises an ALERT.
-  it.fails("alerts an operator after a hedge order of unknown outcome", async () => {
+  it("alerts an operator after a hedge order of unknown outcome", async () => {
     const t = await hedged("hedge-unknown-alert");
     t.hedgeVenue.script({ lost: true });
 
@@ -1091,8 +1090,7 @@ describe("the hedge goes wrong", () => {
     t.stopLoops();
   });
 
-  // BUG: the hedge's unknown order is remembered in memory only, and a restart waits 10 s, not the 60 s quarantine, without looking at the venue's fills.
-  it.fails("sends no second hedge order after a restart while the account lags", async () => {
+  it("sends no second hedge order after a restart while the account lags", async () => {
     const t = await hedged("hedge-unknown-then-restart");
     t.hedgeVenue.freezeAccount();
     t.hedgeVenue.script({ lost: true });
