@@ -14,15 +14,25 @@ export interface UnknownOrderRecord {
   positionBefore: bigint;
   /** The order's call may still be dispatched late until then. */
   quarantinedUntilMs: number;
+  /**
+   * How far the hedge position may still move from `positionBefore` because of orders that are not
+   * explained yet, if every one of them filled in full: the sum of the sells, and of the buys.
+   */
+  moveMin: bigint;
+  moveMax: bigint;
 }
+
+const amount = z.string().regex(/^-?\d+$/);
 
 const fileSchema = z.object({
   order: z
     .object({
       clientId: z.string().min(1),
       sentAtMs: z.number(),
-      positionBefore: z.string().regex(/^-?\d+$/),
+      positionBefore: amount,
       quarantinedUntilMs: z.number(),
+      moveMin: amount,
+      moveMax: amount,
     })
     .nullable(),
 });
@@ -59,7 +69,13 @@ export class UnknownOrderStore implements SavedOrders {
     }
     try {
       const { order } = fileSchema.parse(JSON.parse(text));
-      return order === null ? null : { ...order, positionBefore: BigInt(order.positionBefore) };
+      if (order === null) return null;
+      return {
+        ...order,
+        positionBefore: BigInt(order.positionBefore),
+        moveMin: BigInt(order.moveMin),
+        moveMax: BigInt(order.moveMax),
+      };
     } catch (error) {
       throw new Error(`the hedge's saved order ${this.path} is not valid`, { cause: error });
     }
@@ -67,7 +83,12 @@ export class UnknownOrderStore implements SavedOrders {
 
   /** Writes the record, syncs it and syncs the directory. Throws when it is not safely on disk. */
   save(record: UnknownOrderRecord): Promise<void> {
-    return this.write({ ...record, positionBefore: record.positionBefore.toString() });
+    return this.write({
+      ...record,
+      positionBefore: record.positionBefore.toString(),
+      moveMin: record.moveMin.toString(),
+      moveMax: record.moveMax.toString(),
+    });
   }
 
   /** Marks that no order is held. */
