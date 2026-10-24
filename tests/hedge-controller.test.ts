@@ -391,9 +391,13 @@ describe("the hedge controller", () => {
       const { venue, state, controller, tickThroughDeadlines, tick } = rig();
       const first = venue.placeIoc.bind(venue);
       let sent = 0;
+      let answerFirst: (() => void) | null = null;
       venue.placeIoc = (order) => {
         sent += 1;
-        return sent === 1 ? NEVER() : first(order);
+        if (sent > 1) return first(order);
+        return new Promise((resolve) => {
+          answerFirst = () => resolve({ status: "accepted" });
+        });
       };
       state.maker = dollars(1);
 
@@ -409,9 +413,31 @@ describe("the hedge controller", () => {
       await tick(5);
       expect(sent).toBe(1);
 
+      // Past the quarantine the first call is still running, so it could still dispatch again.
       await tick(LATE_DISPATCH_QUARANTINE_MS / 1_000);
+      expect(sent).toBe(1);
+
+      answerFirst!();
+      await tick();
       expect(venue.placed.map((order) => order.size)).toEqual([dollars(0.5)]);
       expect(controller.hedgedPosition).toBe(dollars(-1.5));
+    });
+
+    it("never sends a second order while the first order's call has not settled, and goes blind", async () => {
+      const { venue, state, controller, tickThroughDeadlines, tick } = rig();
+      const first = venue.placeIoc.bind(venue);
+      let sent = 0;
+      venue.placeIoc = (order) => {
+        sent += 1;
+        return sent === 1 ? NEVER() : first(order);
+      };
+      state.maker = dollars(1);
+
+      await tickThroughDeadlines();
+      for (let i = 0; i < 20; i += 1) await tick(30);
+
+      expect(sent).toBe(1);
+      expect(controller.status()).toBe("blind");
     });
 
     it("goes blind once an order's hold stays unresolved for 2 minutes, and is never released by age", async () => {
