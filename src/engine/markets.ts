@@ -58,10 +58,6 @@ export const MARKETS: readonly MarketConfig[] = [
 
 export const MARKET_IDS = MARKETS.map((market) => market.id) as [MarketId, ...MarketId[]];
 
-export const PERP_MARKET_IDS = MARKETS.filter((market) => market.kind === "perp").map(
-  (market) => market.id,
-);
-
 export const marketById = (id: MarketId): MarketConfig | undefined =>
   MARKETS.find((market) => market.id === id);
 
