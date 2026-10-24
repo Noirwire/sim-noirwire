@@ -640,8 +640,8 @@ describe("the hedge controller", () => {
       expect(venue.placed).toMatchObject([{ side: "buy", size: dollars(0.6), reduceOnly: true }]);
     });
 
-    it("trades nothing at the hard stop, and says once that the hedge is unmanaged", async () => {
-      const { venue, state, said, tick } = rig();
+    it("trades nothing at the hard stop, and says at once that the hedge is unmanaged", async () => {
+      const { venue, state, said, controller, tick } = rig();
       venue.position = dollars(-1);
       state.mode = "stopped";
       state.maker = dollars(5);
@@ -652,10 +652,44 @@ describe("the hedge controller", () => {
       expect(venue.placed).toHaveLength(0);
       expect(said.alerts).toHaveLength(1);
       expect(said.alerts[0]).toMatch(/ALERT .*-1\.0 SOL.*unmanaged/);
+      expect(controller.hasUnmanagedPosition).toBe(true);
 
       state.mode = "run";
       await tick();
       expect(venue.placed).toHaveLength(1);
+      expect(controller.hasUnmanagedPosition).toBe(false);
+    });
+
+    it("alerts again every 10 minutes while the position stays open under a stopped maker", async () => {
+      const { venue, state, said, tick } = rig();
+      venue.position = dollars(-1);
+      state.mode = "stopped";
+
+      await tick();
+      await tick(9 * 60);
+      expect(said.alerts).toHaveLength(1);
+
+      await tick(60);
+      expect(said.alerts).toHaveLength(2);
+      expect(said.alerts[1]).toMatch(/ALERT .*-1\.0 SOL.*unmanaged/);
+
+      await tick(9 * 60);
+      expect(said.alerts).toHaveLength(2);
+
+      await tick(60);
+      expect(said.alerts).toHaveLength(3);
+    });
+
+    it("says nothing and is not unmanaged when the stopped maker leaves no hedge position", async () => {
+      const { venue, state, said, controller, tick } = rig();
+      venue.position = 0n;
+      state.mode = "stopped";
+
+      await tick();
+      await tick(11 * 60);
+
+      expect(said.alerts).toEqual([]);
+      expect(controller.hasUnmanagedPosition).toBe(false);
     });
   });
 

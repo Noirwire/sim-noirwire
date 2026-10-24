@@ -160,8 +160,10 @@ const noiseTaker = (
 
 /**
  * Whether the makers are quoting under a working hedge. Not the same as the process being alive. A
- * hedge that is only `lagging` counts as ready (the maker already quotes wider for it), and the
- * liquidation keeper and the price crank are not covered: they run outside this process.
+ * hedge that is only `lagging` counts as ready (the maker already quotes wider for it). A venue that
+ * would refuse the maker's quotes counts as not ready too, which covers a stale mark (a price crank
+ * that is down) and a dislocated or paused market. The liquidation keeper is not covered: it runs
+ * outside this process and leaves no signal here.
  */
 export interface TradingReadiness {
   ready: boolean;
@@ -172,7 +174,7 @@ export interface TradingReadiness {
 export interface OpenedBots {
   /** Starts every bot's loop. */
   start(): Repeating[];
-  /** Not ready while a maker is stopped or its hedge is blind. */
+  /** Not ready while a maker is stopped, its hedge is blind or the venue would refuse its quotes. */
   trading(): TradingReadiness;
   /** Takes every maker's quotes off the venue. Call it once the loops have stopped. */
   withdrawQuotes(): Promise<void>;
@@ -251,6 +253,28 @@ export const openBots = async (
       (error) => problems.onError(what, error),
       () => problems.onRecovered(what),
     );
+  /** Why the venue would refuse each maker's quotes, as the last read found. Empty until a read, so a wake starts clean. */
+  const quotesRefused = new Map<string, string>();
+  const readQuotesRefused = async (): Promise<void> => {
+    let infos: Awaited<ReturnType<typeof botVenue.markets>>;
+    try {
+      infos = await botVenue.markets();
+    } catch (error) {
+      for (const { id } of botMarkets) quotesRefused.set(id, "the market could not be read");
+      throw error;
+    }
+    for (const { id } of botMarkets) {
+      const info = infos.find((entry) => entry.id === id);
+      const refused = info ? info.quotesRefusedBecause : "the venue does not list the market";
+      if (refused !== undefined && info?.takesReduceOnlyOrders !== true)
+        quotesRefused.set(id, refused);
+      else quotesRefused.delete(id);
+    }
+  };
+  const watch =
+    ledgers.length > 0
+      ? new TradingWatch(() => trading(), makerVoice(problems), systemClock)
+      : null;
   const start = (): Repeating[] => {
     const loops = [
       ...makers.map((maker, at) =>
@@ -267,9 +291,18 @@ export const openBots = async (
         ),
       ),
     ];
-    if (ledgers.length > 0) {
-      const watch = new TradingWatch(trading, makerVoice(problems), systemClock);
-      loops.push(loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => watch.check()));
+    if (watch) {
+      watch.resume();
+      quotesRefused.clear();
+      loops.push(
+        loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => {
+          try {
+            await readQuotesRefused();
+          } finally {
+            watch.check();
+          }
+        }),
+      );
     }
     if (liquidator) {
       loops.push(
@@ -313,6 +346,10 @@ export const openBots = async (
       ...hedges
         .filter(({ controller }) => controller.status() === "blind")
         .map(({ market }) => `${market} hedge is blind`),
+      ...hedges
+        .filter(({ controller }) => controller.hasUnmanagedPosition)
+        .map(({ market }) => `${market} maker is stopped with an open hedge position`),
+      ...[...quotesRefused].map(([market, why]) => `${market} quotes would be refused: ${why}`),
     ];
     return problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
   };
