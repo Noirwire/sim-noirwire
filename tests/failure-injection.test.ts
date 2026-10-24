@@ -185,6 +185,8 @@ class World {
   refusedBecause: string | null = null;
   placeFaults: PlaceFault[] = [];
   cancelFault: CancelFault | null = null;
+  /** How far the chain's clock runs behind the host's. */
+  chainBehindMs = 0;
   generation = 0;
   placeCalls = 0;
   cancelCalls = 0;
@@ -324,11 +326,13 @@ class World {
     }
   }
 
-  /** An order's expiry is fixed when it is sent, as the program takes it: a late landing rests only until then. */
+  /** An order rests until the absolute expiry it carries, as the venue takes it; one without falls back to its length from the send. */
   private land(order: NewOrder, late: boolean, sentAtMs: number): void {
-    const expiresAtMs = sentAtMs + (order.expiresInSeconds ?? 0) * SECOND;
-    if (expiresAtMs <= Date.now()) return;
-    this.resting.push({ expiresAtMs, order });
+    const expiresAtMs = order.expiresAtMs ?? sentAtMs + (order.expiresInSeconds ?? 0) * SECOND;
+    // The chain takes whole seconds, expires an order once its time is past that second, and reads its own clock.
+    const liveUntilMs = (Math.floor(expiresAtMs / SECOND) + 1) * SECOND + this.chainBehindMs;
+    if (liveUntilMs <= Date.now()) return;
+    this.resting.push({ expiresAtMs: liveUntilMs, order });
     if (this.liveResting().length > LADDER_SIZE) {
       this.violate(
         `I1: ${this.liveResting().length} orders rest after a landing, more than one ladder`,
@@ -694,8 +698,7 @@ describe("a place call goes wrong", () => {
     t.stopLoops();
   });
 
-  // BUG: a place that throws after dispatch leaves its hold on disk only, so the running maker is not held and trading reads ready.
-  it.fails("reads not ready while the hold of a place that threw is on disk", async () => {
+  it("reads not ready while the hold of a place that threw is on disk", async () => {
     const t = await rig("place-throws-readiness");
     t.world.placeFaults.push({ kind: "throws" });
 
@@ -705,8 +708,7 @@ describe("a place call goes wrong", () => {
     t.stopLoops();
   });
 
-  // BUG: after a place that threw, a resume sends a full ladder at once; the next dispatch record overwrites the hold.
-  it.fails("sends no ladder after a resume while a thrown place's hold lasts", async () => {
+  it("sends no ladder after a resume while a thrown place's hold lasts", async () => {
     const t = await rig("place-throws-resume");
     t.world.placeFaults.push({ kind: "throws" });
     await t.step(14);
@@ -757,8 +759,7 @@ describe("a cancel goes wrong", () => {
     t.stopLoops();
   });
 
-  // BUG: trading() has no input for an unconfirmed cancel, so it reads ready while the quotes may still stand.
-  it.fails("reads not ready while a cancel is unconfirmed", async () => {
+  it("reads not ready while a cancel is unconfirmed", async () => {
     const t = await rig("cancel-hangs-readiness");
     await t.step(20);
     t.world.cancelFault = { kind: "hang" };
@@ -1019,8 +1020,7 @@ describe("the process restarts", () => {
     t.stopLoops();
   });
 
-  // BUG: a ladder's saved hold lapses 40 s after its first order, but a later order of the ladder expires later and can still land.
-  it.fails("stays held until the last order of a crashed ladder can no longer land", async () => {
+  it("stays held until the last order of a crashed ladder can no longer land", async () => {
     const t = await rig("restart-mid-ladder-late", { requoteMs: LONG_REQUOTE_MS });
     t.world.placeFaults.push({ kind: "slow", ms: 15_000 }, { kind: "late", landsAfterMs: 38_000 });
     await t.step(37);
@@ -1029,6 +1029,20 @@ describe("the process restarts", () => {
     await t.step(60);
 
     expect(t.world.violations("I1")).toEqual([]);
+    t.stopLoops();
+  });
+
+  it("stays held past the expiry when the host clock is ahead of the chain's", async () => {
+    const t = await rig("restart-chain-behind", { requoteMs: LONG_REQUOTE_MS });
+    t.world.chainBehindMs = 20_000;
+    t.world.placeFaults.push({ kind: "late", landsAfterMs: 35_000 });
+    await t.step(25);
+
+    await t.restart();
+    await t.step(120);
+
+    expect(t.world.violations("I1")).toEqual([]);
+    expect(t.world.violations("I3")).toEqual([]);
     t.stopLoops();
   });
 });

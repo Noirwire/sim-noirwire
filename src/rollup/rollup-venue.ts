@@ -12,7 +12,7 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
-import { rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
+import { ORDER_EXPIRY_TOO_NEAR, rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
 import { withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
@@ -411,7 +411,8 @@ export class RollupVenue implements Venue {
     if (typeof sendable === "string") return rejectedOrder(orderId, NO_TAG, order, sendable);
 
     const rests = order.type === "limit" || order.type === "postOnly";
-    const restsWithoutExpiry = rests && !order.reduceOnly && order.expiresInSeconds === undefined;
+    const hasExpiry = order.expiresInSeconds !== undefined || order.expiresAtMs !== undefined;
+    const restsWithoutExpiry = rests && !order.reduceOnly && !hasExpiry;
     if (restsWithoutExpiry) {
       return rejectedOrder(
         orderId,
@@ -419,6 +420,15 @@ export class RollupVenue implements Venue {
         order,
         "a resting order needs an expiry of its own, so it cannot outlive the bot that placed it",
       );
+    }
+    const expiresAtMs = order.expiresAtMs;
+    const lapsed =
+      rests &&
+      !order.reduceOnly &&
+      expiresAtMs !== undefined &&
+      Math.floor(expiresAtMs / MS_PER_SECOND) <= Math.floor(Date.now() / MS_PER_SECOND) + 1;
+    if (lapsed) {
+      return rejectedOrder(orderId, NO_TAG, order, ORDER_EXPIRY_TOO_NEAR);
     }
     const secret = newOrderSecret();
     this.secrets.add(order.market, trader, secret);
@@ -441,8 +451,11 @@ export class RollupVenue implements Venue {
             reduceOnly: order.reduceOnly ?? false,
             secret,
             restingExpirySeconds:
-              rests && !order.reduceOnly && order.expiresInSeconds !== undefined
-                ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
+              rests && !order.reduceOnly && hasExpiry
+                ? order.expiresAtMs !== undefined
+                  ? // Rounded down, so the program never keeps the order past the time the caller recorded.
+                    Math.floor(order.expiresAtMs / MS_PER_SECOND)
+                  : Math.floor(Date.now() / MS_PER_SECOND) + (order.expiresInSeconds ?? 0)
                 : undefined,
           });
           this.trackUntilSettled(trader, placing);

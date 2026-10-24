@@ -19,6 +19,7 @@ const fakeTrader = vi.hoisted(() => ({
   /** While set, opening the trader waits for it. */
   opening: undefined as undefined | Promise<void>,
   placed: 0,
+  expiries: [] as (number | undefined)[],
 }));
 
 vi.mock("../src/rollup/bot-accounts.js", () => ({
@@ -30,8 +31,9 @@ vi.mock("../src/rollup/bot-accounts.js", () => ({
       return {
         address: "owner",
         cancelAll: () => fakeTrader.cancel?.(),
-        place: () => {
+        place: (_market: number, params: { restingExpirySeconds?: number }) => {
           fakeTrader.placed += 1;
+          fakeTrader.expiries.push(params.restingExpirySeconds);
           return fakeTrader.place?.();
         },
       };
@@ -119,6 +121,63 @@ beforeEach(() => {
   fakeTrader.opening = undefined;
   fakeTrader.cancel = undefined;
   fakeTrader.placed = 0;
+  fakeTrader.expiries = [];
+});
+
+describe("the expiry of a resting order", () => {
+  const rested = () =>
+    Promise.resolve<PlaceOutcome>({
+      status: "rested",
+      filled: 0n,
+      rested: 1n,
+      sendToResultMs: 1,
+    });
+
+  it("is exactly the absolute time the caller recorded, however late the order is sent", async () => {
+    const { venue } = venueWith();
+    fakeTrader.place = rested;
+    const recordedAtMs = Date.now() + 5_500;
+
+    await venue.placeOrder(TRADER, order({ expiresInSeconds: 600, expiresAtMs: recordedAtMs }));
+
+    expect(fakeTrader.expiries).toEqual([Math.floor(recordedAtMs / 1_000)]);
+  });
+
+  it.each([-5_000, 0, 1_000])(
+    "is not sent when the absolute time is %i ms from now, and is no order of unknown outcome",
+    async (offsetMs) => {
+      const { venue } = venueWith();
+      fakeTrader.place = rested;
+
+      const result = await venue.placeOrder(
+        TRADER,
+        order({ expiresAtMs: Date.now() + offsetMs, expiresInSeconds: 30 }),
+      );
+
+      expect(fakeTrader.placed).toBe(0);
+      expect(result.status).toBe("rejected");
+      expect(result.outcomeUnknown).not.toBe(true);
+    },
+  );
+
+  it("is sent when the absolute time is a few seconds away", async () => {
+    const { venue } = venueWith();
+    fakeTrader.place = rested;
+
+    await venue.placeOrder(TRADER, order({ expiresAtMs: Date.now() + 3_000 }));
+
+    expect(fakeTrader.placed).toBe(1);
+  });
+
+  it("still counts from the moment of sending when no absolute time is given", async () => {
+    const { venue } = venueWith();
+    fakeTrader.place = rested;
+    const before = Math.floor(Date.now() / 1_000);
+
+    await venue.placeOrder(TRADER, order({ expiresInSeconds: 30 }));
+
+    expect(fakeTrader.expiries[0]).toBeGreaterThanOrEqual(before + 30);
+  });
 });
 
 describe("a cancel that completes late", () => {

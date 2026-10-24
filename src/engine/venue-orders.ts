@@ -14,6 +14,10 @@ export const rejectedOrder = (
   reason,
 });
 
+/** The reason of an order refused before it was handed on because its expiry was too near: nothing was sent. */
+export const ORDER_EXPIRY_TOO_NEAR =
+  "the order's expiry is already past or within a second, so nothing was sent";
+
 /** An order that failed after it may have been sent: shown as rejected, flagged as not known to be. */
 export const unknownOrder = (
   orderId: string,
