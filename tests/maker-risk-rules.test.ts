@@ -2761,6 +2761,35 @@ describe("a ladder is recorded before any order of it is sent", () => {
     expect(ledger.state.mode).toBe("stopped");
   });
 
+  it("sends no ladder after a failed clear and a resume until the saved hold is reconciled, then quotes again", async () => {
+    const { warmUp, book, tick, dir, clock, ledger, maker } = await rig(
+      "ladder-clear-fails-resume",
+    );
+    await warmUp();
+    book.take();
+    book.beforePlacing = async () => {
+      book.beforePlacing = null;
+      await rm(makerStatePath(dir, PERP), { force: true });
+      await mkdir(makerStatePath(dir, PERP));
+    };
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+    book.take();
+
+    await rm(makerStatePath(dir, PERP), { recursive: true, force: true });
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("run");
+    expect(ledger.state.hold).not.toBeNull();
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    await tick(60);
+    await tick(11);
+    expect(maker.quarantinedSinceMs).toBeNull();
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
   it("has the hold on disk while the orders go out, and clears it once they are all answered", async () => {
     const { warmUp, book, tick, dir, maker } = await rig("ladder-recorded");
     await warmUp();

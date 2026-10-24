@@ -457,6 +457,9 @@ export class HouseMaker {
     }
     let held = false;
     let heldProblem: unknown;
+    // A hold the ledger keeps is the maker's hold, however it came to be saved: nothing ordinary goes out under it.
+    // A hold the ledger keeps is the maker's hold, however it came to be saved: nothing ordinary goes out under it.
+    this.hold ??= this.options.ledger?.state.hold ?? null;
     if (this.hold !== null) {
       try {
         held = !(await this.reconcile(venue));
