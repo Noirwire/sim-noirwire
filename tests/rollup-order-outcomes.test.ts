@@ -143,6 +143,32 @@ describe("the expiry of a resting order", () => {
     expect(fakeTrader.expiries).toEqual([Math.floor(recordedAtMs / 1_000)]);
   });
 
+  it.each([-5_000, 0, 1_000])(
+    "is not sent when the absolute time is %i ms from now, and is no order of unknown outcome",
+    async (offsetMs) => {
+      const { venue } = venueWith();
+      fakeTrader.place = rested;
+
+      const result = await venue.placeOrder(
+        TRADER,
+        order({ expiresAtMs: Date.now() + offsetMs, expiresInSeconds: 30 }),
+      );
+
+      expect(fakeTrader.placed).toBe(0);
+      expect(result.status).toBe("rejected");
+      expect(result.outcomeUnknown).not.toBe(true);
+    },
+  );
+
+  it("is sent when the absolute time is a few seconds away", async () => {
+    const { venue } = venueWith();
+    fakeTrader.place = rested;
+
+    await venue.placeOrder(TRADER, order({ expiresAtMs: Date.now() + 3_000 }));
+
+    expect(fakeTrader.placed).toBe(1);
+  });
+
   it("still counts from the moment of sending when no absolute time is given", async () => {
     const { venue } = venueWith();
     fakeTrader.place = rested;

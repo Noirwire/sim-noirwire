@@ -12,7 +12,7 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
-import { rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
+import { ORDER_EXPIRY_TOO_NEAR, rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
 import { withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
@@ -420,6 +420,15 @@ export class RollupVenue implements Venue {
         order,
         "a resting order needs an expiry of its own, so it cannot outlive the bot that placed it",
       );
+    }
+    const expiresAtMs = order.expiresAtMs;
+    const lapsed =
+      rests &&
+      !order.reduceOnly &&
+      expiresAtMs !== undefined &&
+      Math.floor(expiresAtMs / MS_PER_SECOND) <= Math.floor(Date.now() / MS_PER_SECOND) + 1;
+    if (lapsed) {
+      return rejectedOrder(orderId, NO_TAG, order, ORDER_EXPIRY_TOO_NEAR);
     }
     const secret = newOrderSecret();
     this.secrets.add(order.market, trader, secret);

@@ -20,6 +20,7 @@ import {
   type HouseMakerOptions,
   QuotesHeld,
   flattenOrders,
+  holdLapsesAtMs,
   ladderOrders,
   onlyReducing,
 } from "../src/bots/house-maker.js";
@@ -46,7 +47,7 @@ import {
   referenceSources,
 } from "../src/prices/reference-price.js";
 import { MARKETS } from "../src/engine/markets.js";
-import { placingOrdersThrough } from "../src/engine/venue-orders.js";
+import { ORDER_EXPIRY_TOO_NEAR, placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
 import { TradingWatch } from "../src/wiring/trading-watch.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
@@ -194,6 +195,8 @@ class Book {
   /** The venue answers every order with a refusal, giving this reason. */
   rejecting: string | null = null;
   rejectedCount = 0;
+  /** Once this many orders stand, the venue refuses a resting order as too near its expiry, sending nothing. */
+  refusesTooLateAfter: number | null = null;
   /** The venue answers every order as rejected but possibly executed, giving this reason. */
   unknownBecause: string | null = null;
   beforePlacing: (() => Promise<void>) | null = null;
@@ -239,6 +242,20 @@ class Book {
             filledSize: 0n,
             remainingSize: order.size,
             reason: "ReduceOnlyWouldIncrease",
+          };
+        }
+        if (
+          this.refusesTooLateAfter !== null &&
+          order.reduceOnly !== true &&
+          this.orders.length >= this.refusesTooLateAfter
+        ) {
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: ORDER_EXPIRY_TOO_NEAR,
           };
         }
         if (this.rejecting !== null) {
@@ -1318,7 +1335,7 @@ describe("a house maker that stops or fails", () => {
 
       await requestMode(dir, "run", clock.nowMs() + 1);
       book.failPlacing = null;
-      await tick();
+      await tick(60);
       book.failPlacing = failure;
       await expect(tick(11)).rejects.toThrow("something new");
       for (let error = 1; error <= 4; error += 1) {
@@ -2162,6 +2179,10 @@ describe("an order whose outcome is unknown", () => {
     expect(maker.quarantinedSinceMs).not.toBeNull();
 
     await tick(11);
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    await tick(40);
     expect(maker.quarantinedSinceMs).toBeNull();
     expect(book.take().length).toBeGreaterThan(0);
   });
@@ -2268,7 +2289,7 @@ describe("an order whose outcome is unknown", () => {
 
       book.failCancelling = null;
       await tick(11);
-      await tick(11);
+      await tick(40);
       expect(book.take().length).toBeGreaterThan(0);
     },
   );
@@ -2756,8 +2777,61 @@ describe("a ladder is recorded before any order of it is sent", () => {
 
     const orders = book.take();
     expect(orders.length).toBeGreaterThan(1);
-    expect(new Set(orders.map((order) => order.expiresAtMs))).toEqual(new Set([seen[0].untilMs]));
-    expect(seen.every((hold) => hold.untilMs === seen[0].untilMs)).toBe(true);
+    const expiry = orders[0].expiresAtMs ?? 0;
+    expect(new Set(orders.map((order) => order.expiresAtMs))).toEqual(new Set([expiry]));
+    expect(seen.every((hold) => hold.untilMs === holdLapsesAtMs(expiry))).toBe(true);
+  });
+
+  it("takes a slow ladder off without stopping the maker, and quotes again on the next tick", async () => {
+    const { warmUp, book, tick, ledger, dir } = await rig("ladder-too-late");
+    await warmUp();
+    book.take();
+    book.refusesTooLateAfter = 2;
+    const cancelsBefore = book.cancels;
+
+    await tick(11);
+
+    expect(book.cancels).toBeGreaterThan(cancelsBefore + 1);
+    expect(ledger.state.mode).toBe("run");
+    expect(await holdOnDisk(dir)).toBeNull();
+
+    book.take();
+    book.refusesTooLateAfter = null;
+    await tick(11);
+    expect(book.take().length).toBeGreaterThan(2);
+    expect(ledger.state.mode).toBe("run");
+  });
+
+  it("keeps the record of a slow ladder while an order call of it is unsettled", async () => {
+    const { warmUp, book, tick, ledger, dir } = await rig("ladder-too-late-unsettled");
+    await warmUp();
+    book.take();
+    book.refusesTooLateAfter = 2;
+    book.unsettled = 1;
+
+    await tick(11);
+
+    expect(ledger.state.mode).toBe("run");
+    expect(await holdOnDisk(dir)).not.toBeNull();
+  });
+
+  it("adds a risk-reducing send to the hold on disk, unbounded", async () => {
+    const { warmUp, book, tick, ledger } = await rig("held-flatten-recorded");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+    const idsBefore = ledger.state.hold?.orderIds.length ?? 0;
+    expect(ledger.state.hold?.untilMs).not.toBeNull();
+
+    book.equity = dollars(969);
+    await tick(1);
+
+    expect(book.take().every((order) => order.reduceOnly === true)).toBe(true);
+    expect(ledger.state.hold?.untilMs).toBeNull();
+    expect(ledger.state.hold?.orderIds.length).toBeGreaterThan(idsBefore);
   });
 
   it("takes the ladder off, throws, and sends no heartbeat when the record of it cannot be cleared", async () => {
@@ -2780,6 +2854,35 @@ describe("a ladder is recorded before any order of it is sent", () => {
     expect(heartbeats).toBe(heartbeatsBefore);
     expect(book.cancels).toBe(cancelsBefore + 2);
     expect(ledger.state.mode).toBe("stopped");
+  });
+
+  it("sends no ladder after a failed clear and a resume until the saved hold is reconciled, then quotes again", async () => {
+    const { warmUp, book, tick, dir, clock, ledger, maker } = await rig(
+      "ladder-clear-fails-resume",
+    );
+    await warmUp();
+    book.take();
+    book.beforePlacing = async () => {
+      book.beforePlacing = null;
+      await rm(makerStatePath(dir, PERP), { force: true });
+      await mkdir(makerStatePath(dir, PERP));
+    };
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+    book.take();
+
+    await rm(makerStatePath(dir, PERP), { recursive: true, force: true });
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    await tick(1);
+
+    expect(ledger.state.mode).toBe("run");
+    expect(ledger.state.hold).not.toBeNull();
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    await tick(60);
+    await tick(11);
+    expect(maker.quarantinedSinceMs).toBeNull();
+    expect(book.take().length).toBeGreaterThan(0);
   });
 
   it("has the hold on disk while the orders go out, and clears it once they are all answered", async () => {
@@ -2891,6 +2994,24 @@ describe("a cancel that never answers", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await tick(11);
     expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("reads a cancel as unconfirmed until the overdue one settles, whatever later cancel is confirmed", async () => {
+    const { warmUp, book, tick, dir, clock, maker } = await rig("cancel-overdue-readiness", SHORT);
+    await warmUp();
+    book.take();
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+    book.hangCancelling = true;
+    await expect(tick(1)).rejects.toThrow("did not answer");
+    expect(maker.cancelUnconfirmed).toBe(true);
+
+    book.hangCancelling = false;
+    await tick(1);
+    expect(maker.cancelUnconfirmed).toBe(true);
+
+    book.releaseCancels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(maker.cancelUnconfirmed).toBe(false);
   });
 
   it("keeps a withdrawn maker from quoting, and keeps trying to withdraw, when the cancel after a hard stop never answers", async () => {
