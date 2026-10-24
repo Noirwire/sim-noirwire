@@ -217,7 +217,8 @@ export class MakerRisk {
    * to keep it safe, so a maker that was quoting falls back to that. One that
    * is already at the soft stop stays there until it has met such a problem
    * `unknownErrorsBeforeHardStop` times in a row, with no good requote in
-   * between, and then stops altogether. One that is flattening, or stopped
+   * between, and then stops altogether (the maker sends nothing at the soft
+   * stop today, so only a future send path there would count). One that is flattening, or stopped
    * already, stops altogether at the first: a flattening that cannot place its
    * order is not working.
    */
@@ -247,8 +248,8 @@ export class MakerRisk {
       this.voice.alert(
         soft
           ? `ALERT ${this.market} maker: it met a problem it does not understand and has fallen back to the soft stop ` +
-              `(${reason}). It pulls its quotes and places none, and stops altogether if it meets ` +
-              `${MAKER_LIMITS.unknownErrorsBeforeHardStop} more in a row. Read the log above this line. ${KILL_SWITCH_HINT}`
+              `(${reason}). It pulls its quotes and places none until an operator resumes it. ` +
+              `Read the log above this line. ${KILL_SWITCH_HINT}`
           : `ALERT ${this.market} maker: it met a problem it does not understand while it was not quoting freely, ` +
               `and has stopped quoting (${reason}). ${STOP_STRANDS_USERS} Read the log above this line. ${KILL_SWITCH_HINT}`,
       );

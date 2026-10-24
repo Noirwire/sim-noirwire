@@ -336,11 +336,10 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   wait.
 - **Errors it does not understand.** While sending orders, any failure other than the
   rollup being away makes the maker fall back to the soft stop (an `ALERT` line, quotes
-  cancelled and none placed until an operator resumes it). At the soft stop it takes
-  five such errors in a row, with no good requote between them, to stop altogether; one
-  while it is flattening stops it at once, since a flattening that cannot place its order
-  is not working. Either lasts until an operator resumes it. A failed cancel is tried again
-  on the next tick.
+  cancelled and none placed until an operator resumes it). The soft stop sends no orders,
+  so it meets no further send errors; one while it is flattening stops it altogether at
+  once, since a flattening that cannot place its order is not working. Either lasts until
+  an operator resumes it. A failed cancel is tried again on the next tick.
 - **An unreadable control file.** A control file that cannot be read holds the maker at the
   soft stop (an `ALERT` line). It stays there after the file parses again, until a newer
   `resume` is written. A hard stop or a flattening already in force is not loosened.
