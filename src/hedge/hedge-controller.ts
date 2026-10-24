@@ -96,6 +96,8 @@ export class HedgeController implements HedgeGate {
   private holdUntilMs = 0;
   private unmanagedAlertedAtMs: number | null = null;
   private unmanaged = false;
+  /** True from the start: a position left open by a previous run is unknown until a read has shown it. */
+  private unconfirmedAtSleep = true;
   private orders = 0;
   private readonly startedAtMs: number;
   private restartNoticeSent = false;
@@ -117,6 +119,25 @@ export class HedgeController implements HedgeGate {
   /** Whether the maker is stopped while the hedge account still holds a position nobody manages. */
   get hasUnmanagedPosition(): boolean {
     return this.unmanaged;
+  }
+
+  /** Whether the last read before sleep failed or has not finished, so an open hedge cannot be ruled out. */
+  get unconfirmedWhileAsleep(): boolean {
+    return this.unconfirmedAtSleep;
+  }
+
+  /**
+   * One last read of the hedge account when the service goes to sleep, because no tick will read it again
+   * until the next wake. A maker that stopped since the last tick would otherwise leave an open hedge unseen.
+   * It marks the hedge unconfirmed first, so a read that fails or is cut short leaves it unconfirmed.
+   */
+  async confirmBeforeSleep(): Promise<void> {
+    this.unconfirmedAtSleep = true;
+    const account = await this.readVenue();
+    if (!account) return;
+    if (this.options.makerMode() === "stopped") this.announceUnmanaged(account.position);
+    else this.unmanaged = false;
+    this.unconfirmedAtSleep = false;
   }
 
   status(): HedgeStatus {
