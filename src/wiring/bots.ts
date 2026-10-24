@@ -377,6 +377,12 @@ export const openBots = async (
     hedges
       .filter(({ controller }) => controller.hasUnmanagedPosition)
       .map(({ market }) => `${market} maker is stopped with an open hedge position`);
+  const unconfirmedCancels = (): string[] =>
+    makers.flatMap((maker, at) =>
+      maker.cancelUnconfirmed
+        ? [`${botMarkets[at].id} maker's cancel is not confirmed, so its quotes may still stand`]
+        : [],
+    );
   const readinessOf = (problems: string[]): TradingReadiness =>
     problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
   const trading = (): TradingReadiness =>
@@ -389,17 +395,14 @@ export const openBots = async (
           ? []
           : [`${botMarkets[at].id} maker is held by an order of unknown outcome`],
       ),
-      ...makers.flatMap((maker, at) =>
-        maker.cancelUnconfirmed
-          ? [`${botMarkets[at].id} maker's cancel is not confirmed, so its quotes may still stand`]
-          : [],
-      ),
+      ...unconfirmedCancels(),
       ...hedges
         .filter(({ controller }) => controller.status() === "blind")
         .map(({ market }) => `${market} hedge is blind`),
       ...unmanagedHedges(),
       ...[...quotesRefused].map(([market, why]) => `${market} quotes would be refused: ${why}`),
     ]);
-  const tradingWhileAsleep = (): TradingReadiness => readinessOf(unmanagedHedges());
+  const tradingWhileAsleep = (): TradingReadiness =>
+    readinessOf([...unmanagedHedges(), ...unconfirmedCancels()]);
   return { start, trading, tradingWhileAsleep, withdrawQuotes };
 };

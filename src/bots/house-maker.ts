@@ -18,6 +18,7 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
+import { ORDER_EXPIRY_TOO_NEAR } from "../engine/venue-orders.js";
 import { VenueNotReady } from "../engine/venue-not-ready.js";
 import { firstLine } from "../logging/first-line.js";
 import { withinDeadline } from "../scheduling/deadline.js";
@@ -324,20 +325,34 @@ export class HouseMaker {
 
   /** Whether the venue has not confirmed a cancel in time, so the quotes may still stand. */
   get cancelUnconfirmed(): boolean {
-    return this.cancelAlerted;
+    return this.cancelAlerted || this.cancelsOverdue > 0;
   }
 
   /** Cancels the venue was asked for and has not answered, though the maker stopped waiting. */
   private cancelsInFlight = 0;
+  /** Cancels that passed their deadline and have not settled: a later cancel's success does not clear these. */
+  private cancelsOverdue = 0;
 
   private async cancelQuotes(venue: Venue): Promise<void> {
     const call = venue.cancelAll(this.trader, this.options.market);
     this.cancelsInFlight += 1;
+    let settledAlready = false;
+    let overdue = false;
     const settled = (): void => {
+      settledAlready = true;
       this.cancelsInFlight -= 1;
+      if (overdue) this.cancelsOverdue -= 1;
     };
     call.then(settled, settled);
-    await withinDeadline(call, this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS, "the cancel");
+    try {
+      await withinDeadline(call, this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS, "the cancel");
+    } catch (error) {
+      if (!settledAlready) {
+        overdue = true;
+        this.cancelsOverdue += 1;
+      }
+      throw error;
+    }
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
@@ -496,10 +511,14 @@ export class HouseMaker {
     // Fixed once, here: the hold on disk and every order sent carry this same absolute expiry.
     const expiresAtMs = this.options.clock.nowMs() + this.expiresInSeconds * 1_000;
     const dispatching = orders.length > 0 && (await this.recordDispatch(flagged, expiresAtMs));
+    // A risk-reducing send under a hold extends that hold, and the orders it places are added to it.
+    const heldSend = orders.length > 0 && !dispatching && flagged && this.hold !== null;
+    const sentIds: string[] = [];
     let leftOut = 0;
     let unknownReason: string | undefined;
     let sawUnknown = false;
     let cutShort = false;
+    let tooLate = false;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) {
@@ -519,6 +538,11 @@ export class HouseMaker {
           unknownReason = placed.reason;
           break;
         }
+        if (placed.status !== "rejected") sentIds.push(placed.orderId);
+        if (placed.status === "rejected" && placed.reason === ORDER_EXPIRY_TOO_NEAR) {
+          tooLate = true;
+          break;
+        }
         if (!safety || placed.status !== "rejected") continue;
         if (!isRoutineRefusal(sent, placed.reason)) {
           throw new OrderRefused(this.options.market, placed.reason);
@@ -529,8 +553,14 @@ export class HouseMaker {
       // The record of the ladder in flight stays on disk: a failed order may still have been sent.
       // The running maker holds it too, as it would for an order of unknown outcome.
       if (dispatching) this.hold = this.options.ledger?.state.hold ?? this.hold;
+      if (heldSend) await this.noteSentOrders(sentIds);
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
+    }
+    if (heldSend) await this.noteSentOrders(sentIds);
+    if (tooLate && !sawUnknown) {
+      await this.abandonLadder(venue, dispatching);
+      return;
     }
     if (dispatching && this.hold === null) await this.clearDispatch(venue);
     if (cutShort) return;
@@ -585,11 +615,31 @@ export class HouseMaker {
    * Writes the ladder about to go out to the ledger as a hold, before any order is sent, so a crash
    * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
    * Returns whether a record was written (not when the maker is held already, or has no ledger).
+   * A risk-reducing ladder sent while held extends the hold in the ledger instead, and sends nothing
+   * if that write fails: it can never be bounded, since a reduce-only order has no expiry.
    */
   private async recordDispatch(flagged: boolean, expiresAtMs: number): Promise<boolean> {
     const { ledger, clock } = this.options;
-    if (!ledger || this.hold !== null || ledger.state.hold !== null) return false;
+    if (!ledger) return false;
     const now = clock.nowMs();
+    const held = this.hold ?? ledger.state.hold;
+    if (held !== null) {
+      if (!flagged) return false;
+      const extended: UnresolvedHold = {
+        ...held,
+        lastAtMs: now,
+        untilMs: mergedExpiry(held, null),
+        seatClearAtMs: null,
+      };
+      try {
+        await ledger.update({ hold: extended });
+      } catch (error) {
+        if (error instanceof StatePersistenceError) this.alertUnrecorded(error);
+        throw error;
+      }
+      this.hold = extended;
+      return false;
+    }
     try {
       await ledger.update({
         hold: {
@@ -605,6 +655,40 @@ export class HouseMaker {
       throw error;
     }
     return true;
+  }
+
+  /** Adds the orders a risk-reducing send placed under a hold to that hold. */
+  private async noteSentOrders(orderIds: string[]): Promise<void> {
+    const held = this.hold;
+    if (held === null || orderIds.length === 0) return;
+    const hold: UnresolvedHold = {
+      ...held,
+      orderIds: [...held.orderIds, ...orderIds].slice(-HELD_ORDER_IDS),
+    };
+    this.hold = hold;
+    await this.saveHold(hold);
+  }
+
+  /**
+   * A ladder whose orders went out too late for their shared expiry: the rest is not sent, what it
+   * already placed is cancelled, and the maker is not stopped, since no venue failed. Its record ends
+   * only when no order of it can still be out; the next tick quotes again with a fresh expiry.
+   */
+  private async abandonLadder(venue: Venue, dispatching: boolean): Promise<void> {
+    this.lastQuoted = null;
+    try {
+      await this.cancelQuotes(venue);
+    } catch (error) {
+      this.standing = true;
+      this.alertCancelUnconfirmed(error);
+      if (dispatching) this.hold = this.options.ledger?.state.hold ?? this.hold;
+      throw error;
+    }
+    this.cancelAlerted = false;
+    this.standing = false;
+    if (!dispatching) return;
+    if ((venue.unsettledPlaces?.(this.trader) ?? 0) === 0) await this.clearDispatch(venue);
+    else this.hold = this.options.ledger?.state.hold ?? this.hold;
   }
 
   /**
