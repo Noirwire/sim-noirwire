@@ -389,6 +389,11 @@ export const openBots = async (
           ? []
           : [`${botMarkets[at].id} maker is held by an order of unknown outcome`],
       ),
+      ...makers.flatMap((maker, at) =>
+        maker.cancelUnconfirmed
+          ? [`${botMarkets[at].id} maker's cancel is not confirmed, so its quotes may still stand`]
+          : [],
+      ),
       ...hedges
         .filter(({ controller }) => controller.status() === "blind")
         .map(({ market }) => `${market} hedge is blind`),

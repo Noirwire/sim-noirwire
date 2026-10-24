@@ -1223,7 +1223,7 @@ describe("a house maker that stops or fails", () => {
 
       await requestMode(dir, "run", clock.nowMs() + 1);
       book.failPlacing = null;
-      await tick();
+      await tick(30);
       book.failPlacing = failure;
       await expect(tick(11)).rejects.toThrow("something new");
       for (let error = 1; error <= 4; error += 1) {

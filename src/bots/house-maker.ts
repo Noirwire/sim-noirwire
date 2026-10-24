@@ -314,6 +314,11 @@ export class HouseMaker {
     return this.hold?.sinceMs ?? null;
   }
 
+  /** Whether the venue has not confirmed a cancel in time, so the quotes may still stand. */
+  get cancelUnconfirmed(): boolean {
+    return this.cancelAlerted;
+  }
+
   /** Cancels the venue was asked for and has not answered, though the maker stopped waiting. */
   private cancelsInFlight = 0;
 
@@ -514,6 +519,8 @@ export class HouseMaker {
       }
     } catch (error) {
       // The record of the ladder in flight stays on disk: a failed order may still have been sent.
+      // The running maker holds it too, as it would for an order of unknown outcome.
+      if (dispatching) this.hold = this.options.ledger?.state.hold ?? this.hold;
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
@@ -573,7 +580,7 @@ export class HouseMaker {
    */
   private async recordDispatch(flagged: boolean, expiresAtMs: number): Promise<boolean> {
     const { ledger, clock } = this.options;
-    if (!ledger || this.hold !== null) return false;
+    if (!ledger || this.hold !== null || ledger.state.hold !== null) return false;
     const now = clock.nowMs();
     try {
       await ledger.update({
