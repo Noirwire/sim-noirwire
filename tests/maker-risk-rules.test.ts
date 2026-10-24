@@ -1069,15 +1069,110 @@ describe("the makers opened by the service", () => {
       hedgeVenue,
     );
     const bots = await opened;
-    expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+    expect(bots.tradingWhileAsleep().ready).toBe(false);
 
     const loops = bots.start();
     try {
-      await vi.waitFor(() => expect(bots.tradingWhileAsleep().ready).toBe(false));
+      await vi.waitFor(() =>
+        expect(bots.tradingWhileAsleep().reason).toContain("open hedge position"),
+      );
     } finally {
       for (const loop of loops) loop.stop();
     }
     expect(bots.tradingWhileAsleep().reason).toContain("open hedge position");
+  });
+
+  describe("the last look at the hedge before sleep", () => {
+    const hedgedBots = async (
+      name: string,
+      mode: "stopped" | "run",
+      hedgeVenue: FakeHedgeVenue,
+    ) => {
+      const dir = join(ROOT, name);
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dir, { recursive: true });
+      await (await MakerLedger.open(makerStatePath(dir, MARKETS[0].id))).update({ mode });
+      const { opened } = await openedWith(
+        MARKETS[0],
+        { HOUSE_MAKER_RISK_RULES: "1", HEDGE_ENABLED: "1", DATA_DIR: dir },
+        undefined,
+        hedgeVenue,
+      );
+      return opened;
+    };
+
+    it("is not ready asleep when the maker stopped with an open hedge that no tick has seen", async () => {
+      const hedgeVenue = new FakeHedgeVenue();
+      hedgeVenue.position = dollars(-1);
+      const bots = await hedgedBots("sleep-open", "stopped", hedgeVenue);
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep().ready).toBe(false);
+      expect(bots.tradingWhileAsleep().reason).toContain("open hedge position");
+    });
+
+    it("is not ready asleep when the last read of the hedge fails", async () => {
+      const hedgeVenue = new FakeHedgeVenue();
+      hedgeVenue.down = true;
+      const bots = await hedgedBots("sleep-down", "stopped", hedgeVenue);
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep().ready).toBe(false);
+      expect(bots.tradingWhileAsleep().reason).toContain("could not be confirmed");
+
+      hedgeVenue.down = false;
+      await bots.confirmHedgesBeforeSleep();
+      expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+    });
+
+    it("is ready asleep when the last read shows a flat hedge", async () => {
+      const bots = await hedgedBots("sleep-flat", "stopped", new FakeHedgeVenue());
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+    });
+
+    it("is not ready on a boot into sleep until the startup read has shown the hedge", async () => {
+      const hedgeVenue = new FakeHedgeVenue();
+      hedgeVenue.position = dollars(-1);
+      const bots = await hedgedBots("boot-open", "stopped", hedgeVenue);
+      expect(bots.tradingWhileAsleep().ready).toBe(false);
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep().reason).toContain("open hedge position");
+    });
+
+    it("is ready on a boot into sleep once the startup read shows a flat hedge", async () => {
+      const bots = await hedgedBots("boot-flat", "stopped", new FakeHedgeVenue());
+      expect(bots.tradingWhileAsleep().ready).toBe(false);
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+    });
+
+    it("stays not ready on a boot into sleep while the hedge venue is down", async () => {
+      const hedgeVenue = new FakeHedgeVenue();
+      hedgeVenue.down = true;
+      const bots = await hedgedBots("boot-down", "stopped", hedgeVenue);
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep().reason).toContain("could not be confirmed");
+    });
+
+    it("is ready asleep with no hedge configured, and reads nothing", async () => {
+      const { opened } = await openedWith(MARKETS[0], { HOUSE_MAKER_RISK_RULES: "1" });
+      const bots = await opened;
+
+      await bots.confirmHedgesBeforeSleep();
+
+      expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+    });
   });
 
   it("refuses the risk rules on a market it has no reference price for", async () => {

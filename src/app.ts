@@ -28,6 +28,7 @@ const STATS_BROADCAST_INTERVAL_MS = 2_000;
 const WAIT_FOR_LOOPS_ON_CLOSE_MS = 2_000;
 /** A stop waits this long for the makers' quotes to come off the venue; they expire by themselves anyway. */
 const WAIT_FOR_QUOTES_OFF_MS = 4_000;
+const WAIT_FOR_HEDGE_READ_MS = 15_000;
 /** Jupiter is not the rollup, but there is no reason to ask it for prices nobody is using. */
 const ASLEEP_PRICE_POLL_INTERVAL_MS = 60_000;
 /** A wake waits this long for the price source's answer before it publishes. */
@@ -224,6 +225,8 @@ export const startApp = async (
     sleep: async () => {
       await stopAwakeLoops();
       await takeQuotesOff();
+      // Nothing reads the hedge while asleep, so the asleep health answer rests on this last look.
+      await Promise.race([bots?.confirmHedgesBeforeSleep(), waitFor(WAIT_FOR_HEDGE_READ_MS)]);
       priceSource?.setPace("slow");
       await wiring.rest();
       console.log(
@@ -262,7 +265,11 @@ export const startApp = async (
     activity,
     startUp: config.VENUE === "rollup" ? startUp : undefined,
     trading: () => bots?.trading() ?? { ready: false, reason: "the bots are not open yet" },
-    tradingWhileAsleep: () => bots?.tradingWhileAsleep() ?? { ready: true },
+    tradingWhileAsleep: () =>
+      bots?.tradingWhileAsleep() ??
+      (config.HEDGE_ENABLED
+        ? { ready: false, reason: "the hedge has not been read since the service started" }
+        : { ready: true }),
   });
   await server.listen({ port: config.PORT, host: config.HOST });
   const address = server.server.address();
