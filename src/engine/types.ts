@@ -24,7 +24,7 @@ export interface MarketInfo {
   /**
    * Set together with `quotesRefusedBecause` when the only thing wrong is that
    * the market is reduce-only: it still takes orders flagged reduce-only, so
-   * a maker can go on quoting the side that shrinks its position.
+   * a maker can still flatten its position there.
    */
   takesReduceOnlyOrders?: boolean;
   /**

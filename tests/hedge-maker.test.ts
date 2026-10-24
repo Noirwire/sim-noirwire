@@ -27,6 +27,7 @@ afterAll(() => rm(ROOT, { recursive: true, force: true }));
 class Book {
   position = 0n;
   orders: NewOrder[] = [];
+  cancels = 0;
 
   asVenue(): Venue {
     const info: MarketInfo = {
@@ -45,7 +46,10 @@ class Book {
     };
     return {
       markets: async () => [info],
-      cancelAll: async () => 0,
+      cancelAll: async () => {
+        this.cancels += 1;
+        return 0;
+      },
       placeOrder: async (_trader: string, order: NewOrder) => {
         this.orders.push(order);
         return { orderId: "", tag: 0n, status: "open", filledSize: 0n, remainingSize: order.size };
@@ -162,20 +166,20 @@ describe("the maker and its hedge", () => {
     expect(said.notices.some((line) => line.includes("confirmed again"))).toBe(true);
   });
 
-  it("quotes only the side that shrinks its position while the hedge is blind, with one ALERT", async () => {
+  it("pulls its quotes and places none while the hedge is blind, with one ALERT", async () => {
     const { book, forced, tick, warmUp, said } = await rig("blind");
     forced.status = "ok";
     await warmUp();
     book.take();
+    const cancelsBefore = book.cancels;
 
     book.position = dollars(0.5);
     forced.status = "blind";
     await tick();
     await tick();
 
-    const orders = book.take();
-    expect(orders.length).toBeGreaterThan(0);
-    expect(orders.every((order) => order.side === "sell")).toBe(true);
+    expect(book.cancels).toBeGreaterThan(cancelsBefore);
+    expect(book.take()).toEqual([]);
     const blindAlerts = said.alerts.filter((line) => line.includes("hedge is blind"));
     expect(blindAlerts).toHaveLength(1);
     expect(blindAlerts[0]).toMatch(/^ALERT /);

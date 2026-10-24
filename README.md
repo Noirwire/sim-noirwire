@@ -306,10 +306,11 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   they are counted at the worse of the mark and the last good price known, and a
   flattening gets three minutes, not ten.
 - **Reduce-only markets.** When the program has set the market to reduce-only, the maker
-  cancels what it has and keeps quoting the side that shrinks its own position, flagged
-  reduce-only: that is the side users need to close theirs. Flat, it quotes nothing. It
-  sends no heartbeat meanwhile (see "A heartbeat" below), so the outside monitor pages
-  until the market opens again. For
+  cancels what it has and holds, placing nothing: the program never rests a reduce-only
+  order and refuses a post-only one that is reduce-only, so there is no quote it could
+  leave that only shrinks its position. Only a flatten (after a loss limit) still goes
+  out, as a crossing reduce-only order. The maker sends no heartbeat meanwhile (see "A
+  heartbeat" below), so the outside monitor pages until the market opens again. For
   any other reason the program would refuse its quotes (paused, a stale mark, a tripped
   guard, a dislocation) it sends nothing. A reduce-only order carries no program expiry,
   so the maker's own cancels (at every requote and at a stop of the service) are what
@@ -317,8 +318,8 @@ elsewhere is off by default and on mainnet cannot be set to 0):
 - **Kill switch, two stops.** `npm run kill-switch -- reduce | resume | stop
 --confirm-strands-users` (or `node dist/kill-switch.js ...` in the container) writes a
   request into `DATA_DIR` that the maker follows within a second.
-  - `reduce` is the soft stop. It cancels the quotes that would grow the position and
-    keeps quoting the side that shrinks it, so users can still close.
+  - `reduce` is the soft stop. It pulls its quotes and places none; only a flatten
+    reduces the position.
   - `stop` is the hard stop. It cancels everything and quotes nothing, so **users cannot
     close a position until the maker is resumed**. The exchange admin can pause the market
     in the meantime. A restart does not resume it, since the stop is kept in `DATA_DIR`.
@@ -338,11 +339,10 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   wait.
 - **Errors it does not understand.** While sending orders, any failure other than the
   rollup being away makes the maker fall back to the soft stop (an `ALERT` line, quotes
-  cancelled, the reducing side quoted again on the next tick). At the soft stop it takes
-  five such errors in a row, with no good requote between them, to stop altogether; one
-  while it is flattening stops it at once, since a flattening that cannot place its order
-  is not working. Either lasts until an operator resumes it. A failed cancel is tried again
-  on the next tick.
+  cancelled and none placed until an operator resumes it). The soft stop sends no orders,
+  so it meets no further send errors; one while it is flattening stops it altogether at
+  once, since a flattening that cannot place its order is not working. Either lasts until
+  an operator resumes it. A failed cancel is tried again on the next tick.
 - **An unreadable control file.** A control file that cannot be read holds the maker at the
   soft stop (an `ALERT` line). It stays there after the file parses again, until a newer
   `resume` is written. A hard stop or a flattening already in force is not loosened.
@@ -352,8 +352,8 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   reduce-only market has it reducing only, so the outside monitor alerts when the calls
   stop: the maker is stopped, reducing, pulled, stuck or the machine is down. **A
   reduce-only market silences the heartbeat on purpose,** so a monitor page while the
-  program's market is reduce-only is understood, not ignored: the maker is quoting only
-  the side that shrinks its position, as designed, and the calls start again with the
+  program's market is reduce-only is understood, not ignored: the maker has pulled its
+  quotes, as designed, and the calls start again with the
   first full requote after the market opens. A failed call is logged without the address
   and never stops the maker.
 - **The position limit counts everything.** The position and a side's resting levels
@@ -403,10 +403,10 @@ interface, supplied separately and kept out of this repository.
   heard from it within that timeout, or the unhedged exposure reaches `HEDGE_HARD_UNHEDGED_NUSD`.
   Before the venue has answered once, the status is `blind`.
   - Lagging: the maker quotes 10 bps wider.
-  - Blind: the maker stops growing its position and quotes only the side that shrinks it, with an
-    `ALERT` line. Both end by themselves once the venue confirms the hedge again.
-  - A flat maker has no side that shrinks its position, so while the hedge is blind it quotes
-    nothing at all. That includes startup: with the hedge enabled, the maker quotes nothing until
+  - Blind: the maker stops growing its position and pulls its quotes, with an
+    `ALERT` line; only a flatten reduces the position. Both end by themselves once the venue
+    confirms the hedge again.
+  - So while the hedge is blind the maker quotes nothing at all. That includes startup: with the hedge enabled, the maker quotes nothing until
     the hedge venue has answered once. This is an intended fail-safe, not a fault. To run the
     maker without the hedge, unset `HEDGE_ENABLED` (or set it to `0`) and restart.
 - **The kill switch covers the hedge.** At the soft stop, and while the maker flattens, the

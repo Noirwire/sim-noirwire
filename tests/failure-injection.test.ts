@@ -1198,9 +1198,11 @@ describe("the kill switch", () => {
   it("keeps an unbounded hold until a resume dated after the unknown order", async () => {
     const t = await rig("hold-review");
     t.world.position = dollars(1);
-    await t.command("reduce");
-    await t.step(14);
+    await t.step(5);
+    await t.command("run");
+    await t.step(30);
     t.world.placeFaults.push({ kind: "late", landsAfterMs: PLACE_DEADLINE_MS + 5_000 });
+    t.world.equity = dollars(960);
     await t.step(80);
     expect(t.world.readiness().ready).toBe(false);
     const heldFrom = t.world.saved()?.hold?.lastAtMs ?? 0;

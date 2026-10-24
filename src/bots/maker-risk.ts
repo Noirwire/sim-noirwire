@@ -53,8 +53,8 @@ interface Verdict {
  * A flattening that has worked leaves the maker flat and dark: it quotes
  * nothing until an operator resumes it.
  *
- * The kill switch's soft stop ("reduce") only stops it growing: it keeps
- * quoting the side that shrinks its position, so users can still close. Its
+ * The kill switch's soft stop ("reduce") only stops it growing: it pulls its
+ * quotes and places none, and only a flatten reduces the position. Its
  * hard stop ("stopped") cancels everything. An error it does not understand
  * falls back to the soft stop. At the soft stop it takes several such errors
  * in a row, with no good requote between them, to reach the hard stop; while
@@ -114,7 +114,7 @@ export class MakerRisk {
     });
     const consequence = hard
       ? STOP_STRANDS_USERS
-      : "It keeps quoting the side that shrinks its position, so users can still close.";
+      : "It pulls its quotes and places none; only a flatten reduces the position.";
     this.voice.alert(`ALERT ${this.market} maker: ${reason}. ${consequence} ${KILL_SWITCH_HINT}`);
   }
 
@@ -217,7 +217,8 @@ export class MakerRisk {
    * to keep it safe, so a maker that was quoting falls back to that. One that
    * is already at the soft stop stays there until it has met such a problem
    * `unknownErrorsBeforeHardStop` times in a row, with no good requote in
-   * between, and then stops altogether. One that is flattening, or stopped
+   * between, and then stops altogether (the maker sends nothing at the soft
+   * stop today, so only a future send path there would count). One that is flattening, or stopped
    * already, stops altogether at the first: a flattening that cannot place its
    * order is not working.
    */
@@ -247,8 +248,8 @@ export class MakerRisk {
       this.voice.alert(
         soft
           ? `ALERT ${this.market} maker: it met a problem it does not understand and has fallen back to the soft stop ` +
-              `(${reason}). It quotes only the side that shrinks its position, and stops altogether if it meets ` +
-              `${MAKER_LIMITS.unknownErrorsBeforeHardStop} more in a row. Read the log above this line. ${KILL_SWITCH_HINT}`
+              `(${reason}). It pulls its quotes and places none until an operator resumes it. ` +
+              `Read the log above this line. ${KILL_SWITCH_HINT}`
           : `ALERT ${this.market} maker: it met a problem it does not understand while it was not quoting freely, ` +
               `and has stopped quoting (${reason}). ${STOP_STRANDS_USERS} Read the log above this line. ${KILL_SWITCH_HINT}`,
       );
@@ -268,8 +269,8 @@ export class MakerRisk {
       await this.ledger.update({ mode: "reduce", reason, flattenStartedAtMs: null });
     } finally {
       this.voice.alert(
-        `ALERT ${this.market} maker: ${reason}. It has fallen back to the soft stop and quotes only the side ` +
-          `that shrinks its position, until the file is fixed and it is resumed. ${KILL_SWITCH_HINT}`,
+        `ALERT ${this.market} maker: ${reason}. It has fallen back to the soft stop and pulls its quotes, ` +
+          `until the file is fixed and it is resumed. ${KILL_SWITCH_HINT}`,
       );
     }
   }

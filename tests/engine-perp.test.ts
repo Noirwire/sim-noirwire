@@ -390,4 +390,76 @@ describe("MemoryVenue perpetuals", () => {
     const liquidated = await venue.liquidate("liquidator", "long", PERP);
     expect(liquidated).toBe(false);
   });
+
+  describe("reduce-only orders, as the program takes them", () => {
+    const longOneSol = async () => {
+      const { venue, clock } = makeVenue();
+      await openFunded(venue, "long", { nUSD: 1000 });
+      await openFunded(venue, "short", { nUSD: 1000 });
+      await publish(venue, clock, PERP, 100);
+      await venue.placeOrder("short", {
+        market: PERP,
+        side: "sell",
+        type: "limit",
+        price: dollars(100),
+        size: dollars(1),
+      });
+      await venue.placeOrder("long", {
+        market: PERP,
+        side: "buy",
+        type: "ioc",
+        price: dollars(100),
+        size: dollars(1),
+      });
+      return venue;
+    };
+
+    it("refuses a reduce-only order that is also post-only, naming the flags", async () => {
+      const venue = await longOneSol();
+
+      const result = await venue.placeOrder("long", {
+        market: PERP,
+        side: "sell",
+        type: "postOnly",
+        price: dollars(101),
+        size: dollars(1),
+        reduceOnly: true,
+      });
+
+      expect(result.status).toBe("rejected");
+      expect(result.reason).toContain("invalid order flags");
+      expect((await venue.traderState("long")).openOrders).toHaveLength(0);
+    });
+
+    it("takes the same post-only order once it is not reduce-only", async () => {
+      const venue = await longOneSol();
+
+      const result = await venue.placeOrder("long", {
+        market: PERP,
+        side: "sell",
+        type: "postOnly",
+        price: dollars(101),
+        size: dollars(1),
+      });
+
+      expect(result.status).toBe("open");
+    });
+
+    it("never rests the unfilled remainder of a reduce-only limit order", async () => {
+      const venue = await longOneSol();
+
+      const result = await venue.placeOrder("long", {
+        market: PERP,
+        side: "sell",
+        type: "limit",
+        price: dollars(101),
+        size: dollars(1),
+        reduceOnly: true,
+      });
+
+      expect(result.status).toBe("cancelled");
+      expect(result.filledSize).toBe(0n);
+      expect((await venue.traderState("long")).openOrders).toHaveLength(0);
+    });
+  });
 });

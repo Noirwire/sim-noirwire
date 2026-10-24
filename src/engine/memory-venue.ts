@@ -285,7 +285,8 @@ export class MemoryVenue implements Venue {
       filled += match.size;
     }
 
-    const resting = type === "limit" ? outcome.remaining : 0n;
+    // A reduce-only order only takes: whatever it did not fill is dropped, never rested.
+    const resting = type === "limit" && !incoming.reduceOnly ? outcome.remaining : 0n;
     if (resting > 0n) this.rest(incoming, resting);
     else if (isSpot && outcome.remaining > 0n) {
       this.releaseSpotReservation(incoming, outcome.remaining);
@@ -439,7 +440,8 @@ export class MemoryVenue implements Venue {
 
   /**
    * Why a perpetual order is refused, or null. A reduce-only order is cut
-   * down to the position it reduces. Growing exposure needs a fresh price and
+   * down to the position it reduces, may not be post-only, and never rests.
+   * Growing exposure needs a fresh price and
    * initial margin on the resulting position.
    */
   private perpRefusal(incoming: Incoming): string | null {
@@ -451,6 +453,8 @@ export class MemoryVenue implements Venue {
     const position = account.positionIn(config.id, runtime.fundingIndex);
 
     if (incoming.reduceOnly) {
+      if (incoming.type === "postOnly")
+        return "invalid order flags: reduce-only cannot be post-only";
       const reduces = side === "sell" ? position.size > 0n : position.size < 0n;
       const reducible = minBigInt(incoming.size, absBigInt(position.size));
       incoming.size = reducible - (reducible % config.lotSize);

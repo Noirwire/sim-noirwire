@@ -3,8 +3,8 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 /**
- * run: quotes both sides. reduce (the soft stop): quotes only the side that
- * shrinks its position, so users can still close against it. flatten: a loss
+ * run: quotes both sides. reduce (the soft stop): pulls its quotes and places
+ * none; only a flatten reduces the position. flatten: a loss
  * limit was passed, so it works its position down to flat with reduce-only
  * orders around the reference price. stopped (the hard stop): quotes nothing,
  * which leaves users unable to close against it.
