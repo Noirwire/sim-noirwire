@@ -46,4 +46,6 @@ export interface AppContext extends Partial<RollupRoutes> {
   startUp?: Pick<StartUp, "ready" | "problem">;
   /** Whether the makers are quoting under a working hedge; absent until the bots are open. */
   trading?: () => { ready: boolean; reason?: string };
+  /** Trading readiness while asleep: not ready only for a hedge position left open with no maker to manage it. */
+  tradingWhileAsleep?: () => { ready: boolean; reason?: string };
 }

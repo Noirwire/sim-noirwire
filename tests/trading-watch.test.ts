@@ -126,6 +126,56 @@ describe("the trading readiness watch", () => {
       expect(said).toEqual({ alerts: [], notices: [] });
     });
 
+    it("alerts across repeated short wakes while trading stays not ready", () => {
+      const { said, state, clock, watch } = watched();
+      watch.check();
+      state.ready = false;
+      state.reason = "NSOL-PERP quotes would be refused: its mark is 90 s old";
+      watch.check();
+      expect(said.alerts).toHaveLength(1);
+
+      for (let wake = 0; wake < 3; wake += 1) {
+        clock.advance(MINUTE);
+        watch.resume();
+        watch.check();
+        clock.advance(30_000);
+        watch.check();
+      }
+
+      expect(said.alerts.some((line) => line.includes("has not been ready for"))).toBe(true);
+    });
+
+    it("alerts across short wakes of a service that never became ready", () => {
+      const { said, state, clock, watch } = watched(false);
+      state.reason = "NSOL-PERP hedge is blind";
+
+      for (let wake = 0; wake < 3; wake += 1) {
+        watch.resume();
+        watch.check();
+        clock.advance(50_000);
+        watch.check();
+      }
+
+      expect(said.alerts).toHaveLength(1);
+      expect(said.alerts[0]).toContain("has not been ready for 2 min");
+    });
+
+    it("stays quiet for a blind hedge that settles after a wake when trading was ready before it", () => {
+      const { said, state, clock, watch } = watched();
+      watch.check();
+
+      watch.resume();
+      state.ready = false;
+      state.reason = "NSOL-PERP hedge is blind";
+      watch.check();
+      clock.advance(30_000);
+      watch.check();
+      state.ready = true;
+      watch.check();
+
+      expect(said.alerts).toEqual([]);
+    });
+
     it("still alerts when trading never becomes ready after a wake", () => {
       const { said, state, clock, make } = watched(false);
       state.reason = "NSOL-PERP hedge is blind";

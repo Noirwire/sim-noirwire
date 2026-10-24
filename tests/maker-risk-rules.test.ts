@@ -37,6 +37,7 @@ import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
 import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/types.js";
 import { VenueNotReady } from "../src/engine/venue-not-ready.js";
+import type { HedgeVenue } from "../src/hedge/hedge-venue.js";
 import {
   type PriceReading,
   type Reference,
@@ -49,6 +50,7 @@ import { placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
 import { TradingWatch } from "../src/wiring/trading-watch.js";
 import type { VenueWiring } from "../src/wiring/venue-wiring.js";
+import { FakeHedgeVenue } from "./fake-hedge-venue.js";
 import { dollars, makeVenue } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
@@ -886,12 +888,18 @@ describe("a spot house maker's starting base", () => {
 });
 
 describe("the makers opened by the service", () => {
-  const openedWith = async (market: (typeof MARKETS)[number], over: Record<string, string>) => {
+  const openedWith = async (
+    market: (typeof MARKETS)[number],
+    over: Record<string, string>,
+    marketsOf?: (real: Venue["markets"]) => Venue["markets"],
+    hedgeVenue?: HedgeVenue,
+  ) => {
     const { venue } = makeVenue();
     const sent = { cancels: 0 };
     const counting: Venue = {
       ...placingOrdersThrough(venue, (trader, order) => venue.placeOrder(trader, order)),
       cancelAll: async () => (sent.cancels += 1),
+      ...(marketsOf ? { markets: marketsOf(() => venue.markets()) } : {}),
     };
     const wiring = {
       venue: counting,
@@ -916,7 +924,7 @@ describe("the makers opened by the service", () => {
       ...over,
     });
     const problems = { onError: () => {}, onRecovered: () => {} };
-    return { opened: openBots(config, wiring, problems), sent };
+    return { opened: openBots(config, wiring, problems, hedgeVenue), sent };
   };
 
   it("takes every maker's quotes off the venue when asked, and starts its loops after", async () => {
@@ -929,6 +937,130 @@ describe("the makers opened by the service", () => {
     const loops = bots.start();
     expect(loops.length).toBeGreaterThan(0);
     for (const loop of loops) loop.stop();
+  });
+
+  it("is not ready to trade while the venue would refuse the maker's quotes, and ready again once it takes them", async () => {
+    const stale = { why: "its mark is 90 s old (StalePrice, 6038): is the price crank running?" };
+    const { opened } = await openedWith(
+      MARKETS[0],
+      { HOUSE_MAKER_RISK_RULES: "1", HOUSE_MAKER_TICK_MS: "20" },
+      (real) => async () =>
+        (await real()).map((info) =>
+          stale.why ? { ...info, quotesRefusedBecause: stale.why } : info,
+        ),
+    );
+    const bots = await opened;
+
+    const loops = bots.start();
+    try {
+      await vi.waitFor(() => expect(bots.trading().reason).toContain("StalePrice"));
+
+      stale.why = "";
+      await vi.waitFor(() => expect(bots.trading()).toEqual({ ready: true }));
+    } finally {
+      for (const loop of loops) loop.stop();
+    }
+  });
+
+  it("is not ready before any read of the markets has succeeded, and again after each wake", async () => {
+    const { opened } = await openedWith(MARKETS[0], {
+      HOUSE_MAKER_RISK_RULES: "1",
+      HOUSE_MAKER_TICK_MS: "20",
+    });
+    const bots = await opened;
+    expect(bots.trading().ready).toBe(false);
+    expect(bots.trading().reason).toContain("has not been read yet");
+
+    const first = bots.start();
+    try {
+      await vi.waitFor(() => expect(bots.trading()).toEqual({ ready: true }));
+    } finally {
+      for (const loop of first) loop.stop();
+    }
+
+    const second = bots.start();
+    try {
+      expect(bots.trading().reason).toContain("has not been read yet");
+      await vi.waitFor(() => expect(bots.trading()).toEqual({ ready: true }));
+    } finally {
+      for (const loop of second) loop.stop();
+    }
+  });
+
+  it("is not ready while a read of the markets never answers, and recovers once one does", async () => {
+    vi.useFakeTimers();
+    try {
+      const hung = { on: true };
+      const { opened } = await openedWith(
+        MARKETS[0],
+        { HOUSE_MAKER_RISK_RULES: "1", HOUSE_MAKER_TICK_MS: "20" },
+        (real) => () => (hung.on ? new Promise<never>(() => {}) : real()),
+      );
+      const bots = await opened;
+      const loops = bots.start();
+      try {
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(bots.trading().ready).toBe(false);
+        expect(bots.trading().reason).toContain("could not be read");
+
+        hung.on = false;
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(bots.trading()).toEqual({ ready: true });
+      } finally {
+        for (const loop of loops) loop.stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads trading readiness with no risk rules and so no maker ledger", async () => {
+    const { opened } = await openedWith(MARKETS[0], { HOUSE_MAKER_TICK_MS: "20" });
+    const bots = await opened;
+    expect(bots.trading().ready).toBe(false);
+
+    const loops = bots.start();
+    try {
+      await vi.waitFor(() => expect(bots.trading()).toEqual({ ready: true }));
+    } finally {
+      for (const loop of loops) loop.stop();
+    }
+  });
+
+  it("reports nothing wrong asleep when no hedge position is open", async () => {
+    const { opened } = await openedWith(MARKETS[0], { HOUSE_MAKER_RISK_RULES: "1" });
+    const bots = await opened;
+    expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+  });
+
+  it("stays not ready asleep while an unmanaged hedge position is open", async () => {
+    const dir = join(ROOT, "unmanaged");
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+    await (await MakerLedger.open(makerStatePath(dir, MARKETS[0].id))).update({ mode: "stopped" });
+    const hedgeVenue = new FakeHedgeVenue();
+    hedgeVenue.position = dollars(-1);
+    const { opened } = await openedWith(
+      MARKETS[0],
+      {
+        HOUSE_MAKER_RISK_RULES: "1",
+        HEDGE_ENABLED: "1",
+        HOUSE_MAKER_TICK_MS: "20",
+        DATA_DIR: dir,
+      },
+      undefined,
+      hedgeVenue,
+    );
+    const bots = await opened;
+    expect(bots.tradingWhileAsleep()).toEqual({ ready: true });
+
+    const loops = bots.start();
+    try {
+      await vi.waitFor(() => expect(bots.tradingWhileAsleep().ready).toBe(false));
+    } finally {
+      for (const loop of loops) loop.stop();
+    }
+    expect(bots.tradingWhileAsleep().reason).toContain("open hedge position");
   });
 
   it("refuses the risk rules on a market it has no reference price for", async () => {
