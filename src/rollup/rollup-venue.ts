@@ -12,7 +12,7 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
-import { rejectedOrder } from "../engine/venue-orders.js";
+import { rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
@@ -54,6 +54,8 @@ const CONNECTED_WITHIN_MS = 3 * REREAD_INTERVAL_MS;
 const MS_PER_SECOND = 1_000;
 /** How long a rest waits for the requests in flight before it lets them go. */
 const DRAIN_WITHIN_MS = 2_000;
+/** How long an order of unknown outcome may hold its bot's tick before it is reported as still unknown. */
+export const SETTLEMENT_DEADLINE_MS = 30_000;
 /** The program gives a bot's order no tag: its fills are recognised by receipt instead. */
 const NO_TAG = 0n;
 
@@ -384,8 +386,6 @@ export class RollupVenue implements Venue {
     const sendable = chainPriceAndSize(market, order);
     if (typeof sendable === "string") return rejectedOrder(orderId, NO_TAG, order, sendable);
 
-    const secret = newOrderSecret();
-    this.secrets.add(order.market, trader, secret);
     const rests = order.type === "limit" || order.type === "postOnly";
     const restsWithoutExpiry = rests && !order.reduceOnly && order.expiresInSeconds === undefined;
     if (restsWithoutExpiry) {
@@ -396,12 +396,16 @@ export class RollupVenue implements Venue {
         "a resting order needs an expiry of its own, so it cannot outlive the bot that placed it",
       );
     }
+    const secret = newOrderSecret();
+    this.secrets.add(order.market, trader, secret);
     let outcome: PlaceOutcome;
     let owner = "";
+    let dispatched = false;
     try {
       outcome = await this.whileAwake(async () => {
         const programTrader = await this.bots.trader(trader);
         owner = programTrader.address;
+        dispatched = true;
         return programTrader.place(market.chain.marketId, {
           side: order.side,
           type: order.type,
@@ -415,12 +419,16 @@ export class RollupVenue implements Venue {
         });
       });
     } catch (error) {
-      this.secrets.retire(secret, Date.now());
       const reason = error instanceof Error ? error.message : String(error);
+      // Once the order was handed to the program it may still fill, and its fills are told by this secret.
+      if (dispatched) return unknownOrder(orderId, NO_TAG, order, reason);
+      this.secrets.retire(secret, Date.now());
       return rejectedOrder(orderId, NO_TAG, order, reason);
     }
     if (outcome.settled) outcome = await this.onceSettled(outcome.settled);
-    if (outcome.status !== "rested") this.secrets.retire(secret, Date.now());
+    if (outcome.status !== "rested" && outcome.status !== "unknown") {
+      this.secrets.retire(secret, Date.now());
+    }
     if (rests && !order.reduceOnly) {
       noteMakerQuote(this.options.handlers, trader, order.market, owner, outcome);
     }
@@ -436,12 +444,25 @@ export class RollupVenue implements Venue {
   private async onceSettled(settled: Promise<PlaceOutcome>): Promise<PlaceOutcome> {
     const { handlers } = this.options;
     handlers.onBotOrderUnknown();
-    const outcome = await settled.catch((): PlaceOutcome => ({
-      status: "expired",
+    const stillUnknown = (reason: string): PlaceOutcome => ({
+      status: "unknown",
       filled: 0n,
       rested: 0n,
       sendToResultMs: 0,
-    }));
+      reason,
+    });
+    let stopWaiting: () => void = () => {};
+    const timedOut = new Promise<PlaceOutcome>((resolve) => {
+      const timer = setTimeout(
+        () => resolve(stillUnknown("the order was not settled in time")),
+        SETTLEMENT_DEADLINE_MS,
+      );
+      stopWaiting = () => clearTimeout(timer);
+    });
+    const outcome = await Promise.race([
+      settled.catch(() => stillUnknown("the order's outcome could not be settled")),
+      timedOut,
+    ]).finally(stopWaiting);
     handlers.onBotOrderSettled(executed(outcome));
     return outcome;
   }

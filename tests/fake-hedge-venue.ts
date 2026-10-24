@@ -23,6 +23,7 @@ export interface HedgeStep {
 
 /** A hedge venue that does what a test scripts: fills, partial fills, refusals, outages, lost and late answers. */
 export class FakeHedgeVenue implements HedgeVenue {
+  readonly maxCallMs = 10_000;
   position = 0n;
   equity = dollars(1_000);
   rulesNow: HedgeMarketRules = {

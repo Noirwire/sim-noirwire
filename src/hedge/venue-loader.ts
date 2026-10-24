@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import { LATE_DISPATCH_QUARANTINE_MS } from "./hedge-limits.js";
 import type { HedgeVenue } from "./hedge-venue.js";
 
 const MODULE_VARIABLE = "HEDGE_VENUE_MODULE";
@@ -93,6 +94,19 @@ const assertImplementsVenue = (
   if (missing.length > 0) {
     throw new HedgeVenueLoadError(
       `the venue the module created does not implement: ${missing.join(", ")}. Config keys it was given: ${keyNames(settings)}.`,
+    );
+  }
+  const { maxCallMs } = candidate as { maxCallMs?: unknown };
+  const longestAllowedMs = LATE_DISPATCH_QUARANTINE_MS / 2;
+  if (
+    typeof maxCallMs !== "number" ||
+    !Number.isFinite(maxCallMs) ||
+    maxCallMs <= 0 ||
+    maxCallMs > longestAllowedMs
+  ) {
+    throw new HedgeVenueLoadError(
+      `the venue the module created must declare maxCallMs, a finite number above 0 and at most ${longestAllowedMs}: ` +
+        "the longest one placeIoc or cancel call stays alive before the venue aborts it.",
     );
   }
   return candidate as HedgeVenue;

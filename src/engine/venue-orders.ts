@@ -14,6 +14,14 @@ export const rejectedOrder = (
   reason,
 });
 
+/** An order that failed after it may have been sent: shown as rejected, flagged as not known to be. */
+export const unknownOrder = (
+  orderId: string,
+  tag: bigint,
+  order: NewOrder,
+  reason: string,
+): PlaceResult => ({ ...rejectedOrder(orderId, tag, order, reason), outcomeUnknown: true });
+
 /** `venue` with its orders placed through `placeOrder`, and everything else untouched. */
 export const placingOrdersThrough = (venue: Venue, placeOrder: Venue["placeOrder"]): Venue => ({
   markets: () => venue.markets(),

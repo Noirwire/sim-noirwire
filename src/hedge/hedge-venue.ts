@@ -47,10 +47,22 @@ export interface HedgeFill {
 export type HedgeHealth = { ok: true } | { ok: false; reason: string };
 
 export interface HedgeVenue {
+  /**
+   * The longest time, in milliseconds, one `placeIoc` or `cancel` call can stay alive before the
+   * implementation aborts it, so that an aborted request can no longer reach the venue. The loader
+   * refuses a venue whose value is not finite and positive, or is above half of
+   * `LATE_DISPATCH_QUARANTINE_MS`: the controller stops waiting after its own deadline but cannot
+   * stop a call, and its quarantine after an unknown order proves nothing without this bound.
+   */
+  readonly maxCallMs: number;
   rules(): Promise<HedgeMarketRules>;
   account(): Promise<HedgeAccount>;
-  /** Throws, or resolves without an answer the controller can believe, when the outcome is unknown. */
+  /**
+   * Throws, or resolves without an answer the controller can believe, when the outcome is unknown.
+   * The call is bounded by `maxCallMs`.
+   */
   placeIoc(order: HedgeOrder): Promise<HedgeAck>;
+  /** Bounded by `maxCallMs`, like `placeIoc`. */
   cancel(clientId: string): Promise<void>;
   fills(sinceMs: number): Promise<HedgeFill[]>;
   /** Whether the venue answers and is trading: its heartbeat. */

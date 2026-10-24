@@ -16,8 +16,9 @@ const writeModule = async (source: string): Promise<string> => {
 };
 
 const venueSource = (
-  overrides: { health?: string; rules?: string; omit?: string } = {},
+  overrides: { health?: string; rules?: string; omit?: string; maxCallMs?: string | null } = {},
 ): string => {
+  const maxCallMs = overrides.maxCallMs === undefined ? "10000" : overrides.maxCallMs;
   const methods: Record<string, string> = {
     rules:
       overrides.rules ??
@@ -32,7 +33,8 @@ const venueSource = (
   const body = Object.entries(methods)
     .map(([name, fn]) => `${name}: ${fn}`)
     .join(",\n");
-  return `export default async (config) => ({ received: config, ${body} });`;
+  const bound = maxCallMs === null ? "" : `maxCallMs: ${maxCallMs},\n`;
+  return `export default async (config) => ({ received: config, ${bound}${body} });`;
 };
 
 const loadFailure = async (path: string | undefined, env: Record<string, string> = {}) => {
@@ -83,6 +85,26 @@ describe("loading the hedge venue module", () => {
   it("refuses a venue missing a method and names the method", async () => {
     const path = await writeModule(venueSource({ omit: "cancel" }));
     expect(await loadFailure(path)).toContain("does not implement: cancel");
+  });
+
+  it.each([
+    ["missing", null],
+    ["zero", "0"],
+    ["negative", "-5"],
+    ["not finite", "Infinity"],
+    ["not a number", "'10000'"],
+    ["above half of the late-dispatch quarantine", "30001"],
+  ])("refuses a venue whose maxCallMs is %s, naming the key only", async (_, maxCallMs) => {
+    const path = await writeModule(venueSource({ maxCallMs }));
+    const message = await loadFailure(path, { HEDGE_VENUE_KEY: "s3cret-value" });
+    expect(message).toContain("maxCallMs");
+    expect(message).not.toContain("s3cret-value");
+  });
+
+  it("accepts a maxCallMs at exactly half of the late-dispatch quarantine", async () => {
+    const path = await writeModule(venueSource({ maxCallMs: "30000" }));
+    const venue = await loadHedgeVenue(path, {});
+    expect(venue.maxCallMs).toBe(30_000);
   });
 
   it("refuses a venue whose health check fails", async () => {

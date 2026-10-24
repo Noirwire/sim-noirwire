@@ -3,10 +3,16 @@ import type { MakerVoice } from "../bots/maker-risk.js";
 import type { MakerMode } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
 import { absBigInt, mulDivScale, toDecimalString } from "../engine/money.js";
-import { firstLine } from "../logging/first-line.js";
 import type { Reference } from "../prices/reference-price.js";
+import { type Schedule, errorClass, realSchedule, withinDeadline } from "./call-deadline.js";
 import { decideHedge } from "./hedge-decision.js";
-import { HEDGE_LIMITS, type HedgeSettings } from "./hedge-limits.js";
+import {
+  HEDGE_LIMITS,
+  type HedgeSettings,
+  LATE_DISPATCH_QUARANTINE_MS,
+  UNRESOLVED_HOLD_BLIND_MS,
+  VENUE_CALL_TIMEOUT_MS,
+} from "./hedge-limits.js";
 import type { HedgeAccount, HedgeMarketRules, HedgeOrder, HedgeVenue } from "./hedge-venue.js";
 
 /**
@@ -33,6 +39,18 @@ export interface HedgeControllerOptions {
   voice: MakerVoice;
   market: string;
   settings: HedgeSettings;
+  /** How long a venue call may take; the default is `VENUE_CALL_TIMEOUT_MS`. */
+  callTimeoutMs?: number;
+  /** Starts the deadline timers; a test supplies its own. */
+  schedule?: Schedule;
+}
+
+/** The venue answered its health check with "not trading". Its own reason is not logged. */
+class VenueUnhealthy extends Error {
+  constructor() {
+    super("the hedge venue reports that it is not trading");
+    this.name = "VenueUnhealthy";
+  }
 }
 
 /** An order whose outcome the controller does not know yet: it is never followed by a new order. */
@@ -42,6 +60,10 @@ interface UnexplainedOrder {
   positionBefore: bigint;
   cancelled: boolean;
   alerted: boolean;
+  /** The order's call may still be dispatched late until then, so nothing clears the hold before it. */
+  quarantinedUntilMs: number;
+  /** The order's own call. While it has not settled it may still dispatch, so nothing clears the hold. */
+  call: { live: boolean };
 }
 
 const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
@@ -97,6 +119,10 @@ export class HedgeController implements HedgeGate {
       return "blind";
     }
     if (now < this.startedAtMs + HEDGE_LIMITS.settleAfterUnknownMs) return "blind";
+    // A hold that nothing has resolved is never released by age, but it is no longer a hedge anyone can trust.
+    if (this.unexplained && now - this.unexplained.sentAtMs > UNRESOLVED_HOLD_BLIND_MS) {
+      return "blind";
+    }
     const exposed = this.unhedgedNotional();
     if (exposed >= settings.hardUnhedgedNotional) return "blind";
     if (exposed >= settings.softUnhedgedNotional) return "lagging";
@@ -106,7 +132,14 @@ export class HedgeController implements HedgeGate {
 
   async tick(): Promise<void> {
     const { clock, makerMode, makerPosition } = this.options;
-    const maker = await makerPosition();
+    let maker: bigint;
+    try {
+      maker = await this.within("the maker's position", makerPosition);
+    } catch (error) {
+      // Without the maker's exposure the controller cannot hedge it: say so now, not when the last read ages out.
+      this.reachable = false;
+      throw error;
+    }
     const account = await this.readVenue();
     const { rules } = this;
     if (!account || !rules) return;
@@ -169,6 +202,8 @@ export class HedgeController implements HedgeGate {
         positionBefore: account.position,
         cancelled: true,
         alerted: false,
+        quarantinedUntilMs: 0,
+        call: { live: false },
       };
     }
   }
@@ -192,15 +227,21 @@ export class HedgeController implements HedgeGate {
   /** Whether the venue took the order. A refusal or an unclear answer holds back the next order. */
   private async send(order: HedgeOrder, positionBefore: bigint): Promise<boolean> {
     const { venue, voice, market, clock } = this.options;
+    const call = { live: true };
+    const placing = (async () => venue.placeIoc(order))();
+    const settle = () => {
+      call.live = false;
+    };
+    placing.then(settle, settle);
     try {
-      const ack = await venue.placeIoc(order);
+      const ack = await this.within("an order", () => placing);
       if (ack.status === "accepted") return true;
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.retryAfterRefusalMs;
       voice.notice(`${market} hedge order refused by the venue: ${ack.reason}`);
     } catch (error) {
       this.holdUntilMs = clock.nowMs() + HEDGE_LIMITS.settleAfterUnknownMs;
       voice.notice(
-        `${market} hedge order has an unknown outcome (${firstLine(error)}). ` +
+        `${market} hedge order has an unknown outcome (${errorClass(error)}). ` +
           "It is not sent again until the venue's position or fills have explained it.",
       );
       this.unexplained = {
@@ -209,6 +250,8 @@ export class HedgeController implements HedgeGate {
         positionBefore,
         cancelled: false,
         alerted: false,
+        quarantinedUntilMs: clock.nowMs() + LATE_DISPATCH_QUARANTINE_MS,
+        call,
       };
       await this.cancelUnexplained(this.unexplained);
     }
@@ -218,7 +261,7 @@ export class HedgeController implements HedgeGate {
   /** Cancels the order by its client id. A cancel that fails stays unresolved, is retried, and is an ALERT. */
   private async cancelUnexplained(order: UnexplainedOrder): Promise<void> {
     const { venue, voice, market } = this.options;
-    order.cancelled = await venue.cancel(order.clientId).then(
+    order.cancelled = await this.within("a cancel", () => venue.cancel(order.clientId)).then(
       () => true,
       () => false,
     );
@@ -234,20 +277,29 @@ export class HedgeController implements HedgeGate {
    * Whether an order of unknown outcome is still unexplained, which holds every new order. It is
    * explained when the hedge position moved, or when the venue's fills show its client id and the
    * position has caught up. With neither, it is explained as not filled only once its cancel went
-   * through and the settle time has passed. A cancel that fails is retried every tick.
+   * through and the settle time has passed. A cancel that fails is retried every tick. An order
+   * whose call timed out or failed is held in either case until its late-dispatch quarantine ends
+   * and its call has settled, because a call still running may dispatch at any time.
    */
   private async stillUnexplained(account: HedgeAccount): Promise<boolean> {
     const order = this.unexplained;
     if (!order) return false;
     const { venue, clock } = this.options;
-    if (account.position !== order.positionBefore) {
+    const quarantined = order.call.live || clock.nowMs() < order.quarantinedUntilMs;
+    if (account.position !== order.positionBefore && !quarantined) {
       this.unexplained = null;
       return false;
     }
     if (!order.cancelled) await this.cancelUnexplained(order);
-    const fills = await venue.fills(order.sentAtMs).catch(() => null);
+    const fills = await this.within("its fills", () => venue.fills(order.sentAtMs)).catch(
+      () => null,
+    );
     if (fills === null || fills.some((fill) => fill.clientId === order.clientId)) return true;
-    if (order.cancelled && clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs) {
+    if (
+      order.cancelled &&
+      !quarantined &&
+      clock.nowMs() >= order.sentAtMs + HEDGE_LIMITS.settleAfterUnknownMs
+    ) {
       this.unexplained = null;
       return false;
     }
@@ -258,21 +310,26 @@ export class HedgeController implements HedgeGate {
   private async readVenue(): Promise<HedgeAccount | null> {
     const { venue, voice, market, clock } = this.options;
     try {
-      const health = await venue.health();
-      if (!health.ok) throw new Error(health.reason);
-      this.rules ??= await venue.rules();
-      const account = await venue.account();
+      const health = await this.within("its health", () => venue.health());
+      if (!health.ok) throw new VenueUnhealthy();
+      this.rules ??= await this.within("its rules", () => venue.rules());
+      const account = await this.within("its account", () => venue.account());
       if (!this.reachable) voice.notice(`${market} hedge venue answers again`);
       this.reachable = true;
       this.lastReadAtMs = clock.nowMs();
       return account;
     } catch (error) {
       if (this.reachable) {
-        voice.notice(`${market} hedge venue cannot be reached: ${firstLine(error)}`);
+        voice.notice(`${market} hedge venue cannot be reached: ${errorClass(error)}`);
       }
       this.reachable = false;
       return null;
     }
+  }
+
+  private within<T>(what: string, call: () => Promise<T>): Promise<T> {
+    const { callTimeoutMs = VENUE_CALL_TIMEOUT_MS, schedule = realSchedule } = this.options;
+    return withinDeadline(what, callTimeoutMs, schedule, call);
   }
 
   /** Records what the venue shows. A position that moved is the venue confirming a fill. */
