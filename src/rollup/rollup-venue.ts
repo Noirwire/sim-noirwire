@@ -411,7 +411,8 @@ export class RollupVenue implements Venue {
     if (typeof sendable === "string") return rejectedOrder(orderId, NO_TAG, order, sendable);
 
     const rests = order.type === "limit" || order.type === "postOnly";
-    const restsWithoutExpiry = rests && !order.reduceOnly && order.expiresInSeconds === undefined;
+    const hasExpiry = order.expiresInSeconds !== undefined || order.expiresAtMs !== undefined;
+    const restsWithoutExpiry = rests && !order.reduceOnly && !hasExpiry;
     if (restsWithoutExpiry) {
       return rejectedOrder(
         orderId,
@@ -441,8 +442,11 @@ export class RollupVenue implements Venue {
             reduceOnly: order.reduceOnly ?? false,
             secret,
             restingExpirySeconds:
-              rests && !order.reduceOnly && order.expiresInSeconds !== undefined
-                ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
+              rests && !order.reduceOnly && hasExpiry
+                ? order.expiresAtMs !== undefined
+                  ? // Rounded down, so the program never keeps the order past the time the caller recorded.
+                    Math.floor(order.expiresAtMs / MS_PER_SECOND)
+                  : Math.floor(Date.now() / MS_PER_SECOND) + (order.expiresInSeconds ?? 0)
                 : undefined,
           });
           this.trackUntilSettled(trader, placing);

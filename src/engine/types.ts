@@ -48,6 +48,12 @@ export interface NewOrder {
    * venue leaves orders resting until they are cancelled.
    */
   expiresInSeconds?: number;
+  /**
+   * The absolute time a resting remainder becomes void, in milliseconds. A caller that has recorded
+   * the expiry elsewhere sets it so the venue uses exactly that time, whenever the order is sent;
+   * it takes precedence over `expiresInSeconds`.
+   */
+  expiresAtMs?: number;
 }
 
 export type OrderStatus = "open" | "filled" | "partiallyFilled" | "cancelled" | "rejected";
