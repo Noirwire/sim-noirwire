@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { makerTraderKey } from "../bots/bot-traders.js";
 import { FundingUpdater } from "../bots/funding-updater.js";
 import { HedgeController, type HedgeGate } from "../hedge/hedge-controller.js";
@@ -18,6 +19,7 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
 import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
+import { KeeperHeartbeat } from "./keeper-heartbeat.js";
 import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
@@ -27,15 +29,18 @@ const SPOT_MAKER_BASE_PER_TAKER_BASE = 10n;
 const FUNDING_CHECK_AT_MOST_EVERY_MS = 5_000;
 /** The market whose price the reference sources give. */
 const REFERENCE_BASE_TOKEN = "SOL";
-/** A read of the venue's markets that takes longer than this counts as failed. */
+/** A read of the venue's markets, or of the keeper's heartbeat file, that takes longer than this counts as failed. */
 const MARKETS_READ_DEADLINE_MS = 10_000;
 const MARKET_NOT_READ_YET = "the market has not been read yet";
 
 /** `read`'s answer, or an error once the deadline passes. An answer that comes later is dropped. */
-const readWithinDeadline = <T>(read: () => Promise<T>): Promise<T> =>
+const readWithinDeadline = <T>(
+  read: () => Promise<T>,
+  what = "the venue did not list its markets",
+): Promise<T> =>
   new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`the venue did not list its markets within ${MARKETS_READ_DEADLINE_MS} ms`));
+      reject(new Error(`${what} within ${MARKETS_READ_DEADLINE_MS} ms`));
     }, MARKETS_READ_DEADLINE_MS);
     read().then(
       (value) => {
@@ -185,8 +190,9 @@ const noiseTaker = (
  * Whether the makers are quoting under a working hedge. Not the same as the process being alive. A
  * hedge that is only `lagging` counts as ready (the maker already quotes wider for it). A venue that
  * would refuse the maker's quotes counts as not ready too, which covers a stale mark (a price crank
- * that is down) and a dislocated or paused market. The liquidation keeper is not covered: it runs
- * outside this process and leaves no signal here.
+ * that is down) and a dislocated or paused market. The liquidation keeper runs outside this
+ * process, so it is covered through its heartbeat file (`KEEPER_HEARTBEAT_FILE`): a stale, missing
+ * or malformed heartbeat is not ready, and so is no file configured on mainnet.
  */
 export interface TradingReadiness {
   ready: boolean;
@@ -301,6 +307,20 @@ export const openBots = async (
     for (const { id } of botMarkets) quotesRefused.set(id, MARKET_NOT_READ_YET);
   };
   markNotRead();
+  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
+  // Readiness is a synchronous function of cached state, so the file is read by the readiness loop, not by `trading()`.
+  const keeper = new KeeperHeartbeat(
+    keeperFile
+      ? () =>
+          readWithinDeadline(
+            () => readFile(keeperFile, "utf8"),
+            "the keeper heartbeat file was not read",
+          )
+      : undefined,
+    isMainnet(config),
+    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+    systemClock,
+  );
   const readQuotesRefused = async (): Promise<void> => {
     let infos: Awaited<ReturnType<typeof botVenue.markets>>;
     try {
@@ -341,11 +361,14 @@ export const openBots = async (
     if (watch) {
       watch.resume();
       markNotRead();
+      keeper.reset();
       loops.push(
         loop("trading readiness", config.HOUSE_MAKER_TICK_MS, async () => {
+          const keeperRead = keeper.poll();
           try {
             await readQuotesRefused();
           } finally {
+            await keeperRead;
             watch.check();
           }
         }),
@@ -399,6 +422,11 @@ export const openBots = async (
     );
   const readinessOf = (problems: string[]): TradingReadiness =>
     problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
+  // With no maker nothing polls the heartbeat and there is nothing to quote, so it is not asked.
+  const keeperProblems = (): string[] => {
+    const problem = botMarkets.length > 0 ? keeper.problem() : undefined;
+    return problem === undefined ? [] : [problem];
+  };
   const trading = (): TradingReadiness =>
     readinessOf([
       ...ledgers
@@ -415,6 +443,7 @@ export const openBots = async (
         .map(({ market }) => `${market} hedge is blind`),
       ...unmanagedHedges(),
       ...[...quotesRefused].map(([market, why]) => `${market} quotes would be refused: ${why}`),
+      ...keeperProblems(),
     ]);
   const tradingWhileAsleep = (): TradingReadiness =>
     readinessOf([...unmanagedHedges(), ...unconfirmedCancels()]);

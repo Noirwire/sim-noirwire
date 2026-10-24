@@ -74,6 +74,10 @@ const envSchema = z.object({
   HOUSE_MAKER_RISK_RULES: boolFlag("0"),
   /** Pinged after each good requote of the house maker, so an outside monitor notices when the pings stop. */
   HEALTHCHECK_URL: z.url().optional(),
+  /** File the liquidation keeper writes the time of its last healthy sweep to. Required on mainnet for trading to count as ready. */
+  KEEPER_HEARTBEAT_FILE: z.string().min(1).optional(),
+  /** Trading is not ready when that sweep is older than this. */
+  KEEPER_HEARTBEAT_MAX_AGE_MS: positiveInt(30_000),
 
   /** The hedge controller offsets the maker's SOL exposure on an outside perpetuals venue. Off, nothing hedge-related runs. */
   HEDGE_ENABLED: boolFlag("0"),
