@@ -30,6 +30,7 @@ const shortMaker = async () => {
     }),
     alert: () => {},
     requoteSucceeded: () => {},
+    mayGrow: () => true,
     stopFor: async (reason: string) => {
       stopped.push(reason);
     },

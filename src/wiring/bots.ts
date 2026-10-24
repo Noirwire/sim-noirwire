@@ -195,8 +195,8 @@ const noiseTaker = (
  * that is down) and a dislocated or paused market. The liquidation keeper runs outside this
  * process, so it is covered through its heartbeat file (`KEEPER_HEARTBEAT_FILE`): a stale, missing
  * or malformed heartbeat is not ready, and so is no file configured on mainnet. The same heartbeat
- * also acts: while it is not fresh, every maker stops growing its position and quotes only the side
- * that shrinks it, as for a blind hedge.
+ * also acts: while it is not fresh, every maker pulls its quotes and places none until the
+ * heartbeat is fresh again; only a flatten trades the position down.
  */
 export interface TradingReadiness {
   ready: boolean;

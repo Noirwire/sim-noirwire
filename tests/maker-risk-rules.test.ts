@@ -1831,22 +1831,22 @@ describe("a house maker while the liquidation keeper is not sweeping", () => {
     expect(keeperAlerts(said)).toEqual([]);
   });
 
-  it("quotes only the side that shrinks its position, with one ALERT that does not repeat as the age grows", async () => {
+  it("cancels the standing ladder and places none, with one ALERT that does not repeat as the age grows", async () => {
     const { book, keeper, said, tick, warmUp } = await rig("keeper-stale");
-    await warmUp();
-    book.take();
-
     book.position = dollars(0.5);
+    await warmUp();
+    expect(new Set(book.take().map((order) => order.side))).toEqual(new Set(["buy", "sell"]));
+    const cancelsBefore = book.cancels;
+
     keeper.problem = STALE(31);
     await tick();
+    expect(book.cancels).toBe(cancelsBefore + 1);
     await tick();
     keeper.problem = STALE(45);
     await tick();
     await tick();
 
-    const orders = book.take();
-    expect(orders.length).toBeGreaterThan(0);
-    expect(orders.every((order) => order.side === "sell" && order.reduceOnly === true)).toBe(true);
+    expect(book.take()).toEqual([]);
     const alerts = keeperAlerts(said);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toMatch(/^ALERT /);
@@ -1857,10 +1857,11 @@ describe("a house maker while the liquidation keeper is not sweeping", () => {
     const { book, keeper, said, tick, warmUp } = await rig("keeper-recovers");
     await warmUp();
     book.position = dollars(0.5);
+    book.take();
     keeper.problem = STALE(31);
     await tick();
     await tick();
-    book.take();
+    expect(book.take()).toEqual([]);
 
     keeper.problem = undefined;
     await tick();
@@ -1887,7 +1888,7 @@ describe("a house maker while the liquidation keeper is not sweeping", () => {
     expect(keeperAlerts(said)).toHaveLength(2);
   });
 
-  it("is reduce-only before the heartbeat has been read, but says nothing", async () => {
+  it("places nothing before the heartbeat has been read, but says nothing", async () => {
     const { book, keeper, said, tick, warmUp } = await rig("keeper-not-read");
     await warmUp();
     book.take();
@@ -1896,7 +1897,7 @@ describe("a house maker while the liquidation keeper is not sweeping", () => {
     keeper.problem = KEEPER_NOT_READ_YET;
     await tick();
     await tick();
-    expect(book.take().every((order) => order.side === "sell")).toBe(true);
+    expect(book.take()).toEqual([]);
 
     keeper.problem = undefined;
     await tick();
@@ -1916,6 +1917,35 @@ describe("a house maker while the liquidation keeper is not sweeping", () => {
     keeper.problem = "keeper heartbeat unreadable";
     await tick();
 
+    expect(keeperAlerts(said)).toHaveLength(1);
+  });
+
+  it("places nothing, and alerts once, when the keeper turns stale between the assessment and the placing", async () => {
+    const { book, keeper, said, tick, venue, maker, clock, warmUp } = await rig("keeper-race");
+    await warmUp();
+    book.take();
+    let reads = 0;
+    const racing: typeof venue = {
+      ...venue,
+      traderState: async (trader) => {
+        reads += 1;
+        // The first read is the assessment's; the keeper goes stale after it.
+        if (reads === 2) keeper.problem = STALE(31);
+        return venue.traderState(trader);
+      },
+    };
+
+    clock.advance(11_000);
+    await maker.tick(racing);
+
+    expect(reads).toBe(2);
+    expect(book.take()).toEqual([]);
+    expect(keeperAlerts(said)).toHaveLength(1);
+
+    await tick();
+    await tick();
+
+    expect(book.take()).toEqual([]);
     expect(keeperAlerts(said)).toHaveLength(1);
   });
 

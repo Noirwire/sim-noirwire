@@ -124,7 +124,8 @@ export interface MakerSafetyOptions {
  * and how much wider than usual, or why not to quote. It follows the
  * operator's commands and the loss limits first, since they decide whether
  * the maker may quote at all. A blind hedge, or a liquidation keeper that is
- * not sweeping, lets it quote only the side that shrinks its position.
+ * not sweeping, makes it pull its quotes and place none until it is back; only
+ * a flatten trades the position down.
  */
 export class MakerSafety {
   private readonly history = new PriceHistory();
@@ -235,11 +236,20 @@ export class MakerSafety {
     if (problem !== KEEPER_NOT_READ_YET && !this.keeperAlerted) {
       this.keeperAlerted = true;
       voice.alert(
-        `ALERT ${market} maker: the liquidation keeper is not sweeping (${problem}). It stops growing its ` +
-          "position and quotes only the side that shrinks it, until the keeper's heartbeat is fresh again.",
+        `ALERT ${market} maker: the liquidation keeper is not sweeping (${problem}). It pulls its quotes ` +
+          "and places none until the keeper's heartbeat is fresh again; only a flatten trades the position down.",
       );
     }
     return true;
+  }
+
+  /**
+   * Whether the maker may still place a ladder that grows its position: a second look at the
+   * keeper just before the orders go out, since `assess` looked once at the start of the tick.
+   * It says the same things aloud as `assess` does, and only once between them.
+   */
+  mayGrow(): boolean {
+    return !this.followKeeper();
   }
 
   /**
