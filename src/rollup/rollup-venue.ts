@@ -13,6 +13,7 @@ import type {
   Venue,
 } from "../engine/types.js";
 import { rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
+import { withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
@@ -56,6 +57,11 @@ const MS_PER_SECOND = 1_000;
 const DRAIN_WITHIN_MS = 2_000;
 /** How long an order of unknown outcome may hold its bot's tick before it is reported as still unknown. */
 export const SETTLEMENT_DEADLINE_MS = 30_000;
+/**
+ * How long the program may take to take an order before its outcome is reported as unknown. A late
+ * answer after that is dropped: the order is never reported as placed by it.
+ */
+export const PLACE_DEADLINE_MS = 20_000;
 /** The program gives a bot's order no tag: its fills are recognised by receipt instead. */
 const NO_TAG = 0n;
 
@@ -124,6 +130,8 @@ export class RollupVenue implements Venue {
   /** Every key's connection, opened again after a rest. */
   private readonly sessions: Session[] = [];
   private stopped = false;
+  /** Per bot trader, the place calls handed to the program that have not settled. */
+  private readonly placesInFlight = new Map<TraderKey, number>();
   /**
    * The generation now current: everything that sends is made for it and ends
    * with it. Undefined while the service rests, when nothing may send.
@@ -379,6 +387,22 @@ export class RollupVenue implements Venue {
     return this.whileAwake(() => this.bots.topUp(trader, token, amount));
   }
 
+  /** Counts `placing` against `trader` until it resolves or rejects, whatever deadline its caller gave up at. */
+  private trackUntilSettled(trader: TraderKey, placing: Promise<unknown>): void {
+    this.placesInFlight.set(trader, (this.placesInFlight.get(trader) ?? 0) + 1);
+    const settled = (): void => {
+      const left = (this.placesInFlight.get(trader) ?? 1) - 1;
+      if (left > 0) this.placesInFlight.set(trader, left);
+      else this.placesInFlight.delete(trader);
+    };
+    placing.then(settled, settled);
+  }
+
+  /** How many calls handing an order to the program for `trader` have not yet resolved or rejected. */
+  unsettledPlaces(trader: TraderKey): number {
+    return this.placesInFlight.get(trader) ?? 0;
+  }
+
   async placeOrder(trader: TraderKey, order: NewOrder): Promise<PlaceResult> {
     this.ordersPlaced += 1;
     const orderId = `${trader}#${this.ordersPlaced}`;
@@ -401,24 +425,34 @@ export class RollupVenue implements Venue {
     let outcome: PlaceOutcome;
     let owner = "";
     let dispatched = false;
+    // Set once the deadline has passed: work that has not been handed to the program by then never is.
+    let abandoned = false;
     try {
-      outcome = await this.whileAwake(async () => {
-        const programTrader = await this.bots.trader(trader);
-        owner = programTrader.address;
-        dispatched = true;
-        return programTrader.place(market.chain.marketId, {
-          side: order.side,
-          type: order.type,
-          ...sendable,
-          reduceOnly: order.reduceOnly ?? false,
-          secret,
-          restingExpirySeconds:
-            rests && !order.reduceOnly && order.expiresInSeconds !== undefined
-              ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
-              : undefined,
-        });
-      });
+      outcome = await withinDeadline(
+        this.whileAwake(async () => {
+          const programTrader = await this.bots.trader(trader);
+          if (abandoned) throw new Error("the order was abandoned before it was sent");
+          owner = programTrader.address;
+          dispatched = true;
+          const placing = programTrader.place(market.chain.marketId, {
+            side: order.side,
+            type: order.type,
+            ...sendable,
+            reduceOnly: order.reduceOnly ?? false,
+            secret,
+            restingExpirySeconds:
+              rests && !order.reduceOnly && order.expiresInSeconds !== undefined
+                ? Math.floor(Date.now() / MS_PER_SECOND) + order.expiresInSeconds
+                : undefined,
+          });
+          this.trackUntilSettled(trader, placing);
+          return placing;
+        }),
+        PLACE_DEADLINE_MS,
+        "placing the order",
+      );
     } catch (error) {
+      abandoned = true;
       const reason = error instanceof Error ? error.message : String(error);
       // Once the order was handed to the program it may still fill, and its fills are told by this secret.
       if (dispatched) return unknownOrder(orderId, NO_TAG, order, reason);
@@ -468,11 +502,13 @@ export class RollupVenue implements Venue {
   }
 
   async cancelAll(trader: TraderKey, market: MarketId): Promise<number> {
+    // Only the orders that stood when this cancel was issued end with it, however late it completes.
+    const fence = this.secrets.mark();
     const cancelled = await this.whileAwake(async () =>
       (await this.bots.trader(trader)).cancelAll(this.market(market).chain.marketId),
     );
     if (cancelled === null) return 0;
-    this.secrets.retireAll(market, trader, Date.now());
+    this.secrets.retireAll(market, trader, Date.now(), fence);
     return Number(cancelled);
   }
 

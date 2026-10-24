@@ -11,7 +11,7 @@ import { MakerSafety } from "../bots/maker-safety.js";
 import { MakerLedger, makerStatePath } from "../bots/maker-state.js";
 import { NoiseTaker } from "../bots/noise-taker.js";
 import { SeededRandom } from "../bots/rng.js";
-import type { Config } from "../config/config.js";
+import { type Config, isMainnet } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
@@ -238,8 +238,17 @@ export const openBots = async (
     // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.
     const ledger =
       rules || config.VENUE === "rollup"
-        ? await MakerLedger.open(makerStatePath(config.DATA_DIR, market.id))
+        ? await MakerLedger.open(makerStatePath(config.DATA_DIR, market.id), {
+            requireSavedState: isMainnet(config),
+          })
         : undefined;
+    if (ledger?.startedWithoutState) {
+      problems.onError(
+        `ALERT ${market.id} maker: no saved state was found on mainnet, so it starts stopped and reduce-only for the hedge. ` +
+          `If this is the right data directory, run "node dist/kill-switch.js resume" to start it.`,
+        null,
+      );
+    }
     const hedge =
       config.HEDGE_ENABLED && reference && ledger
         ? hedgeController(config, market, ledger, reference, botVenue, hedgeVenue, problems)

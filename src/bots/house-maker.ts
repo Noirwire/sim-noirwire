@@ -20,10 +20,11 @@ import type {
 } from "../engine/types.js";
 import { VenueNotReady } from "../engine/venue-not-ready.js";
 import { firstLine } from "../logging/first-line.js";
+import { withinDeadline } from "../scheduling/deadline.js";
 import { makerTraderKey } from "./bot-traders.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
 import type { MakerSafety, Plan } from "./maker-safety.js";
-import { type MakerLedger, StatePersistenceError } from "./maker-state.js";
+import { type MakerLedger, StatePersistenceError, type UnresolvedHold } from "./maker-state.js";
 
 export interface HouseMakerOptions {
   market: MarketId;
@@ -48,7 +49,12 @@ export interface HouseMakerOptions {
   ledger?: MakerLedger;
   /** Called after each requote that sent every order. It must not throw or wait: a heartbeat to an outside monitor. */
   afterRequote?: () => void;
+  /** How long a cancel may take before it counts as unconfirmed. */
+  cancelDeadlineMs?: number;
 }
+
+/** A cancel the venue has not answered in this long is unconfirmed: the quotes may still stand. */
+export const CANCEL_DEADLINE_MS = 15_000;
 
 /** The skew is applied in thousandths of a basis point, so a small inventory still moves the centre. */
 const SKEW_PRECISION = 1_000;
@@ -93,8 +99,22 @@ export class OrderRefused extends Error {
   }
 }
 
-/** How long an order of unknown outcome that has no expiry of its own may still be dispatched late. */
+/**
+ * How long an order of unknown outcome that has no expiry of its own is held for by a maker that has
+ * no ledger to record an operator's review in. With a ledger such an order holds the maker until the
+ * operator has looked.
+ */
 export const UNKNOWN_ORDER_QUARANTINE_MS = 60_000;
+
+/** The unknown orders a hold remembers by name. */
+const HELD_ORDER_IDS = 5;
+
+/** When a hold lasts to once another order joins it: the later expiry, and never bounded if either is not. */
+const mergedExpiry = (hold: UnresolvedHold | null, untilMs: number | null): number | null => {
+  if (hold === null) return untilMs;
+  if (hold.untilMs === null || untilMs === null) return null;
+  return Math.max(hold.untilMs, untilMs);
+};
 
 /** An order may have been executed although the venue never said so: the maker sends nothing until it has looked. */
 export class OrderOutcomeUnknown extends Error {
@@ -276,22 +296,35 @@ export class HouseMaker {
   private epoch = 0;
   /**
    * An order's outcome is unknown: no quote goes out until a cancel and a read of the seat have both
-   * worked and the unknown order can no longer be dispatched (`quarantineUntilMs`).
+   * worked and the unknown order can no longer be dispatched (`hold.untilMs`), or, where that is not
+   * bounded, an operator has looked. It is kept in the ledger, so a restart is held just the same.
    */
-  private unreconciled = false;
-  private unknownSinceMs = 0;
-  private quarantineUntilMs = 0;
+  private hold: UnresolvedHold | null;
   private readonly expiresInSeconds: number;
 
   constructor(private readonly options: HouseMakerOptions) {
     this.trader = makerTraderKey(options.market);
     this.expiresInSeconds =
       Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
+    this.hold = options.ledger?.state.hold ?? null;
   }
 
   /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
   get quarantinedSinceMs(): number | null {
-    return this.unreconciled ? this.unknownSinceMs : null;
+    return this.hold?.sinceMs ?? null;
+  }
+
+  /** Cancels the venue was asked for and has not answered, though the maker stopped waiting. */
+  private cancelsInFlight = 0;
+
+  private async cancelQuotes(venue: Venue): Promise<void> {
+    const call = venue.cancelAll(this.trader, this.options.market);
+    this.cancelsInFlight += 1;
+    const settled = (): void => {
+      this.cancelsInFlight -= 1;
+    };
+    call.then(settled, settled);
+    await withinDeadline(call, this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS, "the cancel");
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
@@ -310,9 +343,18 @@ export class HouseMaker {
   async withdraw(venue: Venue): Promise<void> {
     this.epoch += 1;
     this.lastQuoted = null;
-    await venue.cancelAll(this.trader, this.options.market);
-    // Only once the venue has taken them off: a cancel that failed is tried again on the next tick.
+    await this.cancelQuotes(venue);
+    // Only once the venue has taken them off: a cancel that failed or never answered is tried again on the next tick.
     this.standing = false;
+  }
+
+  /** The operator is told once that a cancel is unconfirmed, until one is confirmed. */
+  private alertCancelUnconfirmed(error: unknown): void {
+    if (this.cancelAlerted) return;
+    this.cancelAlerted = true;
+    this.options.safety?.alert(
+      `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). It places nothing and tries again on every tick.`,
+    );
   }
 
   /** `withdraw`, telling the operator once if the venue did not confirm the cancel. The error is thrown on. */
@@ -321,12 +363,7 @@ export class HouseMaker {
       await this.withdraw(venue);
       this.cancelAlerted = false;
     } catch (error) {
-      if (!this.cancelAlerted) {
-        this.cancelAlerted = true;
-        this.options.safety?.alert(
-          `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). It tries again on every tick.`,
-        );
-      }
+      this.alertCancelUnconfirmed(error);
       throw error;
     }
   }
@@ -386,12 +423,13 @@ export class HouseMaker {
       // The mode could not be saved, so the ledger holds the hard stop in memory: take the quotes off now.
       if (error instanceof StatePersistenceError) {
         await this.withdrawOrAlert(venue).catch(() => {});
+        this.alertUnrecorded(error);
       }
       throw error;
     }
     let held = false;
     let heldProblem: unknown;
-    if (this.unreconciled) {
+    if (this.hold !== null) {
       try {
         held = !(await this.reconcile(venue));
       } catch (error) {
@@ -421,18 +459,38 @@ export class HouseMaker {
     const now = this.options.clock.nowMs();
     if (!this.dueForRequote(next, now)) return;
 
-    await venue.cancelAll(this.trader, this.options.market);
+    try {
+      // A cancel still out would remove the ladder placed below when it lands, so nothing is placed until it ends.
+      if (this.cancelsInFlight > 0) {
+        throw new Error(
+          "an earlier cancel did not answer and is still out, so a new ladder could be cancelled by it",
+        );
+      }
+      await this.cancelQuotes(venue);
+    } catch (error) {
+      // Unconfirmed: the quotes may stand, nothing new goes out, and the next tick tries the cancel again.
+      this.lastQuoted = null;
+      this.standing = true;
+      this.alertCancelUnconfirmed(error);
+      throw error;
+    }
+    this.cancelAlerted = false;
     this.standing = false;
     const position = this.inventory(await venue.traderState(this.trader));
     const orders = this.ordersFor(next, market, position);
     const flagged = next.reduceOnly || next.flatten === true;
     this.standing = true;
+    const dispatching = orders.length > 0 && (await this.recordDispatch(flagged));
     let leftOut = 0;
     let unknownReason: string | undefined;
     let sawUnknown = false;
+    let cutShort = false;
     try {
       for (const order of orders) {
-        if (epoch !== this.epoch) return;
+        if (epoch !== this.epoch) {
+          cutShort = true;
+          break;
+        }
         const sent: NewOrder = {
           ...order,
           ...(flagged ? { reduceOnly: true } : {}),
@@ -440,7 +498,7 @@ export class HouseMaker {
         };
         const placed = await venue.placeOrder(this.trader, sent);
         if (placed.outcomeUnknown) {
-          this.holdForUnknown(sent);
+          await this.holdForUnknown(sent, placed.orderId);
           sawUnknown = true;
           unknownReason = placed.reason;
           break;
@@ -452,9 +510,12 @@ export class HouseMaker {
         leftOut += 1;
       }
     } catch (error) {
+      // The record of the ladder in flight stays on disk: a failed order may still have been sent.
       await this.stopAfter(venue, error).catch(() => {});
       throw error;
     }
+    if (dispatching && this.hold === null) await this.saveHold(null);
+    if (cutShort) return;
     if (sawUnknown) {
       this.lastQuoted = null;
       await this.withdraw(venue).catch(() => {});
@@ -474,34 +535,120 @@ export class HouseMaker {
 
   /**
    * Holds the maker until `order`, which may have been dispatched, can no longer rest or fill: its own
-   * expiry for a resting order, else `UNKNOWN_ORDER_QUARANTINE_MS`, counted from now.
+   * absolute expiry for a resting order. A reduce-only or non-resting order has no such bound, so
+   * it holds the maker until an operator has looked (`reconcile`); without a ledger to record that
+   * in, `UNKNOWN_ORDER_QUARANTINE_MS` from now. The hold is written to the ledger before this
+   * returns; if that write fails the ledger stops the maker and the hold stays in memory.
    */
-  private holdForUnknown(order: NewOrder): void {
+  private async holdForUnknown(order: NewOrder, orderId: string): Promise<void> {
     const now = this.options.clock.nowMs();
-    if (!this.unreconciled) this.unknownSinceMs = now;
-    this.unreconciled = true;
+    const { ledger } = this.options;
     const resting = order.type === "limit" || order.type === "postOnly";
-    const lastsMs =
-      resting && !order.reduceOnly && order.expiresInSeconds !== undefined
-        ? order.expiresInSeconds * 1_000
+    const bounded = resting && !order.reduceOnly && order.expiresInSeconds !== undefined;
+    const lastsMs = bounded
+      ? (order.expiresInSeconds ?? 0) * 1_000
+      : ledger
+        ? null
         : UNKNOWN_ORDER_QUARANTINE_MS;
-    this.quarantineUntilMs = Math.max(this.quarantineUntilMs, now + lastsMs);
+    const until = lastsMs === null ? null : now + lastsMs;
+    const before = this.hold;
+    const hold: UnresolvedHold = {
+      orderIds: [...(before?.orderIds ?? []), orderId].slice(-HELD_ORDER_IDS),
+      sinceMs: before?.sinceMs ?? now,
+      lastAtMs: now,
+      untilMs: mergedExpiry(before, until),
+      seatClearAtMs: null,
+    };
+    this.hold = hold;
+    await this.saveHold(hold);
   }
 
   /**
-   * Takes the quotes off and reads the seat. The quarantine ends only when the seat shows no order and
-   * the unknown order's lifetime has passed, since a cancel and an empty seat do not stop a send that
-   * has not arrived yet. A failed cancel or read keeps it, and is thrown.
+   * Writes the ladder about to go out to the ledger as a hold, before any order is sent, so a crash
+   * or a failed write at any later point leaves a restart held. Nothing is sent if this write fails.
+   * Returns whether a record was written (not when the maker is held already, or has no ledger).
+   */
+  private async recordDispatch(flagged: boolean): Promise<boolean> {
+    const { ledger, clock } = this.options;
+    if (!ledger || this.hold !== null) return false;
+    const now = clock.nowMs();
+    try {
+      await ledger.update({
+        hold: {
+          orderIds: [],
+          sinceMs: now,
+          lastAtMs: now,
+          untilMs: flagged ? null : now + this.expiresInSeconds * 1_000,
+          seatClearAtMs: null,
+        },
+      });
+    } catch (error) {
+      if (error instanceof StatePersistenceError) this.alertUnrecorded(error);
+      throw error;
+    }
+    return true;
+  }
+
+  private alertUnrecorded(error: StatePersistenceError): void {
+    if (error.durableEvidence) return;
+    this.options.safety?.alert(
+      "its state could not be saved and neither could the recovery marker, so nothing on disk says " +
+        "it must not quote. It stays stopped in memory and quotes nothing. Fix the disk before it is restarted.",
+    );
+  }
+
+  /** Keeps `hold` in the ledger. A write that fails has stopped the maker there, and is told to the operator. */
+  private async saveHold(hold: UnresolvedHold | null): Promise<void> {
+    try {
+      await this.options.ledger?.update({ hold });
+    } catch (error) {
+      if (!(error instanceof StatePersistenceError)) throw error;
+      this.options.safety?.alert(
+        `an unresolved order could not be written to disk (${firstLine(error)}). It stays held in memory, ` +
+          "and a restart would not know of it: do not restart it until the disk is fixed.",
+      );
+    }
+  }
+
+  /**
+   * Takes the quotes off and reads the seat. The hold ends only when the seat shows no order and
+   * the unknown order can no longer be dispatched, since a cancel and an empty seat do not stop a send
+   * that has not arrived yet: that is its absolute expiry, or, where it has none, an operator's
+   * resume after the last unknown order. A failed or unanswered cancel or read keeps it, and is thrown.
    */
   private async reconcile(venue: Venue): Promise<boolean> {
-    await venue.cancelAll(this.trader, this.options.market);
+    const held = this.hold;
+    if (held === null) return true;
+    try {
+      await this.cancelQuotes(venue);
+    } catch (error) {
+      this.standing = true;
+      this.alertCancelUnconfirmed(error);
+      throw error;
+    }
     this.standing = false;
     const seat = await venue.traderState(this.trader);
+    const now = this.options.clock.nowMs();
     if (seat.openOrders.some((open) => open.market === this.options.market)) {
+      if (held.seatClearAtMs !== null) {
+        await this.saveHold((this.hold = { ...held, seatClearAtMs: null }));
+      }
       throw new OrderOutcomeUnknown(this.options.market, "orders still show after a cancel");
     }
-    if (this.options.clock.nowMs() < this.quarantineUntilMs) return false;
-    this.unreconciled = false;
+    if (held.seatClearAtMs === null) {
+      await this.saveHold((this.hold = { ...held, seatClearAtMs: now }));
+    }
+    // A call the venue gave up waiting for can still land its order, so nothing releases the hold meanwhile.
+    if ((venue.unsettledPlaces?.(this.trader) ?? 0) > 0) return false;
+    if (held.untilMs === null) {
+      const state = this.options.ledger?.state;
+      const reviewed = state?.mode === "run" && state.lastCommandAtMs > held.lastAtMs;
+      if (!reviewed) return false;
+    } else if (now < held.untilMs) {
+      return false;
+    }
+    await this.options.ledger?.update({ hold: null });
+    this.hold = null;
     return true;
   }
 

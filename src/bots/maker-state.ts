@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -11,6 +11,34 @@ import { z } from "zod";
  */
 export const MAKER_MODES = ["run", "reduce", "flatten", "stopped"] as const;
 export type MakerMode = (typeof MAKER_MODES)[number];
+
+/**
+ * An order whose outcome the maker never learned, and which may still be
+ * dispatched late. Kept on disk, so a restart does not quote before it is
+ * proven gone.
+ */
+export interface UnresolvedHold {
+  /** The venue's identifiers of the orders in question, newest last. */
+  orderIds: string[];
+  sinceMs: number;
+  /** When the newest of them was sent. An operator's review counts only if it came after this. */
+  lastAtMs: number;
+  /**
+   * The absolute time after which no such order can rest or fill, or null when that is not bounded
+   * (a reduce-only or non-resting order): then only an operator's review ends the hold.
+   */
+  untilMs: number | null;
+  /** When a cancel and a read of the seat first showed no order, or null before then. */
+  seatClearAtMs: number | null;
+}
+
+const holdSchema = z.object({
+  orderIds: z.array(z.string()),
+  sinceMs: z.number(),
+  lastAtMs: z.number(),
+  untilMs: z.number().nullable(),
+  seatClearAtMs: z.number().nullable(),
+});
 
 export interface MakerState {
   mode: MakerMode;
@@ -26,6 +54,8 @@ export interface MakerState {
   lastCommandAtMs: number;
   /** A spot maker's base balance when it first opened, kept so a restart does not take today's for it. */
   spotBaseAtStart: bigint | null;
+  /** An order of unknown outcome that still holds the maker back, or null. */
+  hold: UnresolvedHold | null;
 }
 
 const amount = z
@@ -43,6 +73,7 @@ const fileSchema = z.object({
   peakEquity: amount,
   lastCommandAtMs: z.number(),
   spotBaseAtStart: amount,
+  hold: holdSchema.nullable().default(null),
   /** Whether the saved stop was asked for. A file from before the field counts a saved stop as asked for. */
   hardStop: z.boolean().optional(),
 });
@@ -56,6 +87,7 @@ const FRESH: MakerState = {
   peakEquity: null,
   lastCommandAtMs: 0,
   spotBaseAtStart: null,
+  hold: null,
 };
 
 export const isMissing = (error: unknown): boolean =>
@@ -63,7 +95,12 @@ export const isMissing = (error: unknown): boolean =>
 
 /** The maker's state could not be written, so a restart would not see it. */
 export class StatePersistenceError extends Error {
-  constructor(path: string, cause: unknown) {
+  constructor(
+    path: string,
+    cause: unknown,
+    /** False when the recovery marker could not be written either: nothing on disk says the write failed. */
+    readonly durableEvidence = true,
+  ) {
     super(`the maker's state file ${path} could not be written`, { cause });
     this.name = "StatePersistenceError";
   }
@@ -114,11 +151,14 @@ const failedMarkerPath = (statePath: string): string => `${statePath}.failed`;
 interface Marker {
   phase: "failed" | "resumed";
   commandTs: number | null;
+  /** When a start without a saved state recorded its stop: only a command made after it may resume. */
+  stoppedAtMs?: number;
 }
 
 const markerSchema = z.object({
   phase: z.enum(["failed", "resumed"]),
   commandTs: z.number().nullable(),
+  stoppedAtMs: z.number().optional(),
 });
 
 const FAILED_MARKER: Marker = { phase: "failed", commandTs: null };
@@ -129,15 +169,27 @@ const writeMarker = (statePath: string, marker: Marker): Promise<void> =>
 /**
  * The marker, or null when it is not there. A marker that cannot be read at
  * all means it cannot be known whether a write failed, and is thrown; one
- * that is not valid counts as "failed".
+ * that is not valid counts as "failed". Whether it is there is asked of the
+ * directory entry itself (`lstat`), so a link that points nowhere counts as
+ * a marker, and a failed one.
  */
 const readMarker = async (statePath: string): Promise<Marker | null> => {
   const path = failedMarkerPath(statePath);
   let text: string;
   try {
-    text = await readFile(path, "utf8");
+    await lstat(path);
   } catch (error) {
     if (isMissing(error)) return null;
+    throw new Error(
+      `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
+        "write failed before. Repair the state directory and inspect the state file, then start again.",
+      { cause: error },
+    );
+  }
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (isMissing(error)) return FAILED_MARKER;
     throw new Error(
       `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
         "write failed before. Repair the state directory and inspect the state file, then start again.",
@@ -162,6 +214,34 @@ const RECOVERY_REQUIRED =
   "its resume was saved, but the recovery marker could not be removed. Run the kill switch " +
   '"resume" again to finish the recovery';
 
+export const NO_SAVED_STATE =
+  "no saved state was found for it, and with real money it does not start from a blank slate. " +
+  'Check that the data directory is the right one, then run the kill switch "resume" to start it';
+
+export interface LedgerOptions {
+  /** A missing state file is an error to recover from, not a first run: the maker starts stopped. */
+  requireSavedState?: boolean;
+}
+
+/**
+ * Proves the directory takes a durable write before a maker that has no
+ * marker is trusted to run: if it did not, a later failed write could leave
+ * no trace, and a restart would quote on a state nobody saved.
+ */
+const probeDurability = async (statePath: string): Promise<void> => {
+  const probe = `${statePath}.probe`;
+  try {
+    await writeAtomically(probe, "probe");
+    await rm(probe, { force: true });
+  } catch (error) {
+    throw new Error(
+      `the maker's state directory ${dirname(statePath)} does not take a durable write, so the maker ` +
+        "cannot promise to remember a stop. Repair the disk, then start again.",
+      { cause: error },
+    );
+  }
+};
+
 /** The file of one maker's state, in the data directory. */
 export const makerStatePath = (dataDir: string, market: string): string =>
   join(dataDir, `maker-${market}.json`);
@@ -183,10 +263,22 @@ export class MakerLedger {
   /** A hard stop was asked for, saved or not, and no later write has moved the maker off it. */
   private hardStopIntent = false;
 
-  static async open(path: string): Promise<MakerLedger> {
+  /** A state write and the marker write both failed: nothing on disk says the maker must not run. */
+  private evidenceMissing = false;
+
+  /** Whether the ledger failed to leave any durable trace of a failed write. The maker must not be restarted before the disk is fixed. */
+  get undurable(): boolean {
+    return this.evidenceMissing;
+  }
+
+  /** Whether this ledger began without a saved state and is waiting for an operator. */
+  startedWithoutState = false;
+
+  static async open(path: string, options: LedgerOptions = {}): Promise<MakerLedger> {
     const marker = await readMarker(path);
     let loaded: MakerState;
     let savedHardStop = false;
+    let missing = false;
     try {
       const raw = JSON.parse(await readFile(path, "utf8"));
       const { hardStop, ...state } = fileSchema.parse(raw);
@@ -201,12 +293,32 @@ export class MakerLedger {
         );
       }
       loaded = { ...FRESH };
+      missing = true;
     }
     const withSavedIntent = (ledger: MakerLedger): MakerLedger => {
       ledger.hardStopIntent = savedHardStop;
       return ledger;
     };
-    if (marker === null) return withSavedIntent(new MakerLedger(path, loaded, false, false));
+    if (marker === null && missing && options.requireSavedState) {
+      // The marker goes down first: a start that cannot record this must not run at all.
+      // A command file left over from before this stop must not count as the operator's resume.
+      const stoppedAtMs = Date.now();
+      await writeMarker(path, { ...FAILED_MARKER, stoppedAtMs });
+      const ledger = withSavedIntent(
+        new MakerLedger(
+          path,
+          { ...loaded, mode: "stopped", reason: NO_SAVED_STATE, lastCommandAtMs: stoppedAtMs },
+          true,
+          true,
+        ),
+      );
+      ledger.startedWithoutState = true;
+      return ledger;
+    }
+    if (marker === null) {
+      await probeDurability(path);
+      return withSavedIntent(new MakerLedger(path, loaded, false, false));
+    }
     if (
       marker.phase === "resumed" &&
       loaded.mode === "run" &&
@@ -230,6 +342,7 @@ export class MakerLedger {
       ...loaded,
       mode: "stopped",
       reason: "a state write failed before the last shutdown, so the saved mode cannot be trusted",
+      lastCommandAtMs: Math.max(loaded.lastCommandAtMs, marker.stoppedAtMs ?? 0),
     };
     return withSavedIntent(new MakerLedger(path, held, true, true));
   }
@@ -258,6 +371,12 @@ export class MakerLedger {
    */
   async update(change: Partial<MakerState>): Promise<void> {
     const resumes = change.mode === "run";
+    // An earlier failure left no marker: try to leave one now, so a restart sees it.
+    if (this.evidenceMissing) {
+      await writeMarker(this.path, FAILED_MARKER)
+        .then(() => (this.evidenceMissing = false))
+        .catch(() => {});
+    }
     const next = { ...this.current, ...change };
     if (this.recoveryRequired && !resumes) next.mode = "stopped";
     // Set before the write: a hard stop whose save fails is still a decision to stop.
@@ -281,14 +400,17 @@ export class MakerLedger {
       };
       this.recoveryRequired = true;
       this.faulted = true;
-      await writeMarker(this.path, FAILED_MARKER).catch((markerError) =>
+      let durableEvidence = true;
+      await writeMarker(this.path, FAILED_MARKER).catch((markerError) => {
+        durableEvidence = false;
+        this.evidenceMissing = true;
         console.error(
           `sim-noirwire: ALERT could not write ${failedMarkerPath(this.path)} either, so a restart may ` +
             "quote again. The maker stays stopped in memory. Do not restart it until the disk is fixed.",
           markerError instanceof Error ? markerError.message : markerError,
-        ),
-      );
-      throw new StatePersistenceError(this.path, error);
+        );
+      });
+      throw new StatePersistenceError(this.path, error, durableEvidence);
     }
     if (this.recoveryRequired && resumes) {
       try {
@@ -300,6 +422,7 @@ export class MakerLedger {
       }
       this.recoveryRequired = false;
       this.faulted = false;
+      this.evidenceMissing = false;
     }
     if (change.mode === "stopped") this.faulted = false;
     this.hardStopIntent = intent;

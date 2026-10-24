@@ -182,6 +182,15 @@ class Book {
   cancels = 0;
   failPlacing: Error | null = null;
   failCancelling: Error | null = null;
+  /** The venue never answers a cancel. */
+  hangCancelling = false;
+  /** The cancels that were left unanswered, to answer later. */
+  hungCancels: (() => void)[] = [];
+  releaseCancels(): void {
+    for (const answer of this.hungCancels.splice(0)) answer();
+  }
+  /** Order calls the venue gave up on that may still land. */
+  unsettled = 0;
   /** The venue answers every order with a refusal, giving this reason. */
   rejecting: string | null = null;
   rejectedCount = 0;
@@ -198,7 +207,11 @@ class Book {
   asVenue(): Venue {
     return {
       markets: async () => [this.info()],
+      unsettledPlaces: () => this.unsettled,
       cancelAll: async () => {
+        if (this.hangCancelling) {
+          return new Promise<number>((resolve) => this.hungCancels.push(() => resolve(0)));
+        }
         if (this.failCancelling) throw this.failCancelling;
         this.cancels += 1;
         return 0;
@@ -2480,5 +2493,303 @@ describe("the skew uses exact integer ratios", () => {
 
     expect(pricesOf(beyond, "sell")[0]).toBe(pricesOf(full, "sell")[0]);
     expect(pricesOf(nearly, "sell")[0]).toBeGreaterThan(pricesOf(full, "sell")[0]);
+  });
+});
+
+describe("an order of unknown outcome holds the maker across a restart", () => {
+  const holdOnDisk = async (dir: string) =>
+    JSON.parse(await readFile(makerStatePath(dir, PERP), "utf8")).hold;
+
+  it("writes the hold to disk, and a fresh maker over the same state is held until the order's absolute expiry", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue } = await rig("hold-restart");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    const sentAtMs = clock.nowMs() + 11_000;
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    const saved = await holdOnDisk(dir);
+    expect(saved).toMatchObject({ sinceMs: sentAtMs, lastAtMs: sentAtMs });
+    expect(saved.untilMs).toBeGreaterThan(sentAtMs);
+    book.unknownBecause = null;
+    book.take();
+
+    const restarted = await open();
+    expect(restarted.maker.quarantinedSinceMs).toBe(sentAtMs);
+    for (let step = 0; step < 12; step += 1) {
+      clock.advance(1_000);
+      await restarted.maker.tick(venue);
+    }
+    expect(book.take()).toEqual([]);
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+
+    clock.advance(saved.untilMs - clock.nowMs() + 1_000);
+    await restarted.maker.tick(venue);
+    expect(restarted.maker.quarantinedSinceMs).toBeNull();
+    expect(await holdOnDisk(dir)).toBeNull();
+    for (let step = 0; step < 15; step += 1) {
+      clock.advance(1_000);
+      await restarted.maker.tick(venue);
+    }
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("keeps the hold, durably, past the expiry and an empty seat while a place call the venue gave up on is unsettled", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue } = await rig("hold-unsettled");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the call timed out";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    const { untilMs } = await holdOnDisk(dir);
+    book.unknownBecause = null;
+    book.unsettled = 1;
+
+    const restarted = await open();
+    clock.advance(untilMs - clock.nowMs() + 60_000);
+    await restarted.maker.tick(venue);
+    await restarted.maker.tick(venue);
+
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+    expect((await holdOnDisk(dir)).seatClearAtMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
+
+    book.unsettled = 0;
+    await restarted.maker.tick(venue);
+    expect(restarted.maker.quarantinedSinceMs).toBeNull();
+    expect(await holdOnDisk(dir)).toBeNull();
+  });
+
+  it("keeps the hold, and records it, while a cancel or a read of the seat keeps failing after the restart", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue } = await rig("hold-restart-failing");
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    const { untilMs } = await holdOnDisk(dir);
+    book.unknownBecause = null;
+
+    const restarted = await open();
+    clock.advance(untilMs - clock.nowMs() + 1_000);
+    book.failCancelling = new Error("the venue is away");
+    await expect(restarted.maker.tick(venue)).rejects.toThrow("the venue is away");
+
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+    expect(await holdOnDisk(dir)).not.toBeNull();
+    expect(book.take()).toEqual([]);
+  });
+
+  it("does not clear a reduce-only order's hold by the clock, only by an operator's resume after it", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue, said } = await rig("hold-reduce-only");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    expect((await holdOnDisk(dir)).untilMs).toBeNull();
+    book.unknownBecause = null;
+
+    const restarted = await open();
+    for (let step = 0; step < 4; step += 1) {
+      clock.advance(200_000);
+      await restarted.maker.tick(venue).catch(() => {});
+    }
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+    expect(await holdOnDisk(dir)).not.toBeNull();
+
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    clock.advance(1_000);
+    await restarted.maker.tick(venue);
+
+    expect(restarted.maker.quarantinedSinceMs).toBeNull();
+    expect(await holdOnDisk(dir)).toBeNull();
+    expect(said.alerts.length).toBeGreaterThan(0);
+  });
+
+  it("does not take a resume that came before the unknown order for a review of it", async () => {
+    const { warmUp, book, tick, dir, clock } = await rig("hold-old-resume");
+    book.position = dollars(0.5);
+    await warmUp();
+    book.take();
+    await requestMode(dir, "run", clock.nowMs() + 1);
+    await tick(1);
+    book.unknownBecause = "the connection dropped";
+    book.equity = dollars(969);
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    await tick(5);
+    await tick(5);
+
+    expect((await holdOnDisk(dir)).untilMs).toBeNull();
+  });
+
+  it("reads a state file written before holds existed as holding nothing", async () => {
+    const { dir } = await rig("hold-old-file");
+    await writeFile(
+      makerStatePath(dir, PERP),
+      JSON.stringify({
+        mode: "run",
+        reason: null,
+        day: null,
+        dayStartEquity: null,
+        peakEquity: null,
+        lastCommandAtMs: 0,
+        spotBaseAtStart: null,
+      }),
+    );
+
+    expect((await MakerLedger.open(makerStatePath(dir, PERP))).state.hold).toBeNull();
+  });
+});
+
+describe("a ladder is recorded before any order of it is sent", () => {
+  const holdOnDisk = async (dir: string) =>
+    JSON.parse(await readFile(makerStatePath(dir, PERP), "utf8")).hold;
+
+  it("has the hold on disk while the orders go out, and clears it once they are all answered", async () => {
+    const { warmUp, book, tick, dir, maker } = await rig("ladder-recorded");
+    await warmUp();
+    book.take();
+    const seen: unknown[] = [];
+    book.beforePlacing = async () => {
+      seen.push(await holdOnDisk(dir));
+    };
+
+    await tick(11);
+
+    expect(book.take().length).toBeGreaterThan(0);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((hold) => hold !== null)).toBe(true);
+    expect(await holdOnDisk(dir)).toBeNull();
+    expect(maker.quarantinedSinceMs).toBeNull();
+  });
+
+  it("holds a restarted maker when the process died during the ladder", async () => {
+    const { warmUp, book, tick, dir, clock, open, venue } = await rig("ladder-crash");
+    await warmUp();
+    book.take();
+    book.failPlacing = new Error("the process was killed");
+    await expect(tick(11)).rejects.toThrow("killed");
+    book.failPlacing = null;
+    expect(await holdOnDisk(dir)).not.toBeNull();
+
+    const restarted = await open();
+    expect(restarted.maker.quarantinedSinceMs).not.toBeNull();
+    await restarted.maker.tick(venue);
+    expect(book.take()).toEqual([]);
+
+    clock.advance(60_000);
+    for (let step = 0; step < 15; step += 1) {
+      clock.advance(1_000);
+      await restarted.maker.tick(venue);
+    }
+    expect(restarted.maker.quarantinedSinceMs).toBeNull();
+  });
+
+  it("sends nothing, and says nothing on disk will stop a restart, when neither the state nor the marker can be written", async () => {
+    const { warmUp, book, tick, dir, ledger, said } = await rig("ladder-double-failure");
+    await warmUp();
+    book.take();
+    await rm(makerStatePath(dir, PERP), { force: true });
+    await mkdir(makerStatePath(dir, PERP));
+    await mkdir(`${makerStatePath(dir, PERP)}.failed`);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    book.beforePlacing = async () => {
+      throw new Error("an order was sent");
+    };
+
+    await expect(tick(11)).rejects.toThrow(StatePersistenceError);
+
+    errors.mockRestore();
+    expect(book.take()).toEqual([]);
+    expect(ledger.state.mode).toBe("stopped");
+    expect(said.alerts.some((line) => line.includes("neither could the recovery marker"))).toBe(
+      true,
+    );
+    await tick(30).catch(() => {});
+    expect(book.take()).toEqual([]);
+  });
+});
+
+describe("a cancel that never answers", () => {
+  const SHORT = { cancelDeadlineMs: 20 };
+
+  it("holds nothing new, tells the operator once, and tries again on every tick until one is confirmed", async () => {
+    const { warmUp, book, tick, said } = await rig("cancel-hangs", SHORT);
+    await warmUp();
+    book.take();
+
+    book.hangCancelling = true;
+    await expect(tick(11)).rejects.toThrow("did not answer");
+    await expect(tick(1)).rejects.toThrow("did not answer");
+    await expect(tick(1)).rejects.toThrow("did not answer");
+
+    expect(book.take()).toEqual([]);
+    const alerts = said.alerts.filter((line) => line.includes("cancel was not confirmed"));
+    expect(alerts).toHaveLength(1);
+
+    book.hangCancelling = false;
+    await expect(tick(1)).rejects.toThrow("did not answer");
+    expect(book.take()).toEqual([]);
+
+    book.releaseCancels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick(1);
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("places no ladder for a later cancel to remove while an earlier cancel is still out", async () => {
+    const { warmUp, book, tick } = await rig("cancel-late", SHORT);
+    await warmUp();
+    book.take();
+    book.hangCancelling = true;
+    await expect(tick(11)).rejects.toThrow("did not answer");
+    book.hangCancelling = false;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(tick(11)).rejects.toThrow("did not answer");
+    }
+    expect(book.take()).toEqual([]);
+
+    book.releaseCancels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick(11);
+    expect(book.take().length).toBeGreaterThan(0);
+  });
+
+  it("keeps a withdrawn maker from quoting, and keeps trying to withdraw, when the cancel after a hard stop never answers", async () => {
+    const { warmUp, book, tick, dir, clock, ledger, said } = await rig("cancel-hangs-stop", SHORT);
+    await warmUp();
+    book.take();
+    await requestMode(dir, "stopped", clock.nowMs() + 1);
+
+    book.hangCancelling = true;
+    await expect(tick(1)).rejects.toThrow("did not answer");
+    await expect(tick(1)).rejects.toThrow("did not answer");
+
+    expect(ledger.state.mode).toBe("stopped");
+    expect(book.take()).toEqual([]);
+    expect(said.alerts.filter((line) => line.includes("cancel was not confirmed"))).toHaveLength(1);
+
+    book.hangCancelling = false;
+    const cancelsBefore = book.cancels;
+    await tick(1);
+    expect(book.cancels).toBe(cancelsBefore + 1);
+    expect(book.take()).toEqual([]);
+  });
+
+  it("holds a maker that is reconciling an unknown order when the cancel never answers", async () => {
+    const { warmUp, book, tick, maker } = await rig("cancel-hangs-reconcile", SHORT);
+    await warmUp();
+    book.take();
+    book.unknownBecause = "the connection dropped";
+    await expect(tick(11)).rejects.toThrow("outcome unknown");
+    book.unknownBecause = null;
+
+    book.hangCancelling = true;
+    await expect(tick(30)).rejects.toThrow("did not answer");
+
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+    expect(book.take()).toEqual([]);
   });
 });

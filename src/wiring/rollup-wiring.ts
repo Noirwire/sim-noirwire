@@ -189,6 +189,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     traderState: (trader) => connected().traderState(trader),
     updateFunding: () => connected().updateFunding(),
     liquidate: (liquidator, target, market) => connected().liquidate(liquidator, target, market),
+    unsettledPlaces: (trader) => connected().unsettledPlaces(trader),
     onFill: (listener) => connected().onFill(listener),
   };
 

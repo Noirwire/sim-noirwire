@@ -118,5 +118,10 @@ export interface Venue {
   traderState(trader: TraderKey): Promise<TraderState>;
   updateFunding(market: MarketId): Promise<void>;
   liquidate(liquidator: TraderKey, target: TraderKey, market: MarketId): Promise<boolean>;
+  /**
+   * How many order calls for `trader` were handed on and have neither answered nor failed, though
+   * their caller stopped waiting. A venue that never gives up on a call has none.
+   */
+  unsettledPlaces?(trader: TraderKey): number;
   onFill(listener: (fill: Fill) => void): () => void;
 }

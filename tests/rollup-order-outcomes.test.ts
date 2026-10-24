@@ -1,11 +1,12 @@
 import { Keypair } from "@solana/web3.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MARKETS } from "../src/engine/markets.js";
 import type { NewOrder } from "../src/engine/types.js";
 import type { ChainMarket, PlaceOutcome } from "../src/rollup/chain-types.js";
 import { RollupMarket } from "../src/rollup/rollup-market.js";
 import {
   RollupVenue,
+  PLACE_DEADLINE_MS,
   type RollupVenueOptions,
   SETTLEMENT_DEADLINE_MS,
 } from "../src/rollup/rollup-venue.js";
@@ -13,7 +14,11 @@ import { dollars } from "./helpers.js";
 
 const fakeTrader = vi.hoisted(() => ({
   place: undefined as undefined | (() => Promise<unknown>),
+  cancel: undefined as undefined | (() => Promise<unknown>),
   failToOpen: false,
+  /** While set, opening the trader waits for it. */
+  opening: undefined as undefined | Promise<void>,
+  placed: 0,
 }));
 
 vi.mock("../src/rollup/bot-accounts.js", () => ({
@@ -21,7 +26,15 @@ vi.mock("../src/rollup/bot-accounts.js", () => ({
     count = 0;
     async trader() {
       if (fakeTrader.failToOpen) throw new Error("the trader could not be opened");
-      return { address: "owner", place: () => fakeTrader.place?.() };
+      await fakeTrader.opening;
+      return {
+        address: "owner",
+        cancelAll: () => fakeTrader.cancel?.(),
+        place: () => {
+          fakeTrader.placed += 1;
+          return fakeTrader.place?.();
+        },
+      };
     }
     allFunded() {
       return true;
@@ -103,6 +116,120 @@ const venueWith = () => {
 beforeEach(() => {
   fakeTrader.place = undefined;
   fakeTrader.failToOpen = false;
+  fakeTrader.opening = undefined;
+  fakeTrader.cancel = undefined;
+  fakeTrader.placed = 0;
+});
+
+describe("a cancel that completes late", () => {
+  it("ends only the orders that stood when it was issued, not a ladder placed after", async () => {
+    const { venue, secrets } = venueWith();
+    const book = venue as unknown as {
+      secrets: { forgetEndedBefore(market: string, tapeReadAtMs: number): void };
+    };
+    const rested = () =>
+      Promise.resolve<PlaceOutcome>({
+        status: "rested",
+        filled: 0n,
+        rested: 1n,
+        sendToResultMs: 1,
+      });
+    fakeTrader.place = rested;
+    await venue.placeOrder(TRADER, order());
+
+    let complete: (cancelled: bigint) => void = () => {};
+    fakeTrader.cancel = () => new Promise<bigint>((resolve) => (complete = resolve));
+    const cancelling = venue.cancelAll(TRADER, "NSOL-PERP");
+    await Promise.resolve();
+    await venue.placeOrder(TRADER, order());
+    expect(secrets()).toHaveLength(2);
+
+    complete(1n);
+    await cancelling;
+    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 1_000_000);
+
+    expect(secrets()).toHaveLength(1);
+  });
+});
+
+describe("an order the program never answers", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("is reported as unknown at the deadline, keeps its secret, and a late answer changes nothing", async () => {
+    vi.useFakeTimers();
+    const { venue, secrets } = venueWith();
+    let answer: (outcome: PlaceOutcome) => void = () => {};
+    fakeTrader.place = () => new Promise<PlaceOutcome>((resolve) => (answer = resolve));
+
+    const placing = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS - 1);
+    let settled = false;
+    void placing.then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await placing;
+
+    expect(result).toMatchObject({ status: "rejected", outcomeUnknown: true });
+    expect(result.reason).toContain("did not answer");
+    expect(secrets()).toHaveLength(1);
+
+    answer({ status: "rested", filled: 0n, rested: 1n, sendToResultMs: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(result.outcomeUnknown).toBe(true);
+    expect(secrets()).toHaveLength(1);
+  });
+
+  it("counts as unsettled until the program's own answer or failure, not the deadline", async () => {
+    vi.useFakeTimers();
+    const { venue } = venueWith();
+    let answer: (outcome: PlaceOutcome) => void = () => {};
+    let fail: (error: Error) => void = () => {};
+    fakeTrader.place = () => new Promise<PlaceOutcome>((resolve) => (answer = resolve));
+
+    const first = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS);
+    await first;
+    expect(venue.unsettledPlaces(TRADER)).toBe(1);
+    expect(venue.unsettledPlaces("bot:other")).toBe(0);
+
+    answer({ status: "rested", filled: 0n, rested: 1n, sendToResultMs: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(venue.unsettledPlaces(TRADER)).toBe(0);
+
+    fakeTrader.place = () => new Promise<PlaceOutcome>((_, reject) => (fail = reject));
+    const second = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS);
+    await second;
+    expect(venue.unsettledPlaces(TRADER)).toBe(1);
+    fail(new Error("the connection dropped"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(venue.unsettledPlaces(TRADER)).toBe(0);
+  });
+
+  it("is a clean rejection, and is never sent later, when the trader was still being opened", async () => {
+    vi.useFakeTimers();
+    const { venue } = venueWith();
+    let opened: () => void = () => {};
+    fakeTrader.opening = new Promise<void>((resolve) => (opened = resolve));
+    fakeTrader.place = () =>
+      Promise.resolve<PlaceOutcome>({
+        status: "rested",
+        filled: 0n,
+        rested: 1n,
+        sendToResultMs: 1,
+      });
+
+    const placing = venue.placeOrder(TRADER, order());
+    await vi.advanceTimersByTimeAsync(PLACE_DEADLINE_MS);
+    const result = await placing;
+    expect(result.status).toBe("rejected");
+    expect(result.outcomeUnknown).toBeUndefined();
+
+    opened();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fakeTrader.placed).toBe(0);
+  });
 });
 
 describe("what the rollup venue tells the maker about an order that may have been sent", () => {
