@@ -227,7 +227,7 @@ export class MakerSafety {
     if (problem === undefined) {
       if (this.keeperAlerted) {
         voice.notice(
-          `${market} maker: the liquidation keeper is sweeping again, so it quotes normally`,
+          `${market} maker: the liquidation keeper is sweeping again, so the keeper no longer limits its quotes`,
         );
       }
       this.keeperAlerted = false;
