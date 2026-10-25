@@ -151,7 +151,10 @@ What mainnet requires (the service says which is missing):
 - The deployment description must be a mainnet one: `network` is `mainnet`, no faucet, and
   the quote token is the real USDC mint.
 - `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL` and `PUBLIC_ROLLUP_WS_URL`, different
-  from the private three and carrying no user name, password or query string. These are the
+  from the private three and carrying no user name, password or query string. The rollup pair
+  may equal its private address only when that is exactly `https://mainnet-tee.magicblock.app`
+  for the RPC address and `wss://mainnet-tee.magicblock.app` for the websocket, with no
+  trailing slash, since that endpoint signs each user in with their own token. These are the
   only addresses `GET /v1/deployment` serves; the private ones may hold an API key and are
   never served. They are also hidden from every logged or served error text.
 - `TRUSTED_PROXY_HOPS`: how many reverse proxies sit in front (`0` if none), so the

@@ -55,11 +55,21 @@ const FROM_A_FILE = [
   },
 ];
 
-/** Each address a browser is told, and the private one it must not be. */
-const PUBLIC_URLS = [
+/** Hosts whose rollup endpoint signs each user in with their own token and carries no operator key. */
+const KEYLESS_ROLLUP_HOSTS = ["mainnet-tee.magicblock.app"];
+
+/**
+ * Each address a browser is told, and the private one it must not be. A rollup address may be
+ * shared only when it is exactly `<sharedScheme>://<keyless host>`, with no trailing slash.
+ */
+const PUBLIC_URLS: {
+  name: string;
+  private: string;
+  sharedScheme?: "https" | "wss";
+}[] = [
   { name: "PUBLIC_SOLANA_RPC_URL", private: "SOLANA_RPC_URL" },
-  { name: "PUBLIC_ROLLUP_RPC_URL", private: "ROLLUP_RPC_URL" },
-  { name: "PUBLIC_ROLLUP_WS_URL", private: "ROLLUP_WS_URL" },
+  { name: "PUBLIC_ROLLUP_RPC_URL", private: "ROLLUP_RPC_URL", sharedScheme: "https" },
+  { name: "PUBLIC_ROLLUP_WS_URL", private: "ROLLUP_WS_URL", sharedScheme: "wss" },
 ];
 
 const sameAddress = (a: string, b: string): boolean =>
@@ -69,6 +79,9 @@ const carriesAKey = (value: string): boolean => {
   const url = new URL(value);
   return Boolean(url.username || url.password || url.search || url.hash);
 };
+
+const isKnownKeylessOrigin = (value: string, scheme: string | undefined): boolean =>
+  scheme !== undefined && KEYLESS_ROLLUP_HOSTS.some((host) => value === `${scheme}://${host}`);
 
 const settingsInUse = (group: TestSettings, env: Env): string[] => {
   const prefixed = group.prefix
@@ -110,7 +123,7 @@ const secretsFromFiles = (env: Env): string[] =>
   });
 
 const publicUrls = (env: Env): string[] =>
-  PUBLIC_URLS.flatMap(({ name, private: privateName }) => {
+  PUBLIC_URLS.flatMap(({ name, private: privateName, sharedScheme }) => {
     const value = env[name];
     if (!value) {
       return [
@@ -118,7 +131,8 @@ const publicUrls = (env: Env): string[] =>
           `never the private ${privateName}. Set it to a public endpoint that needs no key.`,
       ];
     }
-    if (sameAddress(value, env[privateName] ?? "")) {
+    const sharedExactly = value === env[privateName] && isKnownKeylessOrigin(value, sharedScheme);
+    if (sameAddress(value, env[privateName] ?? "") && !sharedExactly) {
       return [
         `${name} is the same address as ${privateName}, which may carry a key. ` +
           "Browsers are shown this one, so set it to a separate public endpoint that needs no key.",

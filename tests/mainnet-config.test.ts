@@ -169,6 +169,90 @@ describe("NETWORK=mainnet", () => {
     expect(withPassword).toHaveLength(1);
   });
 
+  it("accepts the rollup's public address being its private one when that is the known keyless origin", () => {
+    const shared = {
+      ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app",
+      PUBLIC_ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app",
+      ROLLUP_WS_URL: "wss://mainnet-tee.magicblock.app",
+      PUBLIC_ROLLUP_WS_URL: "wss://mainnet-tee.magicblock.app",
+    };
+    expect(problemsOf(mainnetEnv(shared))).toEqual([]);
+  });
+
+  it("accepts the known origin shared for the rollup RPC beside a different public WS address", () => {
+    expect(
+      problemsOf(
+        mainnetEnv({
+          ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app",
+          PUBLIC_ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app",
+          PUBLIC_ROLLUP_WS_URL: "wss://public.rollup.example",
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it.each([
+    "https://mainnet-tee.magicblock.app/",
+    "https://mainnet-tee.magicblock.app/k3y/..",
+    "https://mainnet-tee.magicblock.app/%2E%2E/",
+    "https://mainnet-tee.magicblock.app\\k3y\\..",
+    "https://mainnet-tee.magicblock.app/?",
+    "https://mainnet-tee.magicblock.app#",
+    "https://KEY.rollup.example",
+    "https://rollup.example/k3y",
+  ])("refuses the shared rollup RPC address %s", (address) => {
+    const problems = problemsOf(
+      mainnetEnv({ ROLLUP_RPC_URL: address, PUBLIC_ROLLUP_RPC_URL: address }),
+    );
+    expect(problems).toContainEqual(
+      expect.stringContaining("PUBLIC_ROLLUP_RPC_URL is the same address as ROLLUP_RPC_URL"),
+    );
+  });
+
+  it("refuses the known origin when the private rollup RPC address spells it differently", () => {
+    const problems = problemsOf(
+      mainnetEnv({
+        ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app/",
+        PUBLIC_ROLLUP_RPC_URL: "https://mainnet-tee.magicblock.app",
+      }),
+    );
+    expect(problems).toContainEqual(
+      expect.stringContaining("PUBLIC_ROLLUP_RPC_URL is the same address as ROLLUP_RPC_URL"),
+    );
+  });
+
+  it("refuses a shared rollup RPC address under the websocket scheme", () => {
+    const address = "wss://mainnet-tee.magicblock.app";
+    const problems = problemsOf(
+      mainnetEnv({ ROLLUP_RPC_URL: address, PUBLIC_ROLLUP_RPC_URL: address }),
+    );
+    expect(problems).toContainEqual(
+      expect.stringContaining("PUBLIC_ROLLUP_RPC_URL is the same address as ROLLUP_RPC_URL"),
+    );
+  });
+
+  it.each(["https://mainnet-tee.magicblock.app", "wss://mainnet-tee.magicblock.app/k3y/.."])(
+    "refuses the shared rollup WS address %s",
+    (address) => {
+      const problems = problemsOf(
+        mainnetEnv({ ROLLUP_WS_URL: address, PUBLIC_ROLLUP_WS_URL: address }),
+      );
+      expect(problems).toContainEqual(
+        expect.stringContaining("PUBLIC_ROLLUP_WS_URL is the same address as ROLLUP_WS_URL"),
+      );
+    },
+  );
+
+  it("refuses any shared Solana address, even the keyless rollup origin", () => {
+    const address = "https://mainnet-tee.magicblock.app";
+    const solana = problemsOf(
+      mainnetEnv({ SOLANA_RPC_URL: address, PUBLIC_SOLANA_RPC_URL: address }),
+    );
+    expect(solana).toEqual([
+      expect.stringContaining("PUBLIC_SOLANA_RPC_URL is the same address as SOLANA_RPC_URL"),
+    ]);
+  });
+
   it("asks how many proxies are in front, and accepts none", () => {
     expect(problemsOf(mainnetEnv({ TRUSTED_PROXY_HOPS: undefined }))).toEqual([
       expect.stringContaining("TRUSTED_PROXY_HOPS is not set"),
