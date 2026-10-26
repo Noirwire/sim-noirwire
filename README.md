@@ -203,10 +203,13 @@ opens one seat per owner: the same transaction comes back while it is valid for 
 order keys, otherwise a fresh one replaces it and the older one is refused at submit.
 
 A transaction that is never submitted keeps its seat reserved until its blockhash can no
-longer land. Then the service asks the chain for the transaction: if it landed (confirmed
-or finalized) the seat is recorded as opened; if every signature is not found, or failed at finalized, the seat and
-the invite are freed. If the chain cannot be read, or shows a transaction as processed or
-as failed only at confirmed, the seat stays reserved and the operator's log says so. This runs on the next prepare. The gate's
+longer land. Then the service asks the chain for the transaction: if it succeeded at
+finalized the seat is recorded as opened; if every signature is not found, or failed at
+finalized, the seat and the invite are freed. If the chain cannot be read, or shows a
+transaction as processed, as succeeded or failed only at confirmed, the seat stays reserved
+and the operator's log says so. The same applies to a transaction that was submitted: the
+caller is answered when the rollup executes it, but the seat is recorded as opened only
+once it is finalized. This runs on the next prepare. The gate's
 signatures and the last valid block height are kept in `gate-seats.json` with the seat, so
 a seat left unsettled by a restart is settled the same way. Prepares are handled one at a
 time, so two asks at once cannot both pass on the same count. A submit while the same
@@ -214,9 +217,15 @@ transaction is being sent is refused with 409. A refusal by the rollup's endpoin
 door does not free the seat, because whoever holds the signed bytes can still send them: the
 sweep decides. Neither does a refusal by the program, since a failure seen at confirmed can
 be on a fork that is dropped. Asking again with other order keys (a second device) is
-answered with a 409 until the earlier transactions can no longer land, about a minute,
-because one of them could still open the account with its own keys; the same keys get a
+answered with a 409 until the earlier transactions can no longer land and none is pending,
+about a minute, because one of them could still open the account with its own keys. If one
+had landed at finalized, the answer is a 409 that the account exists. The same keys get a
 transaction at once.
+
+Operational note: the rollup reports every executed transaction as finalized, and a
+transaction it never executed as not found. A status lost to a rollup crash or to ledger
+eviction also reads as not found, so the sweep could free a quota place for an account that
+did open. The program's own daily seat limit still caps openings on chain.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 

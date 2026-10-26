@@ -7,6 +7,7 @@ import { refusalOf } from "./fund-desk.js";
 import type { ChainExchange } from "./chain-types.js";
 import type { Program } from "./program.js";
 import { ACCOUNT_EXISTS_ERROR, SEAT_ALREADY_OPEN_ERROR } from "./program-errors.js";
+import { reconcileSeat } from "./reconcile-seat.js";
 import { checkSubmitted } from "./submitted-transaction.js";
 import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
 
@@ -108,15 +109,19 @@ const accountIsThere = (error: unknown): boolean =>
  * the message is byte for byte the prepared one and that every signature on it,
  * the gate's included, is valid, asks the invite list and limits again, and
  * sends it, once: a second submit while it is being sent is refused. The seat
- * is confirmed when the rollup executes it. A refusal frees nothing at once,
- * whether at the door (whoever holds the signed bytes can still send them) or
- * by the program (a failure seen at confirmed can be on an abandoned fork).
- * Those, and a transaction that is never submitted, may still land until
- * its blockhash expires; afterwards the chain is asked for its signatures:
- * executed at confirmed or finalized means the seat is confirmed; every
- * signature not found, or failed at finalized, means it is freed. Anything else
- * (processed, a failure only at confirmed, a chain that cannot be read) keeps
- * the seat reserved until the next sweep. The signatures and the last valid block
+ * answers the caller as soon as the rollup executes it, but writes nothing
+ * final: a success seen at confirmed can still be on an abandoned fork. A
+ * refusal frees nothing at once either, whether at the door (whoever holds the
+ * signed bytes can still send them) or by the program. Every such transaction,
+ * and one that is never submitted, is settled later by `reconcileSeat`, the one
+ * rule the sweep and `prepare` share: once the block height is past the last
+ * valid one, a success at `LANDED_COMMITMENT` (finalized) records the seat as
+ * opened, and signatures all absent or failed at finalized free it. Anything
+ * else (processed, a success or failure only at confirmed, a chain that cannot
+ * be read) keeps the seat reserved. A `prepare` with other order keys than the
+ * earlier transaction uses the same rule: pending is a 409 and nothing is
+ * signed, landed records the seat and answers that the account exists, and
+ * not landed signs the replacement. The signatures and the last valid block
  * height are written in the seat record when the transaction is handed out, so
  * this also settles seats after a restart. Prepares and the sweep run one at a
  * time, so no decision is made on a count another is about to change. The user
@@ -162,7 +167,7 @@ export class OpenDesk implements OpenRequests {
     ownerKey: PublicKey,
     keys: PublicKey[],
   ): Promise<OpenPrepared> {
-    const { program, session, gate, admission, clock, log } = this.options;
+    const { program, session, gate, admission, clock, log, onError } = this.options;
     const { owner, orderKeys, invite, ip } = request;
     const now = clock.nowMs();
     await this.settleExpired(now, owner);
@@ -190,12 +195,8 @@ export class OpenDesk implements OpenRequests {
     // account with its own keys, so the new one waits until the earlier ones can no longer land.
     const earlier = admission.awaitingSettlement().find((seat) => seat.invite === asked.invite);
     if (earlier && outstanding?.orderKeys !== orderKeys.join(",")) {
-      const lastValid = earlier.lastValidBlockHeight ?? 0;
-      const past = await session
-        .use((connection) => connection.getBlockHeight("confirmed"))
-        .then((height) => height > lastValid)
-        .catch(() => false);
-      if (!past) {
+      const verdict = await reconcileSeat(session, earlier, onError);
+      if (verdict === "pending") {
         log(
           `gate: ${owner} prepare refused: an earlier opening with other order keys can still land`,
         );
@@ -204,6 +205,16 @@ export class OpenDesk implements OpenRequests {
           status: 409,
           reason:
             "an earlier account opening for this wallet can still land: try again in about a minute",
+        };
+      }
+      if (verdict === "landed") {
+        this.prepared.delete(owner);
+        await this.settle(() => admission.confirm(earlier.invite));
+        log(`gate: ${owner} prepare refused: the earlier opening had landed, now recorded`);
+        return {
+          ok: false,
+          status: 409,
+          reason: "this address has an account already. Nothing changed",
         };
       }
     }
@@ -286,25 +297,10 @@ export class OpenDesk implements OpenRequests {
         continue;
       }
       const signatures = [...(seat.signatures ?? [])];
-      const lastValid = seat.lastValidBlockHeight ?? 0;
       try {
-        const landed = await session.use(async (connection) => {
-          const height = await connection.getBlockHeight("confirmed");
-          if (height <= lastValid) return null;
-          let unresolved = false;
-          for (const signature of signatures) {
-            const { value } = await connection.getSignatureStatus(signature, {
-              searchTransactionHistory: true,
-            });
-            if (value === null) continue;
-            const { confirmationStatus: level, err } = value;
-            if (!err && (level === "confirmed" || level === "finalized")) return true;
-            // Failed for good only at finalized. Processed, or failed at confirmed, can still be undone.
-            if (!(err && level === "finalized")) unresolved = true;
-          }
-          return unresolved ? null : false;
-        });
-        if (landed === null) continue;
+        const verdict = await reconcileSeat(session, seat, onError);
+        if (verdict === "pending") continue;
+        const landed = verdict === "landed";
         // Something moved while the chain was asked: a newer transaction, a send, or a settled seat.
         const current = this.prepared.get(owner);
         const unchanged =
@@ -377,8 +373,8 @@ export class OpenDesk implements OpenRequests {
         sendDepositAndConfirm(connection, checked.transaction),
       );
       if (this.prepared.get(owner) === request) this.prepared.delete(owner);
-      // The account is open whichever transaction opened it, so the seat is confirmed.
-      await this.settle(() => admission.confirm(request.reservation));
+      // Seen at confirmed at best: the seat stays unconfirmed in the record, with its signatures,
+      // until the sweep sees the transaction at `LANDED_COMMITMENT`.
       log(`gate: ${owner} account opened`);
       return { ok: true, signature };
     } catch (error) {

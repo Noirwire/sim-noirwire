@@ -68,7 +68,7 @@ const serviceWith = async (
     outcome: Outcome;
     blockHeight: number | "down";
     landed: boolean;
-    status: "confirmed" | "processed";
+    status: "processed" | "confirmed" | "finalized";
     /** Held back until released: a send, or the reading of the block height. */
     sendHold: Promise<void> | null;
     heightHold: Promise<void> | null;
@@ -83,7 +83,7 @@ const serviceWith = async (
     /** The chain's block height, and whether a transaction looked up in its history is found. */
     blockHeight: 0,
     landed: false,
-    status: "confirmed",
+    status: "finalized",
     sendHold: null,
     heightHold: null,
   };
@@ -376,11 +376,23 @@ describe("opening an account on mainnet", () => {
   });
 
   it("opens one account per invite: the second try is refused with the reason", async () => {
-    const { owners, prepare, open } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+    const { owners, prepare, open, clock, answer } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
     await open(owners[0]);
 
-    const again = await prepare(owners[0]);
+    const early = await prepare(owners[0]);
+    expect(early.statusCode).toBe(409);
+    expect(errorOf(early)).toContain("can still land");
 
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+    const landed = await prepare(owners[0]);
+    expect(landed.statusCode).toBe(409);
+    expect(errorOf(landed)).toContain("account already");
+
+    const again = await prepare(owners[0]);
     expect(again.statusCode).toBe(409);
     expect(errorOf(again)).toContain("used already");
   });
@@ -515,14 +527,40 @@ describe("opening an account on mainnet", () => {
     expect(errorOf(refused)).toContain("all given out");
   });
 
-  it("counts a seat once when prepare is followed by submit", async () => {
-    const { owners, open, dir } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+  it("counts a seat once when prepare is followed by submit, and records it as opened only once finalized", async () => {
+    const { owners, open, dir, desk, clock, answer } = await serviceWith((o) => everyone(o));
 
     expect((await open(owners[0])).statusCode).toBe(200);
 
     const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
     expect(record.seatsToday(1_000_000)).toBe(1);
-    expect(record.openedFor(owners[0].publicKey.toBase58())?.state).toBe("opened");
+    expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.state).toBe("unconfirmed");
+    expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.signatures).toHaveLength(1);
+
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+    answer.status = "confirmed";
+    await desk.prepare({
+      owner: owners[1].publicKey.toBase58(),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+      ip: "10.0.0.8",
+    });
+    expect(
+      new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)).forInvite(
+        `key:${owners[0].publicKey.toBase58()}`,
+      )?.state,
+    ).toBe("unconfirmed");
+
+    answer.status = "finalized";
+    await desk.prepare({
+      owner: owners[1].publicKey.toBase58(),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+      ip: "10.0.0.8",
+    });
+    const settled = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(settled.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.state).toBe("opened");
+    expect(settled.seatsToday(1_000_000, `key:${owners[1].publicKey.toBase58()}`)).toBe(1);
   });
 
   it("gives no second signed transaction once the invite is taken off the list", async () => {
@@ -662,7 +700,7 @@ describe("opening an account on mainnet", () => {
       "10.0.0.7",
     );
     expect(opened.ok).toBe(true);
-    expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("opened");
+    expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("unconfirmed");
   });
 
   it("writes the signatures down with the seat before the transaction is handed out", async () => {
@@ -719,6 +757,40 @@ describe("opening an account on mainnet", () => {
 
     answer.status = "confirmed";
     await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+
+    answer.status = "finalized";
+    await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened");
+  });
+
+  it("signs nothing for other order keys while an earlier transaction is only processed or confirmed, even past the block height", async () => {
+    const { owners, desk, clock, answer } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+
+    for (const status of ["processed", "confirmed"] as const) {
+      answer.status = status;
+      const other = await desk.prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()));
+      expect(other.ok).toBe(false);
+      if (!other.ok) expect(other.reason).toContain("can still land");
+    }
+  });
+
+  it("records an earlier transaction that finalized and signs nothing for other order keys", async () => {
+    const { owners, desk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+    answer.status = "finalized";
+
+    const other = await desk.prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()));
+
+    expect(other).toMatchObject({ ok: false, status: 409 });
+    if (!other.ok) expect(other.reason).toContain("account already");
     expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened");
   });
 
@@ -813,7 +885,7 @@ describe("opening an account on mainnet", () => {
     expect((await prepare(owners[1], undefined, "10.0.0.8")).statusCode).toBe(503);
     answer.blockHeight = "down";
     expect((await prepare(owners[1], undefined, "10.0.0.8")).statusCode).toBe(503);
-    expect(problems.some((what) => what.includes("settling"))).toBe(true);
+    expect(problems.some((what) => what.includes("reading the chain"))).toBe(true);
 
     const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
     expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.state).toBe("unconfirmed");
@@ -961,8 +1033,8 @@ describe("opening an account on mainnet", () => {
 
     const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
 
-    expect(record.openedFor(owners[0].publicKey.toBase58())?.invite).toBe(
-      `key:${owners[0].publicKey.toBase58()}`,
+    expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.owner).toBe(
+      owners[0].publicKey.toBase58(),
     );
   });
 
