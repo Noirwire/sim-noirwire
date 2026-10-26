@@ -225,7 +225,9 @@ transaction at once.
 Operational note: the rollup reports every executed transaction as finalized, and a
 transaction it never executed as not found. A status lost to a rollup crash or to ledger
 eviction also reads as not found, so the sweep could free a quota place for an account that
-did open. The program's own daily seat limit still caps openings on chain.
+did open, or sign a retry with other order keys for an account that opened with the earlier
+ones (the owner then replaces the order keys from the terminal). The program's own daily seat
+limit still caps openings on chain.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 
