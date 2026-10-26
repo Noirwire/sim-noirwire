@@ -183,12 +183,51 @@ A person opens an account in two requests, like the devnet fund button but with 
 (they deposit their own USDC in a transaction of their own):
 
 1. `POST /v1/open/prepare` with `{ owner, orderKeys: [4 keys], invite? }`. If the rules
-   below say yes, the answer is `{ transaction, expiresAtMs }`: one unsigned transaction
-   whose only instruction is `open_trader`, with the gate as fee payer.
+   below say yes, the answer is `{ transaction, expiresAtMs }`: one transaction whose only
+   instruction is `open_trader`, with the gate as fee payer, already signed by the gate
+   (wallets only leave a transaction alone when it carries a signature) and waiting for
+   the owner's.
 2. `POST /v1/open/submit` with `{ owner, transaction }`, the same transaction signed by
-   the owner. The gate checks it is byte for byte the one it prepared, checks the rules
-   again, writes the seat down on disk, and only then signs and sends it. The answer is
+   the owner. The gate checks it is byte for byte the one it prepared, that the gate's
+   signature is still on it and every signature is valid, checks the rules again, and
+   sends it. The seat was already written down on disk at prepare. The answer is
    `{ reference }`.
+
+A prepared transaction is signed by the gate, so whoever holds it and the owner's
+signature could send it to the rollup without calling submit. That is why the seat is
+written down at prepare, before the signature leaves the service: the day's limit, the
+per-address limit and the invite's single use count it from then on, whichever way it is
+sent. It can only open a seat for that same invited owner, and it expires with its
+blockhash. A second prepare for an owner who holds a seat reuses it, since the program
+opens one seat per owner: the same transaction comes back while it is valid for the same
+order keys, otherwise a fresh one replaces it and the older one is refused at submit.
+
+A transaction that is never submitted keeps its seat reserved until its blockhash can no
+longer land. Then the service asks the chain for the transaction: if it succeeded at
+finalized the seat is recorded as opened; if every signature is not found, or failed at
+finalized, the seat and the invite are freed. If the chain cannot be read, or shows a
+transaction as processed, as succeeded or failed only at confirmed, the seat stays reserved
+and the operator's log says so. The same applies to a transaction that was submitted: the
+caller is answered when the rollup executes it, but the seat is recorded as opened only
+once it is finalized. This runs on the next prepare. The gate's
+signatures and the last valid block height are kept in `gate-seats.json` with the seat, so
+a seat left unsettled by a restart is settled the same way. Prepares are handled one at a
+time, so two asks at once cannot both pass on the same count. A submit while the same
+transaction is being sent is refused with 409. A refusal by the rollup's endpoint at the
+door does not free the seat, because whoever holds the signed bytes can still send them: the
+sweep decides. Neither does a refusal by the program, since a failure seen at confirmed can
+be on a fork that is dropped. Asking again with other order keys (a second device) is
+answered with a 409 until the earlier transactions can no longer land and none is pending,
+about a minute, because one of them could still open the account with its own keys. If one
+had landed at finalized, the answer is a 409 that the account exists. The same keys get a
+transaction at once.
+
+Operational note: the rollup reports every executed transaction as finalized, and a
+transaction it never executed as not found. A status lost to a rollup crash or to ledger
+eviction also reads as not found, so the sweep could free a quota place for an account that
+did open, or sign a retry with other order keys for an account that opened with the earlier
+ones (the owner then replaces the order keys from the terminal). The program's own daily seat
+limit still caps openings on chain.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 
@@ -247,7 +286,7 @@ key and nothing else about the person: no invite code, no network address.
 
 ```
 sim-noirwire: gate: <owner public key> prepare admitted
-sim-noirwire: gate: <owner public key> submit admitted, signing
+sim-noirwire: gate: <owner public key> submit admitted, sending
 sim-noirwire: gate: <owner public key> account opened
 sim-noirwire: gate: <owner public key> prepare refused: this address is not on the invite list. Ask for an invite, then try again
 ```

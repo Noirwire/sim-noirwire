@@ -19,6 +19,14 @@ export interface SeatRecord {
    * the hash is dropped once the UTC day it counts for is over.
    */
   asker?: string;
+  /**
+   * The gate's signature on each transaction handed out for this seat while it is
+   * unconfirmed (each is also the transaction's id on the chain), and the last block
+   * height at which any of them could still land. They are what settles a seat that
+   * was never submitted, also after a restart.
+   */
+  signatures?: string[];
+  lastValidBlockHeight?: number;
 }
 
 interface SeatFile {
@@ -36,6 +44,11 @@ const isRecord = (value: unknown): value is SeatRecord => {
     typeof record.owner === "string" &&
     typeof record.atMs === "number" &&
     (record.asker === undefined || typeof record.asker === "string") &&
+    (record.signatures === undefined ||
+      (Array.isArray(record.signatures) &&
+        record.signatures.every((entry) => typeof entry === "string"))) &&
+    (record.lastValidBlockHeight === undefined ||
+      typeof record.lastValidBlockHeight === "number") &&
     (record.state === "opened" || record.state === "unconfirmed")
   );
 };
@@ -159,16 +172,57 @@ export class SeatLedger {
     );
   }
 
-  /** Records a seat as sent and saves it. Throws if it cannot be saved: nothing may be signed unrecorded. */
+  /** Makes the key the addresses are hashed with, so that `reserve` has nothing to wait for. */
+  async ready(): Promise<void> {
+    await this.ensureKey();
+  }
+
+  /** Seats sent and not confirmed, with the signatures that say whether they landed. */
+  awaitingSettlement(): SeatRecord[] {
+    return this.records.filter(
+      (record) => record.state === "unconfirmed" && (record.signatures?.length ?? 0) > 0,
+    );
+  }
+
+  /**
+   * Records a seat as sent and saves it. Throws if it cannot be saved: nothing may be signed unrecorded.
+   * Call `ready` first: with the key made, the record is in memory before this first waits, so a
+   * decision made just before it cannot be overtaken. The signatures of an earlier try for the same
+   * invite are kept.
+   */
   async reserve(invite: string, owner: string, ip: string, nowMs: number): Promise<void> {
-    const asker = this.askerOf(ip, await this.ensureKey());
-    const before = this.records;
-    this.records = before.filter((record) => record.invite !== invite);
-    this.records.push({ invite, owner, atMs: nowMs, state: "unconfirmed", asker });
+    const asker = this.askerOf(ip, this.key ?? (await this.ensureKey()));
+    const replaced = this.forInvite(invite);
+    const record: SeatRecord = { invite, owner, atMs: nowMs, state: "unconfirmed", asker };
+    if (replaced?.signatures) record.signatures = replaced.signatures;
+    if (replaced?.lastValidBlockHeight !== undefined) {
+      record.lastValidBlockHeight = replaced.lastValidBlockHeight;
+    }
+    this.records = this.records.filter((entry) => entry.invite !== invite);
+    this.records.push(record);
     try {
       await this.save();
     } catch (error) {
-      this.records = before;
+      this.records = this.records.filter((entry) => entry !== record);
+      if (replaced) this.records.push(replaced);
+      throw error;
+    }
+  }
+
+  /** Adds a transaction handed out for this seat. Throws, changing nothing, if it cannot be saved. */
+  async track(invite: string, signature: string, lastValidBlockHeight: number): Promise<void> {
+    const record = this.forInvite(invite);
+    if (!record) throw new Error("no seat is reserved for this invite");
+    const before = {
+      signatures: record.signatures,
+      lastValidBlockHeight: record.lastValidBlockHeight,
+    };
+    record.signatures = [...(record.signatures ?? []), signature];
+    record.lastValidBlockHeight = Math.max(record.lastValidBlockHeight ?? 0, lastValidBlockHeight);
+    try {
+      await this.save();
+    } catch (error) {
+      Object.assign(record, before);
       throw error;
     }
   }
@@ -176,7 +230,11 @@ export class SeatLedger {
   /** The rollup confirmed the seat. */
   async confirm(invite: string): Promise<void> {
     const record = this.forInvite(invite);
-    if (record) record.state = "opened";
+    if (record) {
+      record.state = "opened";
+      delete record.signatures;
+      delete record.lastValidBlockHeight;
+    }
     await this.save();
   }
 
