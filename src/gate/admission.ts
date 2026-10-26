@@ -1,6 +1,6 @@
 import type { Clock } from "../engine/clock.js";
 import type { InviteList } from "./invite-list.js";
-import type { SeatLedger } from "./seat-ledger.js";
+import type { SeatLedger, SeatRecord } from "./seat-ledger.js";
 
 export interface AdmissionLimits {
   /** Seats the gate signs for in a UTC day, before the program's own limit is taken into account. */
@@ -18,6 +18,13 @@ export type Admitted = {
 export type NotAdmitted = { ok: false; status: 403 | 409 | 429 | 503; reason: string };
 
 const NEXT_DAY = "it resets at 00:00 UTC";
+
+export const RECORD_NOT_WRITTEN: NotAdmitted = {
+  ok: false,
+  status: 503,
+  reason:
+    "the gate could not write its seat record, so it signed nothing. Nothing changed: try again, and tell the operator if it keeps happening",
+};
 
 /**
  * Whether the gate may sign `open_trader` for a person: on the invite list,
@@ -95,19 +102,36 @@ export class Admission {
     asker: string,
     programSeatsPerDay: number | null,
   ): Promise<Admitted | NotAdmitted> {
+    try {
+      await this.ledger.ready();
+    } catch {
+      return RECORD_NOT_WRITTEN;
+    }
+    // Nothing waits between this decision and the record being in memory, so two
+    // askers cannot both be admitted on the same count.
     const decision = this.check(owner, code, asker, programSeatsPerDay);
     if (!decision.ok) return decision;
     try {
       await this.ledger.reserve(decision.invite, owner, asker, this.clock.nowMs());
     } catch {
-      return {
-        ok: false,
-        status: 503,
-        reason:
-          "the gate could not write its seat record, so it signed nothing. Nothing changed: try again, and tell the operator if it keeps happening",
-      };
+      return RECORD_NOT_WRITTEN;
     }
     return decision;
+  }
+
+  /** Writes down a transaction handed out for a reserved seat. False if it could not be saved. */
+  async track(invite: string, signature: string, lastValidBlockHeight: number): Promise<boolean> {
+    try {
+      await this.ledger.track(invite, signature, lastValidBlockHeight);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Seats sent and not confirmed that have signatures to look up. */
+  awaitingSettlement(): SeatRecord[] {
+    return this.ledger.awaitingSettlement();
   }
 
   /** The rollup confirmed the seat. */

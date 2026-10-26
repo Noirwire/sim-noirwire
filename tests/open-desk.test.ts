@@ -64,11 +64,22 @@ const serviceWith = async (
   writeFileSync(invitesPath, invites(owners));
   const gate = Keypair.generate();
   const sent: Transaction[] = [];
-  const answer: { outcome: Outcome; blockHeight: number | "down"; landed: boolean } = {
+  const answer: {
+    outcome: Outcome;
+    blockHeight: number | "down";
+    landed: boolean;
+    status: "confirmed" | "processed";
+    /** Held back until released: a send, or the reading of the block height. */
+    sendHold: Promise<void> | null;
+    heightHold: Promise<void> | null;
+  } = {
     outcome: options.outcome ?? "executed",
     /** The chain's block height, and whether a transaction looked up in its history is found. */
     blockHeight: 0,
     landed: false,
+    status: "confirmed",
+    sendHold: null,
+    heightHold: null,
   };
   const connection = {
     rpcEndpoint: "https://rollup.example",
@@ -77,10 +88,12 @@ const serviceWith = async (
       lastValidBlockHeight: 1,
     }),
     sendRawTransaction: async (raw: Buffer) => {
+      await answer.sendHold;
       sent.push(Transaction.from(raw));
       return SIGNATURE;
     },
     getBlockHeight: async () => {
+      await answer.heightHold;
       if (answer.blockHeight === "down") throw new Error("the rollup did not answer");
       return answer.blockHeight;
     },
@@ -90,7 +103,7 @@ const serviceWith = async (
     ) => {
       if (search?.searchTransactionHistory) {
         return {
-          value: answer.landed ? { confirmationStatus: "confirmed", err: null } : null,
+          value: answer.landed ? { confirmationStatus: answer.status, err: null } : null,
         };
       }
       const { outcome } = answer;
@@ -107,22 +120,25 @@ const serviceWith = async (
   const clock = new ManualClock(1_000_000);
   const lines: string[] = [];
   const problems: string[] = [];
-  const admission = new Admission(
-    new InviteList(invitesPath, () => {}),
-    new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)),
-    { perDay: options.perDay ?? 3, perAskerPerDay: options.perIp ?? 1 },
-    clock,
-  );
-  const desk = new OpenDesk({
-    program: new Program(Keypair.generate().publicKey.toBase58()),
-    session: Session.of(connection),
-    gate,
-    admission,
-    exchange: () => (options.exchange === undefined ? EXCHANGE : options.exchange),
-    clock,
-    log: (line) => lines.push(line),
-    onError: (what) => problems.push(what),
-  });
+  const program = new Program(Keypair.generate().publicKey.toBase58());
+  /** A desk with its own admission and seat record read from the file: a restarted service when made again. */
+  const makeDesk = () =>
+    new OpenDesk({
+      program,
+      session: Session.of(connection),
+      gate,
+      admission: new Admission(
+        new InviteList(invitesPath, () => {}),
+        new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)),
+        { perDay: options.perDay ?? 3, perAskerPerDay: options.perIp ?? 1 },
+        clock,
+      ),
+      exchange: () => (options.exchange === undefined ? EXCHANGE : options.exchange),
+      clock,
+      log: (line) => lines.push(line),
+      onError: (what) => problems.push(what),
+    });
+  const desk = makeDesk();
   const config: Config = {
     ...loadConfig({} as NodeJS.ProcessEnv),
     NETWORK: options.network ?? "mainnet",
@@ -196,6 +212,8 @@ const serviceWith = async (
     dir,
     answer,
     clock,
+    desk,
+    makeDesk,
   };
 };
 
@@ -509,6 +527,139 @@ describe("opening an account on mainnet", () => {
     const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
     expect(record.openedFor(owners[0].publicKey.toBase58())?.state).toBe("opened");
     expect(lines.some((line) => line.includes("had landed, recorded"))).toBe(true);
+  });
+
+  const orderKeysOf = () =>
+    Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58());
+  const askFor = (owner: Keypair, ip: string, orderKeys = orderKeysOf()) => ({
+    owner: owner.publicKey.toBase58(),
+    orderKeys,
+    ip,
+  });
+  const everyone = (o: Keypair[]) => o.map((owner) => owner.publicKey.toBase58()).join("\n");
+  const seatsIn = (dir: string) =>
+    new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+  const inviteOf = (owner: Keypair) => `key:${owner.publicKey.toBase58()}`;
+
+  it("signs for one of two owners asking at once from one address", async () => {
+    const { owners, desk } = await serviceWith(everyone, { perIp: 1 });
+
+    const [first, second] = await Promise.all([
+      desk.prepare(askFor(owners[0], "10.0.0.7")),
+      desk.prepare(askFor(owners[1], "10.0.0.7")),
+    ]);
+
+    expect([first.ok, second.ok].filter(Boolean)).toHaveLength(1);
+  });
+
+  it("admits one of two askers at once on the last place of the day, also without the desk", async () => {
+    const dir = join(DIR, `atomic-${counter}`);
+    mkdirSync(dir, { recursive: true });
+    const keys = [Keypair.generate(), Keypair.generate()];
+    const invitesPath = join(dir, "invites.txt");
+    writeFileSync(invitesPath, everyone(keys));
+    const admission = new Admission(
+      new InviteList(invitesPath, () => {}),
+      new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)),
+      { perDay: 1, perAskerPerDay: 1 },
+      new ManualClock(1_000_000),
+    );
+
+    const decisions = await Promise.all(
+      keys.map((key) => admission.admit(key.publicKey.toBase58(), undefined, "10.0.0.7", 5)),
+    );
+
+    expect(decisions.filter((decision) => decision.ok)).toHaveLength(1);
+  });
+
+  it("does not free the seat when an older transaction is refused after a newer one replaced it", async () => {
+    const { owners, desk, answer, signedBy, dir } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+      { outcome: { err: { InstructionError: [0, { Custom: 6000 }] } } },
+    );
+    const owner = owners[0];
+    const older = await desk.prepare(askFor(owner, "10.0.0.7"));
+    if (!older.ok) throw new Error("not prepared");
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+    const sending = desk.submit(
+      owner.publicKey.toBase58(),
+      signedBy(owner, older.transaction),
+      "10.0.0.7",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const newer = await desk.prepare(askFor(owner, "10.0.0.7"));
+    if (!newer.ok) throw new Error("not prepared");
+    answer.sendHold = null;
+    release();
+
+    expect((await sending).ok).toBe(false);
+
+    expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("unconfirmed");
+    answer.outcome = "executed";
+    const opened = await desk.submit(
+      owner.publicKey.toBase58(),
+      signedBy(owner, newer.transaction),
+      "10.0.0.7",
+    );
+    expect(opened.ok).toBe(true);
+    expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("opened");
+  });
+
+  it("writes the signatures down with the seat before the transaction is handed out", async () => {
+    const { owners, desk, dir } = await serviceWith(everyone);
+
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.signatures).toHaveLength(2);
+    expect(seat?.lastValidBlockHeight).toBe(1);
+  });
+
+  it("frees an abandoned seat after a restart when the chain shows it did not land", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone, {
+      perDay: 1,
+    });
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+
+    const restarted = makeDesk();
+    const next = await restarted.prepare(askFor(owners[1], "10.0.0.8"));
+
+    expect(next.ok).toBe(true);
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined();
+  });
+
+  it("records an abandoned seat after a restart when the chain shows it landed", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+
+    await makeDesk().prepare(askFor(owners[1], "10.0.0.8"));
+
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.state).toBe("opened");
+    expect(seat?.signatures).toBeUndefined();
+  });
+
+  it("keeps a seat reserved while the transaction is only processed, and records it once confirmed", async () => {
+    const { owners, desk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+    answer.status = "processed";
+
+    await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+
+    answer.status = "confirmed";
+    await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened");
   });
 
   it("keeps the seat reserved while the blockhash can still land, or the chain cannot be read, and never blocks the owner", async () => {

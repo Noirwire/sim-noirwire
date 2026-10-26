@@ -203,9 +203,13 @@ opens one seat per owner: the same transaction comes back while it is valid for 
 order keys, otherwise a fresh one replaces it and the older one is refused at submit.
 
 A transaction that is never submitted keeps its seat reserved until its blockhash can no
-longer land. Then the service asks the chain for the transaction: if it landed the seat is
-recorded as opened, if not the seat and the invite are freed. If the chain cannot be read,
-the seat stays reserved and the operator's log says so. This runs on the next prepare.
+longer land. Then the service asks the chain for the transaction: if it landed (confirmed
+or finalized) the seat is recorded as opened, if not the seat and the invite are freed. If
+the chain cannot be read, or shows the transaction only as processed, the seat stays
+reserved and the operator's log says so. This runs on the next prepare. The gate's
+signatures and the last valid block height are kept in `gate-seats.json` with the seat, so
+a seat left unsettled by a restart is settled the same way. Prepares are handled one at a
+time, so two asks at once cannot both pass on the same count.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 

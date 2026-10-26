@@ -1,7 +1,7 @@
 import { type Keypair, PublicKey, type Transaction } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
 import { base58Of } from "./base58.js";
-import type { Admission } from "../gate/admission.js";
+import { type Admission, RECORD_NOT_WRITTEN } from "../gate/admission.js";
 import type { Session } from "./connections.js";
 import { refusalOf } from "./fund-desk.js";
 import type { ChainExchange } from "./chain-types.js";
@@ -60,9 +60,6 @@ interface PreparedRequest {
   /** An earlier try for this invite was sent and never confirmed, so its account may exist. */
   afterUnconfirmed: boolean;
   expiresAtMs: number;
-  /** The gate's signature on it and on every transaction it replaced: each is also a transaction id on the chain. */
-  signatures: string[];
-  lastValidBlockHeight: number;
   /** A submit is sending it now. */
   sending: boolean;
 }
@@ -107,14 +104,21 @@ const accountIsThere = (error: unknown): boolean =>
  * the message is byte for byte the prepared one and that every signature on it,
  * the gate's included, is valid, asks the invite list and limits again, and
  * sends it. The seat is confirmed when the rollup executes it and freed when
- * the program refuses it. A prepared transaction that is never submitted may
+ * the program refuses it, unless a newer transaction for the owner has replaced
+ * the one that was refused. A prepared transaction that is never submitted may
  * still land until its blockhash expires; afterwards the chain is asked for
- * its signature: landed means confirmed, not landed means freed. If the chain
- * cannot be read the seat stays reserved. The user deposits in a transaction of
- * their own. Every decision is logged with the owner's public key alone.
+ * its signatures: landed (confirmed or finalized) means confirmed, not landed
+ * means freed. If the chain cannot be read, or only shows the transaction as
+ * processed, the seat stays reserved. The signatures and the last valid block
+ * height are written in the seat record when the transaction is handed out, so
+ * this also settles seats after a restart. Prepares and the sweep run one at a
+ * time, so no decision is made on a count another is about to change. The user
+ * deposits in a transaction of their own. Every decision is logged with the
+ * owner's public key alone.
  */
 export class OpenDesk implements OpenRequests {
   private readonly prepared = new Map<string, PreparedRequest>();
+  private lock: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: OpenDeskOptions) {}
 
@@ -123,8 +127,7 @@ export class OpenDesk implements OpenRequests {
   }
 
   async prepare(request: OpenRequest): Promise<OpenPrepared> {
-    const { program, session, gate, admission, clock, log } = this.options;
-    const { owner, orderKeys, invite, ip } = request;
+    const { owner, orderKeys } = request;
     const ownerKey = publicKeyOf(owner);
     const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
     if (!ownerKey || keys.length !== orderKeys.length) {
@@ -137,6 +140,23 @@ export class OpenDesk implements OpenRequests {
         reason: "the order keys must differ from each other and from the owner",
       };
     }
+    return this.locked(() => this.prepareLocked(request, ownerKey, keys));
+  }
+
+  /** One at a time, so that no decision is made on a count another prepare is about to change. */
+  private locked<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.lock.then(work);
+    this.lock = result.catch(() => {});
+    return result;
+  }
+
+  private async prepareLocked(
+    request: OpenRequest,
+    ownerKey: PublicKey,
+    keys: PublicKey[],
+  ): Promise<OpenPrepared> {
+    const { program, session, gate, admission, clock, log } = this.options;
+    const { owner, orderKeys, invite, ip } = request;
     const now = clock.nowMs();
     await this.settleExpired(now, owner);
     const outstanding = this.prepared.get(owner);
@@ -193,6 +213,18 @@ export class OpenDesk implements OpenRequests {
     const wire = transaction
       .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString("base64");
+    const written = await admission.track(
+      decision.invite,
+      base58Of(gateSignature?.signature ?? new Uint8Array(64)),
+      transaction.lastValidBlockHeight ?? 0,
+    );
+    if (!written) {
+      if (!outstanding && !decision.afterUnconfirmed) {
+        await this.settle(() => admission.release(decision.invite));
+      }
+      log(`gate: ${owner} prepare refused: the seat record could not be written`);
+      return RECORD_NOT_WRITTEN;
+    }
     this.prepared.set(owner, {
       message: transaction.serializeMessage(),
       transaction: wire,
@@ -201,14 +233,6 @@ export class OpenDesk implements OpenRequests {
       reservation: decision.invite,
       afterUnconfirmed: decision.afterUnconfirmed,
       expiresAtMs,
-      signatures: [
-        ...(outstanding?.signatures ?? []),
-        base58Of(gateSignature?.signature ?? new Uint8Array(64)),
-      ],
-      lastValidBlockHeight: Math.max(
-        outstanding?.lastValidBlockHeight ?? 0,
-        transaction.lastValidBlockHeight ?? 0,
-      ),
       sending: false,
     });
     return { ok: true, transaction: wire, expiresAtMs };
@@ -226,24 +250,45 @@ export class OpenDesk implements OpenRequests {
    */
   private async settleExpired(nowMs: number, except: string): Promise<void> {
     const { session, admission, log, onError } = this.options;
-    for (const [owner, request] of [...this.prepared]) {
-      if (owner === except || request.sending || request.expiresAtMs > nowMs) continue;
+    for (const seat of [...admission.awaitingSettlement()]) {
+      const { owner, invite: reservation } = seat;
+      const request = this.prepared.get(owner);
+      if (owner === except || request?.sending || (request && request.expiresAtMs > nowMs)) {
+        continue;
+      }
+      const signatures = [...(seat.signatures ?? [])];
+      const lastValid = seat.lastValidBlockHeight ?? 0;
       try {
         const landed = await session.use(async (connection) => {
           const height = await connection.getBlockHeight("confirmed");
-          if (height <= request.lastValidBlockHeight) return null;
-          for (const signature of request.signatures) {
+          if (height <= lastValid) return null;
+          let unresolved = false;
+          for (const signature of signatures) {
             const { value } = await connection.getSignatureStatus(signature, {
               searchTransactionHistory: true,
             });
-            if (value !== null && !value.err) return true;
+            if (value === null || value.err) continue;
+            if (value.confirmationStatus === "processed") unresolved = true;
+            else return true;
           }
-          return false;
+          return unresolved ? null : false;
         });
         if (landed === null) continue;
+        // Something moved while the chain was asked: a newer transaction, a send, or a settled seat.
+        const current = this.prepared.get(owner);
+        const unchanged =
+          current === request &&
+          !current?.sending &&
+          admission
+            .awaitingSettlement()
+            .some(
+              (entry) =>
+                entry.invite === reservation && entry.signatures?.length === signatures.length,
+            );
+        if (!unchanged) continue;
         this.prepared.delete(owner);
-        if (landed) await this.settle(() => admission.confirm(request.reservation));
-        else await this.settle(() => admission.release(request.reservation));
+        if (landed) await this.settle(() => admission.confirm(reservation));
+        else await this.settle(() => admission.release(reservation));
         log(
           `gate: ${owner} unsubmitted transaction ${landed ? "had landed, recorded" : "never landed, freed"}`,
         );
@@ -293,7 +338,8 @@ export class OpenDesk implements OpenRequests {
       const signature = await session.use((connection) =>
         sendDepositAndConfirm(connection, checked.transaction),
       );
-      this.prepared.delete(owner);
+      if (this.prepared.get(owner) === request) this.prepared.delete(owner);
+      // The account is open whichever transaction opened it, so the seat is confirmed.
       await this.settle(() => admission.confirm(request.reservation));
       log(`gate: ${owner} account opened`);
       return { ok: true, signature };
@@ -303,13 +349,19 @@ export class OpenDesk implements OpenRequests {
       const notOpened = error instanceof DepositRefused || error instanceof ProgramRefused;
       // An answer that the account is there, after a try that was never confirmed, means that try worked.
       const openedBefore = request.afterUnconfirmed && accountIsThere(error);
-      if (openedBefore || notOpened) this.prepared.delete(owner);
-      else {
-        request.sending = false;
-        request.afterUnconfirmed = true;
+      // A newer transaction for this owner depends on the same reservation: a refusal of this older one must not free it.
+      const replaced = this.prepared.get(owner) !== request;
+      if (!replaced) {
+        if (openedBefore || notOpened) this.prepared.delete(owner);
+        else {
+          request.sending = false;
+          request.afterUnconfirmed = true;
+        }
       }
       if (openedBefore) await this.settle(() => admission.confirm(request.reservation));
-      else if (notOpened) await this.settle(() => admission.release(request.reservation));
+      else if (notOpened && !replaced) {
+        await this.settle(() => admission.release(request.reservation));
+      }
       const refusal = refusalOf(error);
       log(
         `gate: ${owner} account ${
