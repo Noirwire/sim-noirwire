@@ -34,9 +34,10 @@ const submitSchema = z.object({
  * returns the one transaction that opens the caller's account (no funds: the
  * caller deposits in a transaction of their own); `submit` takes it back
  * signed by the owner and sends it. The gate signs the transaction at
- * `prepare`, only after the invite list and the day's limits say yes, so a
- * wallet sees it already signed and leaves its message alone; `submit` asks
- * the invite list and the limits again before it sends.
+ * `prepare`, only after the invite list and the day's limits say yes and the
+ * seat is written down, so a wallet sees it already signed and leaves its
+ * message alone; `submit` asks the invite list and the limits again before it
+ * sends.
  */
 export const registerOpenRoutes = (
   app: FastifyInstance,

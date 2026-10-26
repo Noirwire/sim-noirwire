@@ -189,13 +189,23 @@ A person opens an account in two requests, like the devnet fund button but with 
    the owner's.
 2. `POST /v1/open/submit` with `{ owner, transaction }`, the same transaction signed by
    the owner. The gate checks it is byte for byte the one it prepared, that the gate's
-   signature is still on it and every signature is valid, checks the rules again, writes
-   the seat down on disk, and only then sends it. The answer is `{ reference }`.
+   signature is still on it and every signature is valid, checks the rules again, and
+   sends it. The seat was already written down on disk at prepare. The answer is
+   `{ reference }`.
 
 A prepared transaction is signed by the gate, so whoever holds it and the owner's
-signature could send it to the rollup without calling submit. It can only open a seat for
-that same invited owner, it expires with its blockhash, and the program's own daily seat
-limit still counts it; the gate's seat record and per-address counts would not.
+signature could send it to the rollup without calling submit. That is why the seat is
+written down at prepare, before the signature leaves the service: the day's limit, the
+per-address limit and the invite's single use count it from then on, whichever way it is
+sent. It can only open a seat for that same invited owner, and it expires with its
+blockhash. A second prepare for an owner who holds a seat reuses it, since the program
+opens one seat per owner: the same transaction comes back while it is valid for the same
+order keys, otherwise a fresh one replaces it and the older one is refused at submit.
+
+A transaction that is never submitted keeps its seat reserved until its blockhash can no
+longer land. Then the service asks the chain for the transaction: if it landed the seat is
+recorded as opened, if not the seat and the invite are freed. If the chain cannot be read,
+the seat stays reserved and the operator's log says so. This runs on the next prepare.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 

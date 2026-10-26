@@ -64,7 +64,12 @@ const serviceWith = async (
   writeFileSync(invitesPath, invites(owners));
   const gate = Keypair.generate();
   const sent: Transaction[] = [];
-  const answer = { outcome: options.outcome ?? "executed" } satisfies { outcome: Outcome };
+  const answer: { outcome: Outcome; blockHeight: number | "down"; landed: boolean } = {
+    outcome: options.outcome ?? "executed",
+    /** The chain's block height, and whether a transaction looked up in its history is found. */
+    blockHeight: 0,
+    landed: false,
+  };
   const connection = {
     rpcEndpoint: "https://rollup.example",
     getLatestBlockhash: async () => ({
@@ -75,7 +80,19 @@ const serviceWith = async (
       sent.push(Transaction.from(raw));
       return SIGNATURE;
     },
-    getSignatureStatus: async () => {
+    getBlockHeight: async () => {
+      if (answer.blockHeight === "down") throw new Error("the rollup did not answer");
+      return answer.blockHeight;
+    },
+    getSignatureStatus: async (
+      _signature: string,
+      search?: { searchTransactionHistory: boolean },
+    ) => {
+      if (search?.searchTransactionHistory) {
+        return {
+          value: answer.landed ? { confirmationStatus: "confirmed", err: null } : null,
+        };
+      }
       const { outcome } = answer;
       if (outcome === "silent") throw new Error("the rollup did not answer");
       return {
@@ -132,17 +149,20 @@ const serviceWith = async (
   await vi.waitFor(() => expect(activity.phase).toBe("awake"));
   const server = app;
 
-  const prepare = (owner: Keypair, invite?: string, ip = "10.0.0.1") =>
-    server.inject({
+  const keysOf = new Map<string, string[]>();
+  const prepare = (owner: Keypair, invite?: string, ip = "10.0.0.1", freshKeys = false) => {
+    const id = owner.publicKey.toBase58();
+    const orderKeys =
+      (!freshKeys && keysOf.get(id)) ||
+      Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58());
+    keysOf.set(id, orderKeys);
+    return server.inject({
       method: "POST",
       url: "/v1/open/prepare",
       remoteAddress: ip,
-      payload: {
-        owner: owner.publicKey.toBase58(),
-        orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
-        ...(invite ? { invite } : {}),
-      },
+      payload: { owner: id, orderKeys, ...(invite ? { invite } : {}) },
     });
+  };
   const signedBy = (owner: Keypair, prepared: string): string => {
     const transaction = Transaction.from(Buffer.from(prepared, "base64"));
     transaction.partialSign(owner);
@@ -163,7 +183,20 @@ const serviceWith = async (
     return submit(owner, signedBy(owner, JSON.parse(prepared.body).transaction), ip);
   };
 
-  return { owners, gate, sent, lines, problems, prepare, submit, signedBy, open, dir, answer };
+  return {
+    owners,
+    gate,
+    sent,
+    lines,
+    problems,
+    prepare,
+    submit,
+    signedBy,
+    open,
+    dir,
+    answer,
+    clock,
+  };
 };
 
 const errorOf = (response: { body: string }): string => JSON.parse(response.body).error;
@@ -322,22 +355,178 @@ describe("opening an account on mainnet", () => {
     expect(errorOf(again)).toContain("used already");
   });
 
-  it("does not sign a transaction other than the last one it prepared", async () => {
-    const { owners, prepare, submit, sent, lines } = await serviceWith(
+  it("gives the same signed transaction again while one is outstanding, and signs no second one", async () => {
+    const { owners, prepare, dir } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+    const first = JSON.parse((await prepare(owners[0])).body);
+
+    const again = JSON.parse((await prepare(owners[0])).body);
+
+    expect(again.transaction).toBe(first.transaction);
+    expect(again.expiresAtMs).toBe(first.expiresAtMs);
+    expect(
+      new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)).seatsToday(
+        1_000_000,
+      ),
+    ).toBe(1);
+  });
+
+  it("signs a new transaction for other order keys without a second reservation, and refuses the older one", async () => {
+    const { owners, prepare, submit, signedBy, sent, dir } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+      { perDay: 1 },
+    );
+    const first = JSON.parse((await prepare(owners[0])).body).transaction as string;
+
+    const other = await prepare(owners[0], undefined, "10.0.0.1", true);
+
+    expect(other.statusCode).toBe(200);
+    const second = JSON.parse(other.body).transaction as string;
+    expect(second).not.toBe(first);
+    const older = await submit(owners[0], signedBy(owners[0], first));
+    expect(older.statusCode).toBe(400);
+    expect(errorOf(older)).toContain("not the transaction that was prepared");
+    expect(sent).toHaveLength(0);
+    expect((await submit(owners[0], signedBy(owners[0], second))).statusCode).toBe(200);
+    expect(sent).toHaveLength(1);
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.seatsToday(1_000_000)).toBe(1);
+  });
+
+  it("gives the same owner a new transaction after the first expired, with no second reservation", async () => {
+    const { owners, prepare, clock, dir } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+      { perDay: 1 },
+    );
+    const first = JSON.parse((await prepare(owners[0])).body).transaction as string;
+    clock.advance(60_000);
+
+    const retry = await prepare(owners[0]);
+
+    expect(retry.statusCode).toBe(200);
+    expect(JSON.parse(retry.body).transaction).not.toBe(first);
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.seatsToday(1_000_000)).toBe(1);
+  });
+
+  it("still limits a different owner from the same address after the first one's retry", async () => {
+    const { owners, prepare, clock } = await serviceWith(
+      (o) => o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+      { perIp: 1 },
+    );
+    await prepare(owners[0], undefined, "10.0.0.7");
+    clock.advance(60_000);
+    expect((await prepare(owners[0], undefined, "10.0.0.7")).statusCode).toBe(200);
+
+    expect((await prepare(owners[1], undefined, "10.0.0.7")).statusCode).toBe(429);
+  });
+
+  it("limits one network address at prepare, before any transaction is signed", async () => {
+    const { owners, prepare } = await serviceWith(
+      (o) => o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+      { perIp: 1 },
+    );
+    expect((await prepare(owners[0], undefined, "10.0.0.7")).statusCode).toBe(200);
+
+    const refused = await prepare(owners[1], undefined, "10.0.0.7");
+
+    expect(refused.statusCode).toBe(429);
+    expect(refused.body).not.toContain("transaction");
+  });
+
+  it("stops at the day's limit at prepare", async () => {
+    const { owners, prepare } = await serviceWith(
+      (o) => o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+      { perDay: 1, perIp: 5 },
+    );
+    expect((await prepare(owners[0], undefined, "10.0.0.7")).statusCode).toBe(200);
+
+    const refused = await prepare(owners[1], undefined, "10.0.0.8");
+
+    expect(refused.statusCode).toBe(503);
+    expect(errorOf(refused)).toContain("all given out");
+  });
+
+  it("counts a seat once when prepare is followed by submit", async () => {
+    const { owners, open, dir } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+
+    expect((await open(owners[0])).statusCode).toBe(200);
+
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.seatsToday(1_000_000)).toBe(1);
+    expect(record.openedFor(owners[0].publicKey.toBase58())?.state).toBe("opened");
+  });
+
+  it("gives no second signed transaction once the invite is taken off the list", async () => {
+    const { owners, prepare, dir, clock, answer } = await serviceWith(
       (o) => `${o[0].publicKey.toBase58()}\n`,
     );
-    const earlier = JSON.parse((await prepare(owners[0])).body).transaction as string;
     await prepare(owners[0]);
-    const transaction = Transaction.from(Buffer.from(earlier, "base64"));
-    transaction.partialSign(owners[0]);
-    const stale = transaction.serialize({ requireAllSignatures: false }).toString("base64");
+    const path = join(dir, "invites.txt");
+    writeFileSync(path, "");
+    utimesSync(path, new Date(Date.now() + 5_000), new Date(Date.now() + 5_000));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
 
-    const answer = await submit(owners[0], stale);
+    const again = await prepare(owners[0]);
 
-    expect(answer.statusCode).toBe(400);
-    expect(errorOf(answer)).toContain("not the transaction that was prepared");
-    expect(sent).toHaveLength(0);
-    expect(lines.at(-1)).toContain("submit refused");
+    expect(again.statusCode).toBe(403);
+    expect(again.body).not.toContain("transaction");
+  });
+
+  it("frees the seat of a prepared transaction that was never submitted, once its blockhash is past and the chain shows no seat", async () => {
+    const { owners, prepare, clock, answer, dir } = await serviceWith(
+      (o) => o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+      { perDay: 1 },
+    );
+    await prepare(owners[0], undefined, "10.0.0.7");
+    clock.advance(60_000);
+    expect((await prepare(owners[1], undefined, "10.0.0.8")).statusCode).toBe(503);
+    answer.blockHeight = 10;
+    answer.landed = false;
+
+    const next = await prepare(owners[1], undefined, "10.0.0.8");
+
+    expect(next.statusCode).toBe(200);
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)).toBeUndefined();
+    expect(record.seatsToday(1_000_000)).toBe(1);
+  });
+
+  it("records a prepared transaction that was never submitted but landed", async () => {
+    const { owners, prepare, clock, answer, dir, lines } = await serviceWith((o) =>
+      o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+    );
+    await prepare(owners[0], undefined, "10.0.0.7");
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.landed = true;
+
+    await prepare(owners[1], undefined, "10.0.0.8");
+    const again = await prepare(owners[0], undefined, "10.0.0.7");
+
+    expect(again.statusCode).toBe(409);
+    expect(errorOf(again)).toContain("used already");
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.openedFor(owners[0].publicKey.toBase58())?.state).toBe("opened");
+    expect(lines.some((line) => line.includes("had landed, recorded"))).toBe(true);
+  });
+
+  it("keeps the seat reserved while the blockhash can still land, or the chain cannot be read, and never blocks the owner", async () => {
+    const { owners, prepare, clock, answer, dir, problems } = await serviceWith(
+      (o) => o.map((owner) => owner.publicKey.toBase58()).join("\n"),
+      { perDay: 1 },
+    );
+    await prepare(owners[0], undefined, "10.0.0.7");
+    clock.advance(60_000);
+
+    expect((await prepare(owners[1], undefined, "10.0.0.8")).statusCode).toBe(503);
+    answer.blockHeight = "down";
+    expect((await prepare(owners[1], undefined, "10.0.0.8")).statusCode).toBe(503);
+    expect(problems.some((what) => what.includes("settling"))).toBe(true);
+
+    const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
+    expect(record.forInvite(`key:${owners[0].publicKey.toBase58()}`)?.state).toBe("unconfirmed");
+    expect((await prepare(owners[0], undefined, "10.0.0.7")).statusCode).toBe(200);
   });
 
   it("does not sign for someone whose invite was taken off the list after prepare", async () => {
