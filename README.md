@@ -183,12 +183,19 @@ A person opens an account in two requests, like the devnet fund button but with 
 (they deposit their own USDC in a transaction of their own):
 
 1. `POST /v1/open/prepare` with `{ owner, orderKeys: [4 keys], invite? }`. If the rules
-   below say yes, the answer is `{ transaction, expiresAtMs }`: one unsigned transaction
-   whose only instruction is `open_trader`, with the gate as fee payer.
+   below say yes, the answer is `{ transaction, expiresAtMs }`: one transaction whose only
+   instruction is `open_trader`, with the gate as fee payer, already signed by the gate
+   (wallets only leave a transaction alone when it carries a signature) and waiting for
+   the owner's.
 2. `POST /v1/open/submit` with `{ owner, transaction }`, the same transaction signed by
-   the owner. The gate checks it is byte for byte the one it prepared, checks the rules
-   again, writes the seat down on disk, and only then signs and sends it. The answer is
-   `{ reference }`.
+   the owner. The gate checks it is byte for byte the one it prepared, that the gate's
+   signature is still on it and every signature is valid, checks the rules again, writes
+   the seat down on disk, and only then sends it. The answer is `{ reference }`.
+
+A prepared transaction is signed by the gate, so whoever holds it and the owner's
+signature could send it to the rollup without calling submit. It can only open a seat for
+that same invited owner, it expires with its blockhash, and the program's own daily seat
+limit still counts it; the gate's seat record and per-address counts would not.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 
@@ -247,7 +254,7 @@ key and nothing else about the person: no invite code, no network address.
 
 ```
 sim-noirwire: gate: <owner public key> prepare admitted
-sim-noirwire: gate: <owner public key> submit admitted, signing
+sim-noirwire: gate: <owner public key> submit admitted, sending
 sim-noirwire: gate: <owner public key> account opened
 sim-noirwire: gate: <owner public key> prepare refused: this address is not on the invite list. Ask for an invite, then try again
 ```

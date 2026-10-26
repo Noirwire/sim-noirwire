@@ -1,4 +1,4 @@
-import { type Keypair, PublicKey } from "@solana/web3.js";
+import { type Keypair, PublicKey, type Transaction } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
 import type { Admission } from "../gate/admission.js";
 import type { Session } from "./connections.js";
@@ -64,6 +64,11 @@ const publicKeyOf = (value: string): PublicKey | null => {
 
 const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
 
+/** The gate signed this transaction at prepare: its signature must be on it still, and every signature on it must verify. */
+const hasValidGateSignature = (transaction: Transaction, gate: PublicKey): boolean =>
+  transaction.signatures.some((entry) => entry.publicKey.equals(gate) && entry.signature) &&
+  transaction.verifySignatures(true);
+
 /** The program answered that the owner's seat or account is there already. */
 const accountIsThere = (error: unknown): boolean =>
   error instanceof ProgramRefused &&
@@ -73,11 +78,21 @@ const accountIsThere = (error: unknown): boolean =>
  * Opens a new user's account on mainnet, in two steps, for invited people only.
  *
  * `prepare` asks the admission rules first and, if they say yes, builds one
- * transaction that opens a seat for the user's owner key and four order keys.
- * `submit` asks again, writes the seat down, and only then adds the gate's
- * signature to the very transaction that was built and sends it. The user
- * deposits in a transaction of their own. Every decision is logged with the
- * owner's public key alone.
+ * transaction that opens a seat for the user's owner key and four order keys,
+ * and signs it with the gate's key. It is signed here, and not in `submit`,
+ * because wallets add their own instructions only to a transaction that
+ * carries no signature yet, and the terminal refuses a changed message.
+ * `submit` takes the transaction back with the owner's signature, checks that
+ * the message is byte for byte the prepared one and that every signature on it,
+ * the gate's included, is valid, asks the admission rules again, writes the
+ * seat down, and only then sends it. The user deposits in a transaction of
+ * their own. Every decision is logged with the owner's public key alone.
+ *
+ * Because the gate has signed at `prepare`, whoever holds the transaction and
+ * the owner's signature could send it to the rollup without calling `submit`.
+ * That can only open a seat for this same invited owner, for at most the
+ * validity of its blockhash, and the program's own daily seat limit still
+ * counts it. The gate's seat record and per-address counts would not see it.
  */
 export class OpenDesk implements OpenRequests {
   private readonly prepared = new Map<string, PreparedRequest>();
@@ -125,6 +140,7 @@ export class OpenDesk implements OpenRequests {
         orderKeys: keys,
       }),
     );
+    transaction.partialSign(gate);
     const expiresAtMs = now + PREPARED_FOR_MS;
     this.prepared.set(owner, { message: transaction.serializeMessage(), invite, expiresAtMs });
     return {
@@ -156,16 +172,23 @@ export class OpenDesk implements OpenRequests {
       log(`gate: ${owner} submit refused: ${checked.reason}`);
       return { ok: false, status: 400, reason: checked.reason };
     }
+    if (!hasValidGateSignature(checked.transaction, gate.publicKey)) {
+      log(`gate: ${owner} submit refused: the gate's signature is missing or does not match`);
+      return {
+        ok: false,
+        status: 400,
+        reason: "the gate's signature is missing or does not match: prepare again",
+      };
+    }
 
     const decision = await admission.admit(owner, request.invite, ip, this.programSeatsPerDay());
     if (!decision.ok) {
       log(`gate: ${owner} submit refused: ${decision.reason}`);
       return decision;
     }
-    log(`gate: ${owner} submit admitted, signing`);
+    log(`gate: ${owner} submit admitted, sending`);
 
     this.prepared.delete(owner);
-    checked.transaction.partialSign(gate);
     try {
       const signature = await session.use((connection) =>
         sendDepositAndConfirm(connection, checked.transaction),

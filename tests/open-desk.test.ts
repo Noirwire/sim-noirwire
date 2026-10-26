@@ -188,6 +188,106 @@ describe("opening an account on mainnet", () => {
     );
   });
 
+  it("hands out the prepared transaction already signed by the gate, with the owner's slot empty", async () => {
+    const { owners, gate, prepare } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+
+    const prepared = Transaction.from(
+      Buffer.from(JSON.parse((await prepare(owners[0])).body).transaction, "base64"),
+    );
+
+    const slot = (key: Keypair) =>
+      prepared.signatures.find((entry) => entry.publicKey.equals(key.publicKey));
+    expect(slot(gate)?.signature).toBeTruthy();
+    expect(slot(owners[0])?.signature ?? null).toBeNull();
+    expect(prepared.verifySignatures(false)).toBe(true);
+    expect(prepared.verifySignatures(true)).toBe(false);
+  });
+
+  it("refuses a transaction without the owner's signature", async () => {
+    const { owners, prepare, submit, sent } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const prepared = JSON.parse((await prepare(owners[0])).body).transaction as string;
+
+    const answer = await submit(owners[0], prepared);
+
+    expect(answer.statusCode).toBe(400);
+    expect(errorOf(answer)).toContain("owner has not signed");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("refuses a transaction whose message was changed, even if the owner signed the change", async () => {
+    const { owners, prepare, submit, sent } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const prepared = Transaction.from(
+      Buffer.from(JSON.parse((await prepare(owners[0])).body).transaction, "base64"),
+    );
+    const changed = new Transaction({
+      feePayer: prepared.feePayer,
+      blockhash: prepared.recentBlockhash ?? "",
+      lastValidBlockHeight: 1,
+    }).add(...prepared.instructions, prepared.instructions[0]);
+    changed.signatures = prepared.signatures;
+    changed.partialSign(owners[0]);
+
+    const answer = await submit(
+      owners[0],
+      changed
+        .serialize({ requireAllSignatures: false, verifySignatures: false })
+        .toString("base64"),
+    );
+
+    expect(answer.statusCode).toBe(400);
+    expect(errorOf(answer)).toContain("not the transaction that was prepared");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("refuses a transaction whose gate signature was stripped", async () => {
+    const { owners, gate, prepare, submit, sent } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const prepared = Transaction.from(
+      Buffer.from(JSON.parse((await prepare(owners[0])).body).transaction, "base64"),
+    );
+    prepared.signatures = prepared.signatures.map((entry) =>
+      entry.publicKey.equals(gate.publicKey) ? { ...entry, signature: null } : entry,
+    );
+    prepared.partialSign(owners[0]);
+
+    const answer = await submit(
+      owners[0],
+      prepared
+        .serialize({ requireAllSignatures: false, verifySignatures: false })
+        .toString("base64"),
+    );
+
+    expect(answer.statusCode).toBe(400);
+    expect(errorOf(answer)).toContain("gate's signature");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("refuses a transaction whose gate signature was altered", async () => {
+    const { owners, gate, prepare, submit, sent } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const prepared = Transaction.from(
+      Buffer.from(JSON.parse((await prepare(owners[0])).body).transaction, "base64"),
+    );
+    prepared.addSignature(gate.publicKey, Buffer.alloc(64, 9));
+    prepared.partialSign(owners[0]);
+
+    const answer = await submit(
+      owners[0],
+      prepared
+        .serialize({ requireAllSignatures: false, verifySignatures: false })
+        .toString("base64"),
+    );
+
+    expect(answer.statusCode).toBe(400);
+    expect(sent).toHaveLength(0);
+  });
+
   it("turns away an owner that is not invited, with the reason, before anything is built", async () => {
     const { owners, prepare, sent, lines } = await serviceWith(() => "");
 
@@ -356,7 +456,7 @@ describe("opening an account on mainnet", () => {
     expect(lines).toEqual([
       expect.stringContaining(`gate: ${owners[1].publicKey.toBase58()} prepare refused`),
       `gate: ${owner} prepare admitted`,
-      `gate: ${owner} submit admitted, signing`,
+      `gate: ${owner} submit admitted, sending`,
       `gate: ${owner} account opened`,
     ]);
     const text = lines.join("\n");
