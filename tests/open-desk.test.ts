@@ -72,7 +72,13 @@ const serviceWith = async (
     /** Held back until released: a send, or the reading of the block height. */
     sendHold: Promise<void> | null;
     heightHold: Promise<void> | null;
+    /** What the history says about one signature, when it should differ from the rest. */
+    history: Record<string, { confirmationStatus: string; err: unknown } | null>;
+    /** The endpoint refuses the transaction at the door. */
+    door: boolean;
   } = {
+    history: {},
+    door: false,
     outcome: options.outcome ?? "executed",
     /** The chain's block height, and whether a transaction looked up in its history is found. */
     blockHeight: 0,
@@ -89,6 +95,7 @@ const serviceWith = async (
     }),
     sendRawTransaction: async (raw: Buffer) => {
       await answer.sendHold;
+      if (answer.door) throw new Error("429 too many requests");
       sent.push(Transaction.from(raw));
       return SIGNATURE;
     },
@@ -103,7 +110,12 @@ const serviceWith = async (
     ) => {
       if (search?.searchTransactionHistory) {
         return {
-          value: answer.landed ? { confirmationStatus: answer.status, err: null } : null,
+          value:
+            _signature in answer.history
+              ? answer.history[_signature]
+              : answer.landed
+                ? { confirmationStatus: answer.status, err: null }
+                : null,
         };
       }
       const { outcome } = answer;
@@ -660,6 +672,85 @@ describe("opening an account on mainnet", () => {
     answer.status = "confirmed";
     await desk.prepare(askFor(owners[1], "10.0.0.8"));
     expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened");
+  });
+
+  it("sends once: a second submit at the same time is refused", async () => {
+    const { owners, desk, signedBy, sent } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const prepared = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!prepared.ok) throw new Error("not prepared");
+    const owner = owners[0].publicKey.toBase58();
+    const body = signedBy(owners[0], prepared.transaction);
+
+    const answers = await Promise.all([
+      desk.submit(owner, body, "10.0.0.7"),
+      desk.submit(owner, body, "10.0.0.7"),
+    ]);
+
+    expect(answers.map((answer) => (answer.ok ? 200 : answer.status))).toEqual([200, 409]);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("keeps the seat reserved when the endpoint refuses at the door, and lets the sweep free it once the blockhash is past", async () => {
+    const { owners, desk, signedBy, sent, answer, clock, dir } = await serviceWith(everyone, {
+      perDay: 1,
+    });
+    const prepared = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!prepared.ok) throw new Error("not prepared");
+    answer.door = true;
+
+    const refused = await desk.submit(
+      owners[0].publicKey.toBase58(),
+      signedBy(owners[0], prepared.transaction),
+      "10.0.0.7",
+    );
+
+    expect(refused.ok).toBe(false);
+    expect(sent).toHaveLength(0);
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+    expect((await desk.prepare(askFor(owners[0], "10.0.0.7"))).ok).toBe(true);
+    expect((await desk.prepare(askFor(owners[1], "10.0.0.8"))).ok).toBe(false);
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+
+    expect((await desk.prepare(askFor(owners[1], "10.0.0.8"))).ok).toBe(true);
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined();
+  });
+
+  /** Owner 0 abandons transactions with the given statuses for its signatures; true when owner 1 then gets the one place of the day. */
+  const sweepFrees = async (
+    statuses: ({ confirmationStatus: string; err: unknown } | null)[],
+  ): Promise<boolean> => {
+    const { owners, desk, clock, answer, dir } = await serviceWith(everyone, { perDay: 1 });
+    for (let at = 0; at < statuses.length; at += 1) {
+      await desk.prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()));
+    }
+    const signatures = seatsIn(dir).forInvite(inviteOf(owners[0]))?.signatures ?? [];
+    expect(signatures).toHaveLength(statuses.length);
+    signatures.forEach((signature, at) => (answer.history[signature] = statuses[at]));
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    return (await desk.prepare(askFor(owners[1], "10.0.0.8"))).ok;
+  };
+  const FAILED = { InstructionError: [0, { Custom: 6000 }] };
+
+  it("does not free a seat whose transaction failed only as processed", async () => {
+    expect(await sweepFrees([{ confirmationStatus: "processed", err: FAILED }])).toBe(false);
+  });
+
+  it("does not free a seat whose transaction failed only at confirmed", async () => {
+    expect(await sweepFrees([{ confirmationStatus: "confirmed", err: FAILED }])).toBe(false);
+  });
+
+  it("frees a seat whose transaction failed at finalized", async () => {
+    expect(await sweepFrees([{ confirmationStatus: "finalized", err: FAILED }])).toBe(true);
+  });
+
+  it("frees a seat when one transaction failed at finalized and the other was never found, and keeps it when the other is only processed", async () => {
+    const failed = { confirmationStatus: "finalized", err: FAILED };
+    expect(await sweepFrees([failed, null])).toBe(true);
+    expect(await sweepFrees([failed, { confirmationStatus: "processed", err: null }])).toBe(false);
   });
 
   it("keeps the seat reserved while the blockhash can still land, or the chain cannot be read, and never blocks the owner", async () => {

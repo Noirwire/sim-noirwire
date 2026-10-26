@@ -103,13 +103,17 @@ const accountIsThere = (error: unknown): boolean =>
  * `submit` takes the transaction back with the owner's signature, checks that
  * the message is byte for byte the prepared one and that every signature on it,
  * the gate's included, is valid, asks the invite list and limits again, and
- * sends it. The seat is confirmed when the rollup executes it and freed when
- * the program refuses it, unless a newer transaction for the owner has replaced
- * the one that was refused. A prepared transaction that is never submitted may
- * still land until its blockhash expires; afterwards the chain is asked for
- * its signatures: landed (confirmed or finalized) means confirmed, not landed
- * means freed. If the chain cannot be read, or only shows the transaction as
- * processed, the seat stays reserved. The signatures and the last valid block
+ * sends it, once: a second submit while it is being sent is refused. The seat
+ * is confirmed when the rollup executes it and freed when the program refuses
+ * it (the wait returns only at confirmed or finalized), unless a newer
+ * transaction for the owner has replaced the one that was refused. A refusal at
+ * the door frees nothing, since whoever holds the signed bytes can still send
+ * them. That, and a transaction that is never submitted, may still land until
+ * its blockhash expires; afterwards the chain is asked for its signatures:
+ * executed at confirmed or finalized means the seat is confirmed; every
+ * signature not found, or failed at finalized, means it is freed. Anything else
+ * (processed, a failure only at confirmed, a chain that cannot be read) keeps
+ * the seat reserved until the next sweep. The signatures and the last valid block
  * height are written in the seat record when the transaction is handed out, so
  * this also settles seats after a restart. Prepares and the sweep run one at a
  * time, so no decision is made on a count another is about to change. The user
@@ -267,9 +271,11 @@ export class OpenDesk implements OpenRequests {
             const { value } = await connection.getSignatureStatus(signature, {
               searchTransactionHistory: true,
             });
-            if (value === null || value.err) continue;
-            if (value.confirmationStatus === "processed") unresolved = true;
-            else return true;
+            if (value === null) continue;
+            const { confirmationStatus: level, err } = value;
+            if (!err && (level === "confirmed" || level === "finalized")) return true;
+            // Failed for good only at finalized. Processed, or failed at confirmed, can still be undone.
+            if (!(err && level === "finalized")) unresolved = true;
           }
           return unresolved ? null : false;
         });
@@ -306,6 +312,13 @@ export class OpenDesk implements OpenRequests {
         ok: false,
         status: 410,
         reason: "nothing is prepared for this owner: prepare again",
+      };
+    }
+    if (request.sending) {
+      return {
+        ok: false,
+        status: 409,
+        reason: "this account opening is already being sent, wait for it",
       };
     }
     const checked = checkSubmitted(
@@ -345,21 +358,24 @@ export class OpenDesk implements OpenRequests {
       return { ok: true, signature };
     } catch (error) {
       onError("opening a user's account failed", error);
-      // Refused at the door or by the program: it did not open. Anything else may have.
-      const notOpened = error instanceof DepositRefused || error instanceof ProgramRefused;
+      // The program ran it and refused, seen at confirmed or finalized (the wait only returns then): the signature is spent, it did not open.
+      const programRefused = error instanceof ProgramRefused;
+      // A refusal at the door proves nothing: whoever holds the signed bytes can still send them. Only the sweep decides.
+      const doorRefused = error instanceof DepositRefused;
       // An answer that the account is there, after a try that was never confirmed, means that try worked.
       const openedBefore = request.afterUnconfirmed && accountIsThere(error);
       // A newer transaction for this owner depends on the same reservation: a refusal of this older one must not free it.
       const replaced = this.prepared.get(owner) !== request;
+      const settledNow = openedBefore || programRefused;
       if (!replaced) {
-        if (openedBefore || notOpened) this.prepared.delete(owner);
+        if (settledNow) this.prepared.delete(owner);
         else {
           request.sending = false;
           request.afterUnconfirmed = true;
         }
       }
       if (openedBefore) await this.settle(() => admission.confirm(request.reservation));
-      else if (notOpened && !replaced) {
+      else if (programRefused && !replaced) {
         await this.settle(() => admission.release(request.reservation));
       }
       const refusal = refusalOf(error);
@@ -367,12 +383,14 @@ export class OpenDesk implements OpenRequests {
         `gate: ${owner} account ${
           openedBefore
             ? "was opened by an earlier try, now recorded"
-            : notOpened
+            : programRefused
               ? "not opened"
-              : "may or may not be open"
+              : doorRefused
+                ? "refused at the door, its seat stays reserved until it can no longer land"
+                : "may or may not be open"
         }: ${refusal.reason}`,
       );
-      return notOpened
+      return programRefused || doorRefused
         ? refusal
         : {
             ok: false,
