@@ -401,11 +401,12 @@ describe("opening an account on mainnet", () => {
   });
 
   it("signs a new transaction for other order keys without a second reservation, and refuses the older one", async () => {
-    const { owners, prepare, submit, signedBy, sent, dir } = await serviceWith(
+    const { owners, prepare, submit, signedBy, sent, dir, answer } = await serviceWith(
       (o) => `${o[0].publicKey.toBase58()}\n`,
       { perDay: 1 },
     );
     const first = JSON.parse((await prepare(owners[0])).body).transaction as string;
+    answer.blockHeight = 10;
 
     const other = await prepare(owners[0], undefined, "10.0.0.1", true);
 
@@ -420,6 +421,44 @@ describe("opening an account on mainnet", () => {
     expect(sent).toHaveLength(1);
     const record = new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000));
     expect(record.seatsToday(1_000_000)).toBe(1);
+  });
+
+  it("signs nothing for other order keys while an earlier transaction can still land", async () => {
+    const { owners, prepare, answer } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`);
+    await prepare(owners[0]);
+
+    const other = await prepare(owners[0], undefined, "10.0.0.1", true);
+
+    expect(other.statusCode).toBe(409);
+    expect(errorOf(other)).toContain("can still land");
+    expect(other.body).not.toContain("transaction");
+    answer.blockHeight = "down";
+    expect((await prepare(owners[0], undefined, "10.0.0.1", true)).statusCode).toBe(409);
+  });
+
+  it("signs nothing for other order keys after a restart while the earlier transaction can still land", async () => {
+    const { owners, desk, makeDesk, answer } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+
+    const other = await makeDesk().prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()));
+
+    expect(other.ok).toBe(false);
+    answer.blockHeight = 10;
+    expect((await makeDesk().prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()))).ok).toBe(true);
+  });
+
+  it("gives the same order keys a new transaction after expiry, without reading the block height", async () => {
+    const { owners, prepare, answer, clock } = await serviceWith(
+      (o) => `${o[0].publicKey.toBase58()}\n`,
+    );
+    const first = JSON.parse((await prepare(owners[0])).body).transaction as string;
+    clock.advance(60_000);
+    answer.blockHeight = "down";
+
+    const again = await prepare(owners[0]);
+
+    expect(again.statusCode).toBe(200);
+    expect(JSON.parse(again.body).transaction).not.toBe(first);
   });
 
   it("gives the same owner a new transaction after the first expired, with no second reservation", async () => {
@@ -543,7 +582,15 @@ describe("opening an account on mainnet", () => {
 
   const orderKeysOf = () =>
     Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58());
-  const askFor = (owner: Keypair, ip: string, orderKeys = orderKeysOf()) => ({
+  const keysByOwner = new Map<string, string[]>();
+  /** The order keys of one device: the same for an owner each time, unless other ones are passed. */
+  const keysFor = (owner: Keypair): string[] => {
+    const id = owner.publicKey.toBase58();
+    const keys = keysByOwner.get(id) ?? orderKeysOf();
+    keysByOwner.set(id, keys);
+    return keys;
+  };
+  const askFor = (owner: Keypair, ip: string, orderKeys = keysFor(owner)) => ({
     owner: owner.publicKey.toBase58(),
     orderKeys,
     ip,
@@ -619,9 +666,10 @@ describe("opening an account on mainnet", () => {
   });
 
   it("writes the signatures down with the seat before the transaction is handed out", async () => {
-    const { owners, desk, dir } = await serviceWith(everyone);
+    const { owners, desk, dir, clock } = await serviceWith(everyone);
 
     await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
     await desk.prepare(askFor(owners[0], "10.0.0.7"));
 
     const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
@@ -724,7 +772,8 @@ describe("opening an account on mainnet", () => {
   ): Promise<boolean> => {
     const { owners, desk, clock, answer, dir } = await serviceWith(everyone, { perDay: 1 });
     for (let at = 0; at < statuses.length; at += 1) {
-      await desk.prepare(askFor(owners[0], "10.0.0.7", orderKeysOf()));
+      await desk.prepare(askFor(owners[0], "10.0.0.7"));
+      clock.advance(60_000);
     }
     const signatures = seatsIn(dir).forInvite(inviteOf(owners[0]))?.signatures ?? [];
     expect(signatures).toHaveLength(statuses.length);
@@ -824,8 +873,8 @@ describe("opening an account on mainnet", () => {
     expect(errorOf(refused)).toContain("still starting");
   });
 
-  it("frees the invite when the program refuses with its daily limit, and says so", async () => {
-    const { owners, open, prepare } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`, {
+  it("says so when the program refuses with its daily limit, keeps the seat reserved until the sweep, and lets the owner ask again", async () => {
+    const { owners, open, prepare, dir, desk, clock, answer } = await serviceWith(everyone, {
       outcome: { err: { InstructionError: [0, { Custom: PROGRAM_DAILY_LIMIT_ERROR }] } },
     });
 
@@ -833,7 +882,12 @@ describe("opening an account on mainnet", () => {
 
     expect(refused.statusCode).toBe(503);
     expect(errorOf(refused)).toContain("daily limit reached");
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
     expect((await prepare(owners[0])).statusCode).toBe(200);
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined();
   });
 
   it("keeps the seat of an account that opened although its confirmation was lost, when a retry is told it exists", async () => {
@@ -862,18 +916,24 @@ describe("opening an account on mainnet", () => {
     expect((await prepare(owners[0])).statusCode).toBe(409);
   });
 
-  it("frees the invite when a first try, with nothing unconfirmed before it, is told the account exists", async () => {
-    const { owners, open, dir } = await serviceWith((o) => `${o[0].publicKey.toBase58()}\n`, {
+  it("keeps the seat reserved when a first try is told the account exists, until the sweep frees it", async () => {
+    const { owners, open, dir, desk, clock, answer } = await serviceWith(everyone, {
       outcome: { err: { InstructionError: [0, { Custom: 6113 }] } },
     });
 
     expect((await open(owners[0])).statusCode).toBe(409);
 
-    expect(
-      new SeatLedger(join(dir, "gate-seats.json"), new ManualClock(1_000_000)).seatsToday(
-        1_000_000,
-      ),
-    ).toBe(0);
+    expect(seatsIn(dir).seatsToday(1_000_000)).toBe(1);
+    clock.advance(60_000);
+    answer.blockHeight = 10;
+    answer.history = Object.fromEntries(
+      (seatsIn(dir).forInvite(inviteOf(owners[0]))?.signatures ?? []).map((signature) => [
+        signature,
+        { confirmationStatus: "finalized", err: { InstructionError: [0, { Custom: 6113 }] } },
+      ]),
+    );
+    await desk.prepare(askFor(owners[1], "10.0.0.8"));
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined();
   });
 
   it("logs one line per decision, with the public key and nothing else about the person", async () => {

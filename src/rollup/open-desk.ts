@@ -98,17 +98,20 @@ const accountIsThere = (error: unknown): boolean =>
  * invite's single use hold either way. A second `prepare` for an owner who
  * holds a reservation reuses it, since the program opens one seat per owner:
  * the same transaction comes back while it is valid for the same order keys,
- * otherwise a fresh one replaces it and the older one no longer matches.
+ * and a fresh one for the same keys replaces it once it has expired. For other
+ * order keys nothing is signed until the earlier transactions can no longer
+ * land (the chain's block height is past their last valid one), because one of
+ * them could still open the account with its own keys; until then the answer
+ * is a 409, also when the block height cannot be read.
  *
  * `submit` takes the transaction back with the owner's signature, checks that
  * the message is byte for byte the prepared one and that every signature on it,
  * the gate's included, is valid, asks the invite list and limits again, and
  * sends it, once: a second submit while it is being sent is refused. The seat
- * is confirmed when the rollup executes it and freed when the program refuses
- * it (the wait returns only at confirmed or finalized), unless a newer
- * transaction for the owner has replaced the one that was refused. A refusal at
- * the door frees nothing, since whoever holds the signed bytes can still send
- * them. That, and a transaction that is never submitted, may still land until
+ * is confirmed when the rollup executes it. A refusal frees nothing at once,
+ * whether at the door (whoever holds the signed bytes can still send them) or
+ * by the program (a failure seen at confirmed can be on an abandoned fork).
+ * Those, and a transaction that is never submitted, may still land until
  * its blockhash expires; afterwards the chain is asked for its signatures:
  * executed at confirmed or finalized means the seat is confirmed; every
  * signature not found, or failed at finalized, means it is freed. Anything else
@@ -181,6 +184,28 @@ export class OpenDesk implements OpenRequests {
         transaction: outstanding.transaction,
         expiresAtMs: outstanding.expiresAtMs,
       };
+    }
+
+    // Other order keys than an earlier transaction that can still land: that one could open the
+    // account with its own keys, so the new one waits until the earlier ones can no longer land.
+    const earlier = admission.awaitingSettlement().find((seat) => seat.invite === asked.invite);
+    if (earlier && outstanding?.orderKeys !== orderKeys.join(",")) {
+      const lastValid = earlier.lastValidBlockHeight ?? 0;
+      const past = await session
+        .use((connection) => connection.getBlockHeight("confirmed"))
+        .then((height) => height > lastValid)
+        .catch(() => false);
+      if (!past) {
+        log(
+          `gate: ${owner} prepare refused: an earlier opening with other order keys can still land`,
+        );
+        return {
+          ok: false,
+          status: 409,
+          reason:
+            "an earlier account opening for this wallet can still land: try again in about a minute",
+        };
+      }
     }
 
     // The program opens one seat per owner, so a new transaction for an owner who
@@ -358,36 +383,30 @@ export class OpenDesk implements OpenRequests {
       return { ok: true, signature };
     } catch (error) {
       onError("opening a user's account failed", error);
-      // The program ran it and refused, seen at confirmed or finalized (the wait only returns then): the signature is spent, it did not open.
+      // A refusal proves nothing final: at the door, whoever holds the signed bytes can still send them, and a
+      // failure seen at confirmed can still be on an abandoned fork. Only the sweep frees the seat.
       const programRefused = error instanceof ProgramRefused;
-      // A refusal at the door proves nothing: whoever holds the signed bytes can still send them. Only the sweep decides.
       const doorRefused = error instanceof DepositRefused;
       // An answer that the account is there, after a try that was never confirmed, means that try worked.
       const openedBefore = request.afterUnconfirmed && accountIsThere(error);
       // A newer transaction for this owner depends on the same reservation: a refusal of this older one must not free it.
       const replaced = this.prepared.get(owner) !== request;
-      const settledNow = openedBefore || programRefused;
       if (!replaced) {
-        if (settledNow) this.prepared.delete(owner);
+        if (openedBefore) this.prepared.delete(owner);
         else {
           request.sending = false;
           request.afterUnconfirmed = true;
         }
       }
       if (openedBefore) await this.settle(() => admission.confirm(request.reservation));
-      else if (programRefused && !replaced) {
-        await this.settle(() => admission.release(request.reservation));
-      }
       const refusal = refusalOf(error);
       log(
         `gate: ${owner} account ${
           openedBefore
             ? "was opened by an earlier try, now recorded"
-            : programRefused
-              ? "not opened"
-              : doorRefused
-                ? "refused at the door, its seat stays reserved until it can no longer land"
-                : "may or may not be open"
+            : programRefused || doorRefused
+              ? "refused, its seat stays reserved until it can no longer land"
+              : "may or may not be open"
         }: ${refusal.reason}`,
       );
       return programRefused || doorRefused

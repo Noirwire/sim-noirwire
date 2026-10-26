@@ -212,7 +212,11 @@ a seat left unsettled by a restart is settled the same way. Prepares are handled
 time, so two asks at once cannot both pass on the same count. A submit while the same
 transaction is being sent is refused with 409. A refusal by the rollup's endpoint at the
 door does not free the seat, because whoever holds the signed bytes can still send them: the
-sweep decides. A refusal by the program, seen at confirmed or finalized, frees it at once.
+sweep decides. Neither does a refusal by the program, since a failure seen at confirmed can
+be on a fork that is dropped. Asking again with other order keys (a second device) is
+answered with a 409 until the earlier transactions can no longer land, about a minute,
+because one of them could still open the account with its own keys; the same keys get a
+transaction at once.
 
 The rules, in the order they are checked. A refusal says why in `error` and what to do:
 
