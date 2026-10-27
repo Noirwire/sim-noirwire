@@ -12,8 +12,13 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
-import { ORDER_EXPIRY_TOO_NEAR, rejectedOrder, unknownOrder } from "../engine/venue-orders.js";
-import { withinDeadline } from "../scheduling/deadline.js";
+import {
+  ORDER_EXPIRY_TOO_NEAR,
+  rejectedOrder,
+  unknownOrder,
+  unrunOrder,
+} from "../engine/venue-orders.js";
+import { DeadlineExceeded, withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
 import { BotOrderSecrets, originOf } from "./bot-orders.js";
@@ -470,6 +475,8 @@ export class RollupVenue implements Venue {
       // Once the order was handed to the program it may still fill, and its fills are told by this secret.
       if (dispatched) return unknownOrder(orderId, NO_TAG, order, reason);
       this.secrets.retire(secret, Date.now());
+      // Not handed to the program by the deadline, and `abandoned` now stops it ever being: it never ran.
+      if (error instanceof DeadlineExceeded) return unrunOrder(orderId, NO_TAG, order, reason);
       return rejectedOrder(orderId, NO_TAG, order, reason);
     }
     if (outcome.settled) outcome = await this.onceSettled(outcome.settled);

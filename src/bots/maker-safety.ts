@@ -155,6 +155,7 @@ export class MakerSafety {
   /** Whether the next resting ladder is said at once: at the start, after a stop, after a pull that was said. */
   private restingOwed = true;
   private restingSaidAtMs = -Infinity;
+  private abandonSaidAtMs = -Infinity;
   /** The exchange readings the newest reference left out of its median. */
   private leftOut: string[] = [];
   private hedgeStatus: HedgeStatus = "ok";
@@ -234,6 +235,16 @@ export class MakerSafety {
     const bestAsk = asks.length > 0 ? `best ask ${dollarsOf(asks.reduce(minBigInt))}` : "no ask";
     this.options.voice.notice(
       `${this.options.market} maker resting: ${bestBid}, ${bestAsk}, ${orders.length} orders${leftOut}`,
+    );
+  }
+
+  /** A ladder was dropped because an order of it never ran: said at most once a minute, however often it happens. */
+  ladderAbandoned(reason: string | undefined, inARow: number): void {
+    const now = this.options.clock.nowMs();
+    if (now - this.abandonSaidAtMs < SAY_AGAIN_MS) return;
+    this.abandonSaidAtMs = now;
+    this.options.voice.notice(
+      `${this.options.market} maker dropped a ladder, an order never ran (${reason || "no reason given"}), ${inARow} in a row. It quotes again on the next tick.`,
     );
   }
 

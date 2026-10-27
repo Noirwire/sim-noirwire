@@ -71,6 +71,11 @@ export interface PlaceResult {
    * needs the truth reconciles before it sends or cancels anything else.
    */
   outcomeUnknown?: true;
+  /**
+   * Set with a `rejected` status when the order provably never ran, for a cause that passes by itself
+   * (its transaction window ran out). A caller may drop the rest of its batch and send again later.
+   */
+  didNotRun?: true;
 }
 
 export interface Fill {

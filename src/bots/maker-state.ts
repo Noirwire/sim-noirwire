@@ -56,6 +56,8 @@ export interface MakerState {
   spotBaseAtStart: bigint | null;
   /** An order of unknown outcome that still holds the maker back, or null. */
   hold: UnresolvedHold | null;
+  /** Ladders in a row dropped because their orders never ran, kept so a restart does not start the count over. */
+  unrunLadders: number;
 }
 
 const amount = z
@@ -74,6 +76,8 @@ const fileSchema = z.object({
   lastCommandAtMs: z.number(),
   spotBaseAtStart: amount,
   hold: holdSchema.nullable().default(null),
+  /** A missing or invalid count reads as none: it never blocks a start. */
+  unrunLadders: z.number().int().min(0).catch(0),
   /** Whether the saved stop was asked for. A file from before the field counts a saved stop as asked for. */
   hardStop: z.boolean().optional(),
 });
@@ -88,6 +92,7 @@ const FRESH: MakerState = {
   lastCommandAtMs: 0,
   spotBaseAtStart: null,
   hold: null,
+  unrunLadders: 0,
 };
 
 export const isMissing = (error: unknown): boolean =>

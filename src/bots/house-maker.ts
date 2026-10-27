@@ -92,6 +92,16 @@ export class QuotesHeld extends Error {
   }
 }
 
+/** Ladders kept failing because an order provably never ran: the cause is not passing, so the maker stops. */
+export class UnrunOrdersRepeated extends Error {
+  constructor(inARow: number, lastReason: string) {
+    super(
+      `${inARow} ladders in a row were dropped because an order never ran, the last: ${lastReason}`,
+    );
+    this.name = "UnrunOrdersRepeated";
+  }
+}
+
 /** The venue answered an order with a refusal the maker does not recognise as routine. */
 export class OrderRefused extends Error {
   constructor(market: MarketId, reason: string | undefined) {
@@ -285,6 +295,8 @@ export class HouseMaker {
   private standing = true;
   /** Whether the operator has been told that a cancel is unconfirmed. */
   private cancelAlerted = false;
+  /** Ladders in a row dropped because an order never ran; a ladder that went out in full ends the run. */
+  private unrunLadders = 0;
   /** Counts every withdrawal, so a tick that was running through one stops placing orders. */
   private epoch = 0;
   /**
@@ -300,6 +312,7 @@ export class HouseMaker {
     this.expiresInSeconds =
       Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
     this.hold = options.ledger?.state.hold ?? null;
+    this.unrunLadders = options.ledger?.state.unrunLadders ?? 0;
   }
 
   /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
@@ -531,6 +544,7 @@ export class HouseMaker {
     let sawUnknown = false;
     let cutShort = false;
     let tooLate = false;
+    let unrunReason: string | undefined;
     try {
       for (const order of orders) {
         if (epoch !== this.epoch) {
@@ -560,6 +574,10 @@ export class HouseMaker {
           break;
         }
         if (!safety || placed.status !== "rejected") continue;
+        if (placed.didNotRun) {
+          unrunReason = placed.reason || "no reason given";
+          break;
+        }
         if (!isRoutineRefusal(sent, placed.reason)) {
           throw new OrderRefused(this.options.market, placed.reason);
         }
@@ -578,6 +596,20 @@ export class HouseMaker {
       await this.abandonLadder(venue, dispatching);
       return;
     }
+    if (unrunReason !== undefined && !sawUnknown) {
+      await this.abandonLadder(venue, dispatching);
+      this.unrunLadders += 1;
+      safety?.ladderAbandoned(unrunReason, this.unrunLadders);
+      if (this.unrunLadders >= MAKER_LIMITS.unrunLaddersBeforeStop) {
+        const repeated = new UnrunOrdersRepeated(this.unrunLadders, unrunReason);
+        this.unrunLadders = 0;
+        await this.options.ledger?.update({ unrunLadders: 0 }).catch(() => {});
+        await this.stopAfter(venue, repeated).catch(() => {});
+        throw repeated;
+      }
+      await this.options.ledger?.update({ unrunLadders: this.unrunLadders });
+      return;
+    }
     if (dispatching && this.hold === null) await this.clearDispatch(venue);
     if (cutShort) return;
     if (sawUnknown) {
@@ -593,7 +625,13 @@ export class HouseMaker {
     }
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
-    if (orders.length > 0) safety?.requoteSucceeded();
+    if (orders.length > 0) {
+      if (this.unrunLadders > 0) {
+        this.unrunLadders = 0;
+        await this.options.ledger?.update({ unrunLadders: 0 });
+      }
+      safety?.requoteSucceeded();
+    }
     if (resting.length > 0 && !next.reduceOnly) safety?.ladderResting(resting);
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
