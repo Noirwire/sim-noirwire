@@ -524,6 +524,8 @@ export class HouseMaker {
     // A flattening send under a hold extends that hold, and the orders it places are added to it.
     const heldSend = orders.length > 0 && !dispatching && flattening && this.hold !== null;
     const sentIds: string[] = [];
+    /** The orders the venue reports as standing: a post-only order it cancelled does not rest. */
+    const resting: NewOrder[] = [];
     let leftOut = 0;
     let unknownReason: string | undefined;
     let sawUnknown = false;
@@ -549,6 +551,10 @@ export class HouseMaker {
           break;
         }
         if (placed.status !== "rejected") sentIds.push(placed.orderId);
+        const stands =
+          (placed.status === "open" || placed.status === "partiallyFilled") &&
+          placed.remainingSize > 0n;
+        if (stands) resting.push({ ...order, size: placed.remainingSize });
         if (placed.status === "rejected" && placed.reason === ORDER_EXPIRY_TOO_NEAR) {
           tooLate = true;
           break;
@@ -588,7 +594,7 @@ export class HouseMaker {
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
     if (orders.length > 0) safety?.requoteSucceeded();
-    if (orders.length > 0 && !next.reduceOnly) safety?.ladderResting(orders);
+    if (resting.length > 0 && !next.reduceOnly) safety?.ladderResting(resting);
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
 

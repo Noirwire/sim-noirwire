@@ -31,7 +31,8 @@ import {
   requestMode,
 } from "../src/bots/maker-control.js";
 import { MakerRisk } from "../src/bots/maker-risk.js";
-import { MakerSafety, worstEquity } from "../src/bots/maker-safety.js";
+import { MAKER_LIMITS } from "../src/bots/maker-limits.js";
+import { MakerSafety, PriceHistory, worstEquity } from "../src/bots/maker-safety.js";
 import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
@@ -107,11 +108,15 @@ describe("the reference price", () => {
     const fresh = [pyth, reading("Coinbase", 150.1, now), reading("OKX", 150.3, now)];
     const kept = referenceOf(fresh, [], now);
     const old = referenceOf([...fresh, reading("Kraken", 140, now - 11_000)], [], now);
-    expect(old).toEqual(kept);
-    expect(old).toEqual({ ok: true, price: dollars(150.1) });
+    expect(kept).toEqual({ ok: true, price: dollars(150.1) });
+    expect(old).toEqual({
+      ok: true,
+      price: dollars(150.1),
+      leftOut: ["Kraken left out, 11 s old"],
+    });
 
     const ahead = referenceOf([...fresh, reading("Kraken", 140, now + 11_000)], [], now);
-    expect(ahead).toEqual(kept);
+    expect(ahead).toMatchObject({ ok: true, price: dollars(150.1) });
 
     const tenSeconds = referenceOf([...fresh, reading("Kraken", 150, now - 10_000)], [], now);
     expect(tenSeconds.ok).toBe(true);
@@ -342,6 +347,8 @@ class Book {
   rejectedCount = 0;
   /** Once this many orders stand, the venue refuses a resting order as too near its expiry, sending nothing. */
   refusesTooLateAfter: number | null = null;
+  /** The venue answers every order as cancelled, as it does a post-only order that did not rest. */
+  cancelsPostOnly = false;
   /** The venue answers every order as rejected but possibly executed, giving this reason. */
   unknownBecause: string | null = null;
   beforePlacing: (() => Promise<void>) | null = null;
@@ -412,6 +419,15 @@ class Book {
             filledSize: 0n,
             remainingSize: order.size,
             reason: ORDER_EXPIRY_TOO_NEAR,
+          };
+        }
+        if (this.cancelsPostOnly) {
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "cancelled",
+            filledSize: 0n,
+            remainingSize: 0n,
           };
         }
         if (this.rejecting !== null) {
@@ -588,6 +604,33 @@ describe("a house maker's quotes expire by themselves", () => {
   });
 });
 
+describe("the price history across a gap", () => {
+  const SECOND = 1_000;
+  const across = (gapMs: number, before: number, after: number): number => {
+    const history = new PriceHistory();
+    history.record(0, dollars(before));
+    history.record(gapMs, dollars(after));
+    // Read a moment after the new price, so the old one is just outside the 10 s window.
+    return history.rangeBps(10 * SECOND, gapMs + 1);
+  };
+
+  it("does not bridge a gap of exactly 10 s, and bridges one a millisecond longer", () => {
+    expect(across(10 * SECOND, 100, 101)).toBe(0);
+    expect(across(10 * SECOND + 1, 100, 101)).toBeCloseTo(100, 5);
+  });
+
+  it("bridges a gap near the minute the history keeps, and no longer", () => {
+    expect(across(59 * SECOND, 100, 101)).toBeCloseTo(100, 5);
+    expect(across(60 * SECOND, 100, 101)).toBeCloseTo(100, 5);
+    expect(across(60 * SECOND + 1, 100, 101)).toBe(0);
+  });
+
+  it("reads a fall across the gap as a move, just as a rise", () => {
+    expect(across(30 * SECOND, 100, 99)).toBeGreaterThan(MAKER_LIMITS.moveBps);
+    expect(across(30 * SECOND, 100, 101)).toBeGreaterThan(MAKER_LIMITS.moveBps);
+  });
+});
+
 describe("a house maker's reference price", () => {
   it("quotes around the reference price, not around the mark", async () => {
     const { warmUp, book, feed } = await rig("centre");
@@ -670,6 +713,50 @@ describe("a house maker's reference price", () => {
     expect(resting()).toHaveLength(1);
     for (let second = 0; second < 15; second += 1) await tick();
     expect(resting()).toHaveLength(2);
+  });
+
+  it("says nothing rests when the venue cancelled every order, and counts only the orders that stand", async () => {
+    const { warmUp, book, tick, said } = await rig("resting-cancelled");
+    const resting = () => said.notices.filter((line) => line.includes("maker resting"));
+    book.cancelsPostOnly = true;
+
+    await warmUp();
+    expect(resting()).toHaveLength(0);
+
+    book.cancelsPostOnly = false;
+    for (let second = 0; second < 10; second += 1) await tick();
+    expect(resting()).toHaveLength(1);
+    expect(resting()[0]).toContain("6 orders");
+  });
+
+  it("names the exchange readings the median left out in the resting line", async () => {
+    const { warmUp, feed, said } = await rig("resting-left-out");
+    feed.reference = { ok: true, price: dollars(150), leftOut: ["Kraken left out, 11 s old"] };
+
+    await warmUp();
+
+    expect(said.notices.filter((line) => line.includes("maker resting"))).toEqual([
+      expect.stringMatching(/, 6 orders \(Kraken left out, 11 s old\)$/),
+    ]);
+  });
+
+  it("does not print a line per flip when the reference alternates between good and bad", async () => {
+    const { warmUp, feed, tick, said } = await rig("flapping");
+    await warmUp();
+    const before = said.notices.length;
+
+    for (let second = 0; second < 58; second += 1) {
+      feed.reference =
+        second % 2 === 0
+          ? { ok: false, reason: "the Pyth price is 31 s old" }
+          : { ok: true, price: dollars(150) };
+      await tick();
+    }
+
+    const lines = said.notices.slice(before);
+    expect(lines.filter((line) => line.includes("pulled its quotes"))).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("maker resting")).length).toBeLessThanOrEqual(2);
+    expect(lines.length).toBeLessThanOrEqual(3);
   });
 
   it("says that a ladder rests again after a pull, and says a long pull once a minute", async () => {

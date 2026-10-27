@@ -19,7 +19,9 @@ export interface ReferenceSource {
   read(): Promise<PriceReading>;
 }
 
-export type Reference = { ok: true; price: bigint } | { ok: false; reason: string };
+export type Reference =
+  /** `leftOut` names the stale exchange readings that were dropped from the median, with their age. */
+  { ok: true; price: bigint; leftOut?: string[] } | { ok: false; reason: string };
 
 export type FetchJson = (url: string) => Promise<unknown>;
 
@@ -239,7 +241,14 @@ export const referenceOf = (
     const bps = Number((widest * BPS * 10n) / middle) / 10;
     return { ok: false, reason: `the price sources are ${bps} bps apart` };
   }
-  return { ok: true, price: middle };
+  if (staleExchanges.length === 0) return { ok: true, price: middle };
+  return {
+    ok: true,
+    price: middle,
+    leftOut: staleExchanges.map(
+      (reading) => `${reading.source} left out, ${seconds(reading)} s old`,
+    ),
+  };
 };
 
 /** Reads every source at once, and hands what came back to `referenceOf`. */

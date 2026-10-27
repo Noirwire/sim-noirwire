@@ -151,10 +151,12 @@ export class MakerSafety {
   /** The newest reference price that was good, kept for the loss limits while the reference is down. */
   private lastGood: GoodReference | null = null;
   private pulled = false;
-  private pullSaidAtMs = 0;
-  /** Whether a resting ladder has been said aloud since the last pull or start. */
-  private restingSaid = false;
-  private restingSaidAtMs = 0;
+  private pullSaidAtMs = -Infinity;
+  /** Whether the next resting ladder is said at once: at the start, after a stop, after a pull that was said. */
+  private restingOwed = true;
+  private restingSaidAtMs = -Infinity;
+  /** The exchange readings the newest reference left out of its median. */
+  private leftOut: string[] = [];
   private hedgeStatus: HedgeStatus = "ok";
   /** Whether the keeper's problem has been said aloud and not yet cleared. */
   private keeperAlerted = false;
@@ -181,6 +183,7 @@ export class MakerSafety {
 
     if (!reference.ok) return this.pull(reference.reason);
     this.history.record(now, reference.price);
+    this.leftOut = reference.leftOut ?? [];
     const lag = bpsApart(mark, reference.price);
     if (lag > MAKER_LIMITS.markLagPullBps) {
       return this.pull(
@@ -189,7 +192,7 @@ export class MakerSafety {
       );
     }
     if (this.history.oldestAgeMs(now) < MAKER_LIMITS.moveWindowMs) {
-      return this.pull("it is watching the price for 10 s before it quotes");
+      return this.pull("it is watching the price for 10 s before it quotes", true);
     }
     const moved = this.history.rangeBps(MAKER_LIMITS.moveWindowMs, now);
     if (moved > MAKER_LIMITS.moveBps) {
@@ -202,7 +205,6 @@ export class MakerSafety {
     const keeperDown = this.followKeeper();
     const widenForHedge = hedge === "lagging" ? HEDGE_LIMITS.laggingExtraSpreadBps : 0;
     const reduceOnly = risk.mode !== "run" || hedge === "blind" || keeperDown;
-    if (reduceOnly) this.restingSaid = false;
     return {
       action: "quote",
       centre: reference.price,
@@ -213,14 +215,17 @@ export class MakerSafety {
   }
 
   /**
-   * A full ladder of `orders` is resting. Said aloud the first time after the start or a pull, and
-   * then at most once a minute, so an operator can tell a ladder stands without a line per requote.
+   * `orders`, which the venue reports as resting, are the ladder that stands. Said aloud at the
+   * first one after the start, after a stop, or after a pull that was said, and otherwise at most
+   * once a minute since the last such line, however often the maker flips between pulled and
+   * quoting. It names the exchanges the median left out, so a quiet source is not invisible.
    */
   ladderResting(orders: NewOrder[]): void {
     const now = this.options.clock.nowMs();
-    if (this.restingSaid && now - this.restingSaidAtMs < SAY_AGAIN_MS) return;
-    this.restingSaid = true;
+    if (!this.restingOwed && now - this.restingSaidAtMs < SAY_AGAIN_MS) return;
+    this.restingOwed = false;
     this.restingSaidAtMs = now;
+    const leftOut = this.leftOut.length > 0 ? ` (${this.leftOut.join("; ")})` : "";
     const prices = (side: NewOrder["side"]): bigint[] =>
       orders.filter((order) => order.side === side).map((order) => order.price ?? 0n);
     const bids = prices("buy");
@@ -228,7 +233,7 @@ export class MakerSafety {
     const bestBid = bids.length > 0 ? `best bid ${dollarsOf(bids.reduce(maxBigInt))}` : "no bid";
     const bestAsk = asks.length > 0 ? `best ask ${dollarsOf(asks.reduce(minBigInt))}` : "no ask";
     this.options.voice.notice(
-      `${this.options.market} maker resting: ${bestBid}, ${bestAsk}, ${orders.length} orders`,
+      `${this.options.market} maker resting: ${bestBid}, ${bestAsk}, ${orders.length} orders${leftOut}`,
     );
   }
 
@@ -358,20 +363,25 @@ export class MakerSafety {
 
   private stop(): Plan {
     this.history.clear();
-    this.restingSaid = false;
+    this.restingOwed = true;
     return { action: "stop" };
   }
 
-  /** Said when the pull starts, and again at most once a minute while it goes on, whatever its reason is by then. */
-  private pull(reason: string): Plan {
+  /**
+   * Said at most once a minute since the last pull line, whether the pull is new or goes on and
+   * whatever its reason is by then, so a feed that flips between good and bad cannot flood the log.
+   */
+  private pull(reason: string, watching = false): Plan {
     const now = this.options.clock.nowMs();
-    this.restingSaid = false;
-    if (!this.pulled || now - this.pullSaidAtMs >= SAY_AGAIN_MS) {
+    // The watch after a cold start is said when it begins and does not use up the minute of the pull lines.
+    const due = watching ? !this.pulled : now - this.pullSaidAtMs >= SAY_AGAIN_MS;
+    if (due) {
       const still = this.pulled ? " (still pulled)" : "";
       this.options.voice.notice(
         `${this.options.market} maker pulled its quotes${still}: ${reason}`,
       );
-      this.pullSaidAtMs = now;
+      if (!watching) this.pullSaidAtMs = now;
+      this.restingOwed = true;
     }
     this.pulled = true;
     return { action: "pull", reason };
