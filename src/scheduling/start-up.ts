@@ -1,7 +1,9 @@
 import { firstLine } from "../logging/first-line.js";
-import { backoffDelayMs, waitFor } from "./backoff.js";
+import { type Backoff, backoffDelayMs, waitFor } from "./backoff.js";
 
 export interface StartUpOptions {
+  /** How long each wait before a retry is; `ROLLUP_BACKOFF` when absent. */
+  backoff?: Backoff;
   /** The one-time work. Every step of it is safe to run again after a failure. */
   work(): Promise<void>;
   /** A failure that is thrown, ending the start-up, instead of retried. */
@@ -79,7 +81,7 @@ export class StartUp {
         return;
       }
       if (this.options.isFatal?.(failed.error)) throw failed.error;
-      const retryInMs = backoffDelayMs(failures);
+      const retryInMs = backoffDelayMs(failures, this.options.backoff);
       const { error } = failed;
       this.lastProblem = firstLine(error);
       this.options.onFailure(error, failures, retryInMs);

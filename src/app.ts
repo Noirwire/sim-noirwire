@@ -17,7 +17,7 @@ import { JupiterPriceSource } from "./prices/jupiter-price-source.js";
 import { MARKETS_PRICED_BY, NVDAX_MINT, SOL_MINT } from "./prices/mints.js";
 import type { PriceSource } from "./prices/price-source.js";
 import { NetworkMismatch } from "./rollup/connections.js";
-import { waitFor } from "./scheduling/backoff.js";
+import { MAINNET_WAKE_BACKOFF, waitFor } from "./scheduling/backoff.js";
 import { type Repeating, every, idleWithin } from "./scheduling/repeating.js";
 import { StartUp } from "./scheduling/start-up.js";
 import { HedgeNotAvailable, type OpenedBots, openBots } from "./wiring/bots.js";
@@ -172,6 +172,7 @@ export const startApp = async (
   };
 
   const startUp = new StartUp({
+    backoff: isMainnet(config) ? MAINNET_WAKE_BACKOFF : undefined,
     work: async () => {
       await wiring.prepare();
       hedgeVenue ??= await hedgeVenueFor(config);
@@ -239,6 +240,7 @@ export const startApp = async (
     idleAfterMs: config.IDLE_AFTER_MS,
     idleAfterLastSocketMs: config.IDLE_AFTER_LAST_SOCKET_MS,
     onError: logError,
+    wakeBackoff: isMainnet(config) ? MAINNET_WAKE_BACKOFF : undefined,
     onDemand: () => startUp.demand(),
   });
 

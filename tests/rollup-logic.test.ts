@@ -294,12 +294,58 @@ describe("the funding desk when the transaction does not go through", () => {
     expect(reason).not.toContain("secret");
   });
 
-  it("reports any other refusal by the program as an account that was not opened", async () => {
+  it("names the cause of a refused opening in plain words, as a 503 and not as an account that exists", async () => {
+    const causes: [number, string][] = [
+      [6030, "the exchange is paused"],
+      [6013, "the exchange has no free seat left"],
+      [6103, "the exchange does not list this gate"],
+      [6106, "the payment for the new account is below the rent it needs"],
+    ];
+    for (const [code, cause] of causes) {
+      const funded = await submitWith({
+        send: async () => "signature",
+        err: { InstructionError: [0, { Custom: code }] },
+      });
+      expect(funded).toEqual({
+        ok: false,
+        status: 503,
+        reason: `${cause}: no account can be opened right now. Nothing was opened.`,
+      });
+    }
+  });
+
+  it("names any other refusal by the program", async () => {
     const funded = await submitWith({
       send: async () => "signature",
       err: { InstructionError: [0, { Custom: 6003 }] },
     });
-    expect(funded).toMatchObject({ ok: false, status: 409 });
+    expect(funded).toEqual({
+      ok: false,
+      status: 503,
+      reason: "the exchange refused the opening: InvalidMarketParams. Nothing was opened.",
+    });
+  });
+
+  it("keeps the 409 for a seat or account that is there already", async () => {
+    for (const code of [6014, 6113]) {
+      const funded = await submitWith({
+        send: async () => "signature",
+        err: { InstructionError: [0, { Custom: code }] },
+      });
+      expect(funded).toMatchObject({ ok: false, status: 409 });
+    }
+  });
+
+  it("names a refusal without a program error number", async () => {
+    const funded = await submitWith({
+      send: async () => "signature",
+      err: "InsufficientFundsForFee",
+    });
+    expect(funded).toEqual({
+      ok: false,
+      status: 503,
+      reason: "the exchange refused the opening: unnamed program error. Nothing was opened.",
+    });
   });
 });
 

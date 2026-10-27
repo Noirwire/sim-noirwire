@@ -40,6 +40,8 @@ const REFERENCE_BASE_TOKEN = "SOL";
 /** A read of the venue's markets, or of the keeper's heartbeat file, that takes longer than this counts as failed. */
 const MARKETS_READ_DEADLINE_MS = 10_000;
 const MARKET_NOT_READ_YET = "the market has not been read yet";
+/** A maker with no quotes resting for longer than this while the service is awake makes trading not ready. */
+const MAKER_SILENT_NOT_READY_MS = 60_000;
 
 /** `read`'s answer, or an error once the deadline passes. An answer that comes later is dropped. */
 const readWithinDeadline = <T>(
@@ -363,12 +365,15 @@ export const openBots = async (
       else quotesRefused.delete(id);
     }
   };
+  /** When the loops last started: silence before a wake is not counted against the maker. */
+  let awakeSinceMs = systemClock.nowMs();
   // With no maker there is nothing to quote and trading has nothing to be not ready about, so there is nothing to watch.
   const watch =
     botMarkets.length > 0
       ? new TradingWatch(() => trading(), makerVoice(problems), systemClock)
       : null;
   const start = (): Repeating[] => {
+    awakeSinceMs = systemClock.nowMs();
     const loops = [
       ...makers.map((maker, at) =>
         loop(`${botMarkets[at].id} maker tick`, config.HOUSE_MAKER_TICK_MS, () =>
@@ -446,6 +451,23 @@ export const openBots = async (
         ? [`${botMarkets[at].id} maker's cancel is not confirmed, so its quotes may still stand`]
         : [],
     );
+  // A maker that is stopped or held by an unknown order is reported as that, not a second time as silent.
+  const silentMakers = (): string[] => {
+    const nowMs = systemClock.nowMs();
+    return makers.flatMap((maker, at) => {
+      const silence = maker.notQuoting;
+      const reported =
+        ledgers.some(
+          ({ market, ledger }) => market === botMarkets[at].id && ledger.state.mode === "stopped",
+        ) || maker.quarantinedSinceMs !== null;
+      if (!silence || reported) return [];
+      const silentMs = nowMs - Math.max(silence.sinceMs, awakeSinceMs);
+      if (silentMs <= MAKER_SILENT_NOT_READY_MS) return [];
+      return [
+        `${botMarkets[at].id} maker has had no quotes resting for ${Math.floor(silentMs / 1_000)} s: ${silence.because}`,
+      ];
+    });
+  };
   const readinessOf = (problems: string[]): TradingReadiness =>
     problems.length === 0 ? { ready: true } : { ready: false, reason: problems.join("; ") };
   // With no maker nothing polls the heartbeat and there is nothing to quote, so it is not asked.
@@ -464,6 +486,7 @@ export const openBots = async (
           : [`${botMarkets[at].id} maker is held by an order of unknown outcome`],
       ),
       ...unconfirmedCancels(),
+      ...silentMakers(),
       ...hedges
         .filter(({ controller }) => controller.status() === "blind")
         .map(({ market }) => `${market} hedge is blind`),

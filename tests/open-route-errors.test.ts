@@ -92,7 +92,7 @@ describe("the pace at which the open desk is asked", () => {
     expect((await waiting).statusCode).toBe(200);
   });
 
-  it("takes one prepare at a time: a second one while one is under way is told the desk is busy", async () => {
+  it("makes a second prepare wait for the one under way instead of turning it away", async () => {
     let release: () => void = () => {};
     let asked = 0;
     const { prepare } = await serviceWith({
@@ -106,15 +106,43 @@ describe("the pace at which the open desk is asked", () => {
 
     const first = prepare();
     await vi.waitFor(() => expect(asked).toBe(1));
-    const second = await prepare();
-    release();
+    const second = prepare();
+    setTimeout(() => release(), 300);
 
-    expect(second.statusCode).toBe(503);
-    expect(JSON.parse(second.body).error).toContain("busy");
     expect((await first).statusCode).toBe(200);
-    expect(asked).toBe(1);
-    expect((await prepare()).statusCode).toBe(200);
+    expect((await second).statusCode).toBe(200);
+    expect(asked).toBe(2);
   });
+
+  it(
+    "takes one prepare at a time: a second one still waiting after 5 s is told the desk is busy",
+    { timeout: 20_000 },
+    async () => {
+      let release: () => void = () => {};
+      let asked = 0;
+      const { prepare } = await serviceWith({
+        prepare: async () => {
+          asked += 1;
+          if (asked === 1) await new Promise<void>((resolve) => (release = resolve));
+          return { ok: true, transaction: "dHg=", expiresAtMs: 2_000_000 };
+        },
+        submit: async () => ({ ok: true, signature: "x" }),
+      });
+
+      const first = prepare();
+      await vi.waitFor(() => expect(asked).toBe(1));
+      const started = Date.now();
+      const second = await prepare();
+      release();
+
+      expect(Date.now() - started).toBeGreaterThanOrEqual(4_900);
+      expect(second.statusCode).toBe(503);
+      expect(JSON.parse(second.body).error).toContain("busy");
+      expect((await first).statusCode).toBe(200);
+      expect(asked).toBe(1);
+      expect((await prepare()).statusCode).toBe(200);
+    },
+  );
 });
 
 describe("the open desk's errors", () => {

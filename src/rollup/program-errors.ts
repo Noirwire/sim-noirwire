@@ -182,6 +182,17 @@ export const SEAT_ALREADY_OPEN_ERROR = 6014;
 /** `AccountExists`: the account the transaction creates is there already. */
 export const ACCOUNT_EXISTS_ERROR = 6113;
 
+/** `SeatTableFull`: the exchange has no free seat to give. */
+export const SEAT_TABLE_FULL_ERROR = 6013;
+
+/** `ExchangePaused`: the exchange takes no new actions while paused. */
+export const EXCHANGE_PAUSED_ERROR = 6030;
+
+/** `GateMissing`: the exchange has no gate listed, or not this one. */
+export const GATE_MISSING_ERROR = 6103;
+
+/** `BelowRent`: a payment is below the rent the account it creates needs. */
+export const BELOW_RENT_ERROR = 6106;
 /** The program's name for error number `code`, or a plain description when it has none here. */
 export const programErrorName = (code: number): string =>
   PROGRAM_ERROR_NAMES[code] ?? "unnamed program error";

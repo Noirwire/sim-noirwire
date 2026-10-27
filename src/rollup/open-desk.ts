@@ -329,7 +329,8 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
 
     // Other order keys than an earlier transaction that can still land: that one could open the
     // account with its own keys, so the new one waits until the earlier ones can no longer land.
-    const earlier = admission.awaitingSettlement().find((seat) => seat.invite === asked.invite);
+    // Found by owner key, not by invite: the same owner may be invited by key and by code.
+    const earlier = admission.unconfirmedFor(owner);
     if (earlier && outstanding?.orderKeys !== orderKeys.join(",")) {
       const verdict = await reconcileSeat(session, earlier, onError);
       if (verdict === "pending") {
@@ -353,13 +354,21 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
           reason: "this address has an account already. Nothing changed",
         };
       }
+      // Not landed, under another invite: the new seat takes its place, so the owner holds one.
+      if (earlier.invite !== asked.invite) {
+        this.prepared.delete(owner);
+        await this.settle(() => admission.release(earlier.invite));
+      }
     }
 
+    // What the owner still holds a reservation for: not an earlier one that was just given up.
+    const held = this.prepared.get(owner);
     // The program opens one seat per owner, so a new transaction for an owner who
     // holds a reservation cannot widen any limit: the reservation is reused.
-    const decision = outstanding
+    // A prepare only holds a reservation: the day's limits count it once it is submitted.
+    const decision = held
       ? { ...asked, afterUnconfirmed: true }
-      : await admission.admit(owner, invite, ip, this.programSeatsPerDay());
+      : await admission.admit(owner, invite, ip, this.programSeatsPerDay(), true);
     if (!decision.ok) {
       log(`gate: ${owner} prepare refused: ${decision.reason}`);
       return decision;
@@ -377,7 +386,7 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
       );
     } catch (error) {
       // Nothing was signed, so nothing can have opened, unless an earlier try for this invite did.
-      if (!outstanding && !decision.afterUnconfirmed)
+      if (!held && !decision.afterUnconfirmed)
         await this.settle(() => admission.release(decision.invite));
       throw error;
     }
@@ -397,7 +406,7 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
       transaction.lastValidBlockHeight ?? 0,
     );
     if (!written) {
-      if (!outstanding && !decision.afterUnconfirmed) {
+      if (!held && !decision.afterUnconfirmed) {
         await this.settle(() => admission.release(decision.invite));
       }
       log(`gate: ${owner} prepare refused: the seat record could not be written`);
@@ -584,9 +593,17 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
       log(`gate: ${owner} submit refused: ${decision.reason}`);
       return decision;
     }
+    // The seat counts toward the day's limits from here, in the same turn as the check above:
+    // two submits cannot both pass the same count.
+    const committed = admission.commit(decision.invite);
+    request.sending = true;
+    if (!(await committed)) {
+      request.sending = false;
+      log(`gate: ${owner} submit refused: the seat record could not be written`);
+      return RECORD_NOT_WRITTEN;
+    }
     log(`gate: ${owner} submit admitted, sending`);
 
-    request.sending = true;
     try {
       const signature = await session.use((connection) =>
         sendDepositAndConfirm(connection, checked.transaction),
@@ -770,7 +787,8 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
     }
 
     // An earlier opening with other order keys that can still land would open the account with its own keys.
-    const earlier = admission.awaitingSettlement().find((seat) => seat.invite === asked.invite);
+    // Found by owner key, not by invite: the same owner may be invited by key and by code.
+    const earlier = admission.unconfirmedFor(owner);
     if (earlier && request.sentOrderKeys !== request.orderKeys) {
       const verdict = await reconcileSeat(session, earlier, onError);
       if (verdict === "pending") {
@@ -794,6 +812,9 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
           reason: "this address has an account already. Nothing changed",
         };
       }
+      // Not landed, under another invite: the new seat takes its place, so the owner holds one.
+      if (earlier.invite !== asked.invite)
+        await this.settle(() => admission.release(earlier.invite));
     }
 
     const decision = await admission.admit(owner, request.invite, ip, this.programSeatsPerDay());

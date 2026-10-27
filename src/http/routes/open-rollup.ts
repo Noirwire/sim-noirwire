@@ -7,6 +7,8 @@ import { deskUnavailable } from "./desk-availability.js";
 
 const DESK_UNREACHABLE = "the rollup did not answer, try again";
 const DESK_BUSY = "the desk is busy with another request, try again";
+/** How long a prepare waits for the one under way before it is told the desk is busy. */
+const PREPARE_WAIT_MS = 5_000;
 const ORDER_KEYS_PER_TRADER = 4;
 /** Well above an open transaction in base64, well below anything worth parsing. */
 const MAX_TRANSACTION_CHARS = 4_096;
@@ -81,7 +83,35 @@ export const registerOpenRoutes = (
    * send per owner, and it may wait for the rollup to confirm for many seconds, which must not
    * turn other people's prepares and submits away.
    */
-  let preparing = false;
+  let preparing: Promise<void> | null = null;
+
+  /**
+   * Waits up to `PREPARE_WAIT_MS` for the prepare under way, then takes its place; null when it is
+   * still going after that. Whoever wakes first takes the turn, the others wait for that one.
+   */
+  const takeTurn = async (): Promise<(() => void) | null> => {
+    const deadline = Date.now() + PREPARE_WAIT_MS;
+    while (preparing) {
+      const leftMs = deadline - Date.now();
+      if (leftMs <= 0) return null;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        preparing,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, leftMs);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+    let done: () => void = () => {};
+    preparing = new Promise<void>((resolve) => {
+      done = resolve;
+    });
+    return () => {
+      preparing = null;
+      done();
+    };
+  };
 
   /** The desk's answer, or null when it failed: the failure is logged, and the caller is only told to retry. */
   const asked = async <T>(what: string, ask: () => Promise<T>): Promise<T | null> => {
@@ -100,16 +130,21 @@ export const registerOpenRoutes = (
     if (!parsed.success) {
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
-    const reason = deskUnavailable(ctx) ?? (preparing ? DESK_BUSY : null);
-    if (reason) return reply.status(503).send({ error: reason });
+    const unavailable = deskUnavailable(ctx);
+    if (unavailable) return reply.status(503).send({ error: unavailable });
+    const finished = await takeTurn();
+    if (!finished) return reply.status(503).send({ error: DESK_BUSY });
+    // The desk may have become unavailable while this prepare waited.
+    const nowUnavailable = deskUnavailable(ctx);
+    if (nowUnavailable) {
+      finished();
+      return reply.status(503).send({ error: nowUnavailable });
+    }
 
-    preparing = true;
     const ask = { ...parsed.data, ip: request.ip };
     const prepared = await asked("opening an account (prepare)", async () =>
       signedDesk ? signedDesk.prepareMessage(ask) : desk.prepare(ask),
-    ).finally(() => {
-      preparing = false;
-    });
+    ).finally(finished);
     if (!prepared) return reply.status(502).send({ error: DESK_UNREACHABLE });
     if (!prepared.ok) return reply.status(prepared.status).send({ error: prepared.reason });
     if (!("transaction" in prepared)) {

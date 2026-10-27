@@ -1,5 +1,5 @@
 import { firstLine } from "../logging/first-line.js";
-import { retryWithBackoff } from "../scheduling/backoff.js";
+import { type Backoff, retryWithBackoff } from "../scheduling/backoff.js";
 
 /**
  * "asleep": nothing is sent to the rollup. "waking": a request or a socket
@@ -22,6 +22,8 @@ export interface ActivityOptions {
   /** How long after the last socket closes the service stays awake: long enough for a page reload. */
   idleAfterLastSocketMs: number;
   onError(what: string, error: unknown): void;
+  /** How long a failed wake waits before it tries again; the rollup's usual backoff when absent. */
+  wakeBackoff?: Backoff;
   /** Called on every request or socket that asks for activity, awake or not. */
   onDemand?(): void;
 }
@@ -144,6 +146,7 @@ export class Activity {
     const { lifecycle, onError } = this.options;
     this.wakePending = false;
     const done = await retryWithBackoff(() => lifecycle.wake(), {
+      backoff: this.options.wakeBackoff,
       keepTrying: () => this.wanted(),
       onFailure: (error) => {
         this.failure = firstLine(error);

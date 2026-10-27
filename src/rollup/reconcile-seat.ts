@@ -1,7 +1,7 @@
 import type { SeatRecord } from "../gate/seat-ledger.js";
 import type { Session } from "./connections.js";
 
-/** How final a success must be before the gate takes the seat as opened. */
+/** How final a success must be before the gate takes the seat as opened, while its block height can still be reached. */
 export const LANDED_COMMITMENT = "finalized";
 
 export type SeatVerdict = "pending" | "landed" | "not-landed";
@@ -13,7 +13,8 @@ export type SeatVerdict = "pending" | "landed" | "not-landed";
  *   last valid one), one is unresolved (a success below `LANDED_COMMITMENT`,
  *   anything at processed, a failure only at confirmed), or the chain could
  *   not be read.
- * - "landed": one of them succeeded at `LANDED_COMMITMENT`.
+ * - "landed": one of them succeeded at `LANDED_COMMITMENT` or, the block
+ *   height being past the last valid one, at confirmed.
  * - "not-landed": the block height is past the last valid one and every
  *   transaction is absent or failed at finalized.
  *
@@ -37,7 +38,8 @@ export const reconcileSeat = async (
         });
         if (value === null) continue;
         const { confirmationStatus: level, err } = value;
-        if (!err && level === LANDED_COMMITMENT) return "landed";
+        // The block height is past the last valid one, so a success seen at confirmed settles it too.
+        if (!err && (level === LANDED_COMMITMENT || level === "confirmed")) return "landed";
         if (!(err && level === "finalized")) unresolved = true;
       }
       return unresolved ? "pending" : "not-landed";

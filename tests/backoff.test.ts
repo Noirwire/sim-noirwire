@@ -3,7 +3,11 @@ import type { Connection } from "@solana/web3.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProblemLog } from "../src/logging/problem-log.js";
 import { backOffReconnects } from "../src/rollup/connections.js";
-import { backoffDelayMs, retryWithBackoff } from "../src/scheduling/backoff.js";
+import {
+  MAINNET_WAKE_BACKOFF,
+  backoffDelayMs,
+  retryWithBackoff,
+} from "../src/scheduling/backoff.js";
 import { every } from "../src/scheduling/repeating.js";
 import { StartUp, type StartUpOptions } from "../src/scheduling/start-up.js";
 
@@ -17,6 +21,54 @@ describe("the wait after repeated failures", () => {
     expect(waits).toEqual([
       5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000, 300_000, 300_000,
     ]);
+  });
+});
+
+describe("the wake on mainnet", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("never waits longer than 30 seconds between tries", () => {
+    const waits = [1, 2, 3, 4, 5, 10, 20].map((failures) =>
+      backoffDelayMs(failures, MAINNET_WAKE_BACKOFF),
+    );
+
+    expect(waits).toEqual([5_000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000]);
+  });
+
+  it("retries a wake with that cap, and a start-up too", async () => {
+    const waits: number[] = [];
+    let tries = 0;
+    const wake = retryWithBackoff(
+      async () => {
+        tries += 1;
+        if (tries < 7) throw new Error("refused");
+      },
+      {
+        backoff: MAINNET_WAKE_BACKOFF,
+        keepTrying: () => true,
+        onFailure: (_error, _failures, retryInMs) => waits.push(retryInMs),
+      },
+    );
+    await vi.advanceTimersByTimeAsync(5_000 + 10_000 + 20_000 + 30_000 * 3);
+    expect(await wake).toBe(true);
+    expect(waits).toEqual([5_000, 10_000, 20_000, 30_000, 30_000, 30_000]);
+
+    const startUpWaits: number[] = [];
+    let attempts = 0;
+    const startUp = startUpOf({
+      backoff: MAINNET_WAKE_BACKOFF,
+      work: async () => {
+        attempts += 1;
+        if (attempts < 6) throw new Error("refused");
+      },
+      wanted: () => true,
+      onFailure: (_error, _failures, retryInMs) => startUpWaits.push(retryInMs),
+    });
+    startUp.start();
+    await vi.advanceTimersByTimeAsync(5_000 + 10_000 + 20_000 + 30_000 * 2);
+    expect(startUp.ready).toBe(true);
+    expect(startUpWaits).toEqual([5_000, 10_000, 20_000, 30_000, 30_000]);
   });
 });
 
