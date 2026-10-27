@@ -43,6 +43,7 @@ import {
   type PriceReading,
   type Reference,
   ReferencePrice,
+  type ReferenceSource,
   SOL_USD_FEED_ID,
   readPythAccount,
   referenceOf,
@@ -181,6 +182,177 @@ describe("the reference price", () => {
     expect(await new ReferencePrice(sources.slice(1), clock).read()).toEqual({
       ok: false,
       reason: expect.stringContaining("the oracle price is missing"),
+    });
+  });
+
+  describe("how often the sources are called", () => {
+    /** Sources that count their calls; a reading is dated by the clock at the call, `pythAgeMs` older for Pyth. */
+    const counted = (clock: ManualClock, failing: string[] = [], pythAgeMs = 3_000) => {
+      const calls: Record<string, number> = { Pyth: 0, Coinbase: 0, Kraken: 0, OKX: 0 };
+      const sources = referenceSources(async () => null).map((source) => ({
+        ...source,
+        read: async () => {
+          calls[source.name] += 1;
+          if (failing.includes(source.name)) throw new Error("timed out");
+          return source.exchange
+            ? reading(source.name, 150, clock.nowMs())
+            : reading(source.name, 150, clock.nowMs() - pythAgeMs, false);
+        },
+      }));
+      return { calls, sources };
+    };
+
+    /** A wall clock whose `advance` also moves a separate monotonic clock; `set` corrects the wall clock alone. */
+    class SteppedClock extends ManualClock {
+      private monotonic = 0;
+
+      monotonicMs(): number {
+        return this.monotonic;
+      }
+
+      override advance(byMs: number): void {
+        super.advance(byMs);
+        this.monotonic += byMs;
+      }
+    }
+    const referenceOn = (sources: ReferenceSource[], clock: SteppedClock) =>
+      new ReferencePrice(sources, clock, () => clock.monotonicMs());
+
+    it("calls Pyth every 5 s and each exchange every 2 s over a minute of 1 s ticks", async () => {
+      const clock = new SteppedClock(now);
+      const { calls, sources } = counted(clock);
+      const reference = referenceOn(sources, clock);
+      for (let tick = 0; tick < 60; tick += 1) {
+        expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+        clock.advance(1_000);
+      }
+      expect(calls).toEqual({ Pyth: 12, Coinbase: 30, Kraken: 30, OKX: 30 });
+    });
+
+    it("keeps a reused reading's own time, so it goes stale when it would have", async () => {
+      const clock = new SteppedClock(now);
+      const { sources } = counted(clock);
+      const slow = sources.map((source) => ({ ...source, minIntervalMs: 60_000 }));
+      const reference = referenceOn(slow, clock);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+
+      clock.advance(10_000);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.advance(1);
+      expect(await reference.read()).toEqual({
+        ok: false,
+        reason:
+          "only 0 fresh exchange prices, 2 are needed (Coinbase is 10 s old, Kraken is 10 s old, OKX is 10 s old)",
+      });
+    });
+
+    it("lets a reused oracle reading go stale at 30 s, as a fresh read of the same time would", async () => {
+      const clock = new SteppedClock(now);
+      const { sources } = counted(clock, [], 29_000);
+      const reference = referenceOn(
+        sources.map((source) => ({ ...source, minIntervalMs: 60_000 })),
+        clock,
+      );
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.advance(1_000);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.advance(1);
+      expect(await reference.read()).toEqual({ ok: false, reason: "the Pyth price is 30 s old" });
+    });
+
+    it("does not call a failing source again before the interval, and reports it each time", async () => {
+      const clock = new SteppedClock(now);
+      const { calls, sources } = counted(clock, ["OKX", "Pyth"]);
+      const reference = referenceOn(sources, clock);
+      for (let tick = 0; tick < 10; tick += 1) {
+        expect(await reference.read()).toEqual({
+          ok: false,
+          reason: expect.stringContaining("the oracle price is missing (no answer from Pyth, OKX)"),
+        });
+        clock.advance(1_000);
+      }
+      expect(calls.Pyth).toBe(2);
+      expect(calls.OKX).toBe(5);
+    });
+
+    it("calls a source again as soon as the interval has passed, and takes the new reading", async () => {
+      const clock = new SteppedClock(now);
+      let price = 150;
+      const source: ReferenceSource = {
+        name: "Coinbase",
+        exchange: true,
+        minIntervalMs: 2_000,
+        read: async () => reading("Coinbase", price, clock.nowMs()),
+      };
+      const others = [
+        {
+          name: "Pyth",
+          exchange: false,
+          read: async () => reading("Pyth", 150, clock.nowMs(), false),
+        },
+        {
+          name: "Kraken",
+          exchange: true,
+          read: async () => reading("Kraken", 150.2, clock.nowMs()),
+        },
+      ];
+      const reference = referenceOn([others[0], source, others[1]], clock);
+      await reference.read();
+      price = 150.1;
+      clock.advance(1_999);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.advance(1);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150.1) });
+    });
+
+    it("does not call a source early when the wall clock is corrected backward", async () => {
+      const clock = new SteppedClock(now);
+      const { calls, sources } = counted(clock);
+      const reference = referenceOn(
+        sources.map((source) => ({ ...source, minIntervalMs: 60_000 })),
+        clock,
+      );
+      await reference.read();
+      clock.set(now - 3_600_000);
+      await reference.read();
+      clock.set(now - 7_200_000);
+      await reference.read();
+      expect(calls).toEqual({ Pyth: 1, Coinbase: 1, Kraken: 1, OKX: 1 });
+    });
+
+    it("does not call a source early when the wall clock jumps forward past the interval", async () => {
+      const clock = new SteppedClock(now);
+      const { calls, sources } = counted(clock);
+      const reference = referenceOn(
+        sources.map((source) => ({ ...source, minIntervalMs: 60_000 })),
+        clock,
+      );
+      await reference.read();
+      clock.set(now + 3_600_000);
+      await reference.read();
+      expect(calls).toEqual({ Pyth: 1, Coinbase: 1, Kraken: 1, OKX: 1 });
+
+      clock.advance(60_000);
+      await reference.read();
+      expect(calls).toEqual({ Pyth: 2, Coinbase: 2, Kraken: 2, OKX: 2 });
+    });
+
+    it("still ages a reused reading by the wall clock after a backward correction", async () => {
+      const clock = new SteppedClock(now);
+      const { sources } = counted(clock);
+      const reference = referenceOn(
+        sources.map((source) => ({ ...source, minIntervalMs: 60_000 })),
+        clock,
+      );
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.set(now - 5_000);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
+      clock.set(now + 11_000);
+      expect(await reference.read()).toEqual({
+        ok: false,
+        reason:
+          "only 0 fresh exchange prices, 2 are needed (Coinbase is 11 s old, Kraken is 11 s old, OKX is 11 s old)",
+      });
     });
   });
 
