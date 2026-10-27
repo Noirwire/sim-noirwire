@@ -392,6 +392,20 @@ describe("the public deployment description", () => {
     ],
   );
 
+  it("says how an owner approves opening an account: a transaction unless told otherwise", () => {
+    const withAuth = (ownerAuth?: "message" | "transaction") =>
+      publicDeployment(
+        deployment,
+        { solanaRpcUrl: "a", rollupRpcUrl: "b", rollupWsUrl: "c" },
+        [{ chain: chainMarket(0, "perp", 0), symbol: "NSOL-PERP", addresses: addresses() }],
+        ownerAuth,
+      );
+
+    expect(described.ownerAuth).toBe("transaction");
+    expect(withAuth("message").ownerAuth).toBe("message");
+    expect(withAuth("transaction").ownerAuth).toBe("transaction");
+  });
+
   it("names the gate, the oracle, the faucet and the service's own deposit URL nowhere", () => {
     const text = JSON.stringify(described);
     for (const hidden of [...Object.values(roles), deployment.depositUrl]) {

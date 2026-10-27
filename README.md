@@ -108,29 +108,30 @@ and `vendor/` goes away.
 Variables for `VENUE=rollup` (all in [.env.example](.env.example); the service refuses to
 start when a required one is missing or a key is not the one the deployment names):
 
-| Variable                                                                 | Required   | What it is                                                                                                                                                   |
-| ------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SOLANA_RPC_URL`                                                         | yes        | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`                                                                         |
-| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes        | The rollup's private endpoint through the query filter, and its websocket                                                                                    |
-| `DEPOSIT_RPC_URL`                                                        | no         | Overrides where deposits are sent; by default the deployment's `depositUrl`                                                                                  |
-| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no         | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own                                                                            |
-| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes        | The deployment description the order book repository's set-up prints                                                                                         |
-| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes        | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)                                                                      |
-| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead    | The path of each keypair file, in place of the key itself, for a run on your own machine                                                                     |
-| `BOT_TRADER_SEEDS`                                                       | yes        | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                                                                                  |
-| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no         | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)                                                                      |
-| `SERVICE_LOCATION`                                                       | no         | Where the service runs; labels the latency figure                                                                                                            |
-| `HOUSE_MAKER_RISK_RULES`                                                 | no         | `1` makes the house maker follow the risk rules (always on, mainnet; see below)                                                                              |
-| `IDLE_AFTER_MS`                                                          | no         | How long the service keeps trading after the last request, with no socket (10 minutes)                                                                       |
-| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no         | How long it keeps trading after the last stream socket closes (15 seconds)                                                                                   |
-| `HEALTHCHECK_URL`                                                        | no         | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                                                                  |
-| `KEEPER_HEARTBEAT_FILE`, `KEEPER_HEARTBEAT_MAX_AGE_MS`                   | mainnet    | The keeper writes the time of its last healthy sweep (Unix ms) here; trading is not ready when it is old or missing (30 s)                                   |
-| `HEDGE_ENABLED`                                                          | no         | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                                                             |
-| `HEDGE_VENUE_MODULE`, `HEDGE_VENUE_*`                                    | with hedge | Absolute path of the hedge venue module (required with `HEDGE_ENABLED=1`, ignored otherwise); every other `HEDGE_VENUE_*` is passed to it without the prefix |
-| `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no         | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                                                                |
-| `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no         | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3)                                         |
-| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no         | Bot order sizes as notional                                                                                                                                  |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no         | Seats the liquidator tries blind per market per tick; seats this service did not open                                                                        |
+| Variable                                                                 | Required   | What it is                                                                                                                                                    |
+| ------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SOLANA_RPC_URL`                                                         | yes        | Solana. Checked once at start against `NETWORK`: mainnet only with `NETWORK=mainnet`                                                                          |
+| `ROLLUP_RPC_URL`, `ROLLUP_WS_URL`                                        | yes        | The rollup's private endpoint through the query filter, and its websocket                                                                                     |
+| `DEPOSIT_RPC_URL`                                                        | no         | Overrides where deposits are sent; by default the deployment's `depositUrl`                                                                                   |
+| `PUBLIC_SOLANA_RPC_URL`, `PUBLIC_ROLLUP_RPC_URL`, `PUBLIC_ROLLUP_WS_URL` | no         | The URLs `GET /v1/deployment` tells browsers to use; by default the service's own                                                                             |
+| `DEPLOYMENT_PATH` or `DEPLOYMENT_JSON`                                   | yes        | The deployment description the order book repository's set-up prints                                                                                          |
+| `GATE_SECRET_KEY`, `FAUCET_SECRET_KEY`                                   | yes        | Secret keys as JSON arrays of 64 bytes: co-sign openings, deposit (faucet: only if any)                                                                       |
+| `GATE_SECRET_KEY_FILE`, `FAUCET_SECRET_KEY_FILE`                         | instead    | The path of each keypair file, in place of the key itself, for a run on your own machine                                                                      |
+| `BOT_TRADER_SEEDS`                                                       | yes        | One 32-byte hex seed per bot trader, comma separated (10 with the defaults)                                                                                   |
+| `NOISE_TAKERS_ENABLED`, `LIQUIDATOR_ENABLED`                             | no         | `0` opens and starts none of them, leaving the house makers alone (both `1` by default)                                                                       |
+| `SERVICE_LOCATION`                                                       | no         | Where the service runs; labels the latency figure                                                                                                             |
+| `HOUSE_MAKER_RISK_RULES`                                                 | no         | `1` makes the house maker follow the risk rules (always on, mainnet; see below)                                                                               |
+| `IDLE_AFTER_MS`                                                          | no         | How long the service keeps trading after the last request, with no socket (10 minutes)                                                                        |
+| `IDLE_AFTER_LAST_SOCKET_MS`                                              | no         | How long it keeps trading after the last stream socket closes (15 seconds)                                                                                    |
+| `HEALTHCHECK_URL`                                                        | no         | An address the maker calls after a good requote, at most every 15 s, for an outside monitor                                                                   |
+| `KEEPER_HEARTBEAT_FILE`, `KEEPER_HEARTBEAT_MAX_AGE_MS`                   | mainnet    | The keeper writes the time of its last healthy sweep (Unix ms) here; trading is not ready when it is old or missing (30 s)                                    |
+| `SIGNED_OWNER_ACTIONS`                                                   | no         | `1` opens accounts with a message the owner signs instead of a transaction (off by default; only after the program upgrade that adds the signed instructions) |
+| `HEDGE_ENABLED`                                                          | no         | `1` runs the hedge controller (off by default; needs the risk rules; see "The hedge controller")                                                              |
+| `HEDGE_VENUE_MODULE`, `HEDGE_VENUE_*`                                    | with hedge | Absolute path of the hedge venue module (required with `HEDGE_ENABLED=1`, ignored otherwise); every other `HEDGE_VENUE_*` is passed to it without the prefix  |
+| `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no         | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                                                                 |
+| `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no         | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3)                                          |
+| `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no         | Bot order sizes as notional                                                                                                                                   |
+| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no         | Seats the liquidator tries blind per market per tick; seats this service did not open                                                                         |
 
 ### Mainnet mode
 
@@ -280,6 +281,18 @@ If the key file is lost or damaged, delete it: the day's count per address then 
 
 Seats opened by the operator's own keys count in the program's limit but not in these;
 leave room for them when you set `max_seats_per_day`.
+
+**Signed messages (`SIGNED_OWNER_ACTIONS=1`).** Off by default, and to be turned on only after
+the program upgrade that adds the signed instructions. The owner then approves the opening by
+signing a message instead of a transaction. `POST /v1/open/prepare` answers
+`{ ownerAuth: "message", expiresAt, expiresAtMs }` (`expiresAt` in unix seconds on the rollup's
+clock, 100 seconds ahead) and signs nothing; `POST /v1/open/submit` takes
+`{ owner, signature, expiresAt }` (`signature` is 64 bytes, base64). The gate rebuilds the
+message from the keys and expiry it prepared, refuses anything but the owner's signature over
+it, and only then reserves the seat, builds the transaction (the gate pays and signs alone),
+records its signature and last valid block height, and sends. Off, `prepare` answers
+`ownerAuth: "transaction"` with the gate-signed transaction, as before. `GET /v1/deployment`
+carries the same `ownerAuth`.
 
 **What is logged.** One line per decision, to the service's log, with the owner's public
 key and nothing else about the person: no invite code, no network address.

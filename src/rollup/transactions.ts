@@ -53,12 +53,15 @@ export const confirmedWithin = async (
  * rollup reports it executed. A refusal at the door is a `DepositRefused`, a
  * refusal by the program a `ProgramRefused`.
  */
-export const sendDepositAndConfirm = async (
+export const sendDepositAndConfirm = (
   connection: Connection,
   transaction: Transaction,
-): Promise<string> => {
+): Promise<string> => sendRawAndConfirm(connection, transaction.serialize());
+
+/** As `sendDepositAndConfirm`, for a transaction already serialized with every signature on it. */
+export const sendRawAndConfirm = async (connection: Connection, raw: Buffer): Promise<string> => {
   const signature = await connection
-    .sendRawTransaction(transaction.serialize(), { skipPreflight: true })
+    .sendRawTransaction(raw, { skipPreflight: true })
     .catch((error: unknown) => {
       throw new DepositRefused(connection.rpcEndpoint, error);
     });

@@ -46,7 +46,12 @@ import {
   newOrderSecret,
   signedInSession,
 } from "./program.js";
-import { type BrowserUrls, type PublicDeployment, publicDeployment } from "./public-deployment.js";
+import {
+  type BrowserUrls,
+  type OwnerAuth,
+  type PublicDeployment,
+  publicDeployment,
+} from "./public-deployment.js";
 import { RollupMarket } from "./rollup-market.js";
 import { SeatSweep, seatOfTarget, seatTarget } from "./seat-sweep.js";
 import { type RollupSettings, deployedMarket } from "./settings.js";
@@ -345,7 +350,7 @@ export class RollupVenue implements Venue {
   }
 
   /** What a browser needs to trade on the program directly, with the URLs a browser should use. */
-  publicDeployment(urls: BrowserUrls): PublicDeployment {
+  publicDeployment(urls: BrowserUrls, ownerAuth: OwnerAuth): PublicDeployment {
     const { program, settings } = this.options;
     return publicDeployment(
       settings.deployment,
@@ -355,6 +360,7 @@ export class RollupVenue implements Venue {
         symbol: config.id,
         addresses: program.publicAddresses(chain.marketId),
       })),
+      ownerAuth,
     );
   }
 

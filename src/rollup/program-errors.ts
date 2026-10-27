@@ -1,3 +1,10 @@
+const OWNER_TRANSACTION_ERROR = {
+  invalidProof: 6151,
+  wrongNonce: 6152,
+  expiryTooFar: 6153,
+  wrongWithdrawDestination: 6154,
+} as const;
+
 /**
  * The order book program's error names by the number a failed transaction
  * reports (its code plus 6000). The program never reuses or renumbers a
@@ -113,6 +120,50 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
   6148: "PriceSourceBound",
   6149: "PriceSourceInUse",
   6150: "CustodyCapReached",
+  [OWNER_TRANSACTION_ERROR.invalidProof]: "InvalidOwnerProof",
+  [OWNER_TRANSACTION_ERROR.wrongNonce]: "WrongOwnerNonce",
+  [OWNER_TRANSACTION_ERROR.expiryTooFar]: "OwnerExpiryTooFar",
+  [OWNER_TRANSACTION_ERROR.wrongWithdrawDestination]: "WrongWithdrawDestination",
+};
+
+/** `Expired`: a signed action or order reached the program after its expiry. */
+export const EXPIRED_ERROR = 6133;
+
+/** What the program refused an owner's signed action for, in words for the person, with the HTTP status that fits. */
+export const ownerRefusalOf = (
+  code: number | null,
+): { status: 400 | 409 | 410; reason: string } | null => {
+  switch (code) {
+    case OWNER_TRANSACTION_ERROR.invalidProof:
+      return {
+        status: 400,
+        reason:
+          "the rollup did not accept the wallet's signature for this account opening. Nothing changed: sign again",
+      };
+    case OWNER_TRANSACTION_ERROR.wrongNonce:
+      return {
+        status: 409,
+        reason: "the account changed since this was signed. Nothing changed: reload and try again",
+      };
+    case OWNER_TRANSACTION_ERROR.expiryTooFar:
+      return {
+        status: 400,
+        reason: "the signed message expires too far ahead. Nothing changed: prepare again",
+      };
+    case OWNER_TRANSACTION_ERROR.wrongWithdrawDestination:
+      return {
+        status: 400,
+        reason: "the withdrawal must go to the owner's own token account. Nothing changed",
+      };
+    case EXPIRED_ERROR:
+      return {
+        status: 410,
+        reason:
+          "the signed message expired before it was sent. Nothing changed: prepare again and sign again",
+      };
+    default:
+      return null;
+  }
 };
 
 /**
