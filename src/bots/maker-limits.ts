@@ -59,6 +59,15 @@ export const MAKER_LIMITS = {
   /** Ladders in a row abandoned because an order provably never ran (its window passed) that send the maker to the soft stop. */
   unrunLaddersBeforeStop: 5,
 
+  /**
+   * While a requote keeps the old orders standing until the new ladder is up, the maker's resting
+   * orders on a market together stay within this many (the program caps a seat's open orders per
+   * market, at 32 at most), and the worst case they could grow its position to stays within this
+   * share of its equity times the market's leverage.
+   */
+  overlapMaxOpenOrders: 16,
+  overlapMarginShareBps: 8_000,
+
   /** A resting quote lives at most the requote interval plus this long. */
   expiryMarginSeconds: 10,
   /** How far the host clock may run ahead of the chain's: 30 s is far above the drift of a synced host, and costs only a longer hold. */

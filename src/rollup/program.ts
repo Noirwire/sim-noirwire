@@ -66,7 +66,11 @@ import type {
 import { backedOffSockets } from "./bot-socket.js";
 import { Session, connectionTo } from "./connections.js";
 import type { Generation } from "./generation.js";
-import { MAKER_NOT_LISTED_ERROR, programErrorLabel } from "./program-errors.js";
+import {
+  MAKER_NOT_LISTED_ERROR,
+  ORDER_NOT_FOUND_ERROR,
+  programErrorLabel,
+} from "./program-errors.js";
 import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
@@ -111,6 +115,7 @@ const placedAs = (result: OrderResult, timing: Timing): PlaceOutcome => ({
   status: placeStatusOf(result.status, result.rested),
   filled: result.filled,
   rested: result.rested,
+  ...(result.rested > 0n ? { orderSeq: result.orderSeq } : {}),
   sendToResultMs: timing.resultAt - timing.sentAt,
 });
 
@@ -782,6 +787,25 @@ export class ProgramTrader {
     return this.run(
       async (client) => (await this.resultOf(client.cancelAll(marketId)))?.cancelled ?? null,
     );
+  }
+
+  /**
+   * Whether the resting order with sequence number `orderSeq` was cancelled: false when the
+   * program no longer had the order (filled, expired or cancelled). Throws when the instruction
+   * never ran, since the order may still stand, and when the program refused it for any other reason.
+   */
+  async cancelOrder(marketId: number, orderSeq: bigint): Promise<boolean> {
+    const ended = await this.run(async (client) =>
+      (await this.resultOf(client.cancelOrder(marketId, orderSeq))) === null
+        ? "never ran"
+        : "cancelled",
+    ).catch((error: unknown) => {
+      if (error instanceof TransactionFailed && error.code === ORDER_NOT_FOUND_ERROR) return "gone";
+      throw error;
+    });
+    if (ended === "never ran")
+      throw new Error("the cancel never ran, so the order may still stand");
+    return ended === "cancelled";
   }
 
   /** Brings the view's seat copy up to date. False when the instruction never ran. */

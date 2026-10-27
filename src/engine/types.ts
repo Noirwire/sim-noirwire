@@ -126,6 +126,11 @@ export interface Venue {
   deposit(trader: TraderKey, token: string, amount: bigint): Promise<void>;
   placeOrder(trader: TraderKey, order: NewOrder): Promise<PlaceResult>;
   cancelAll(trader: TraderKey, market: MarketId): Promise<number>;
+  /**
+   * Cancels the one resting order that `traderState` lists under `orderId`. False when it was
+   * already gone (filled, expired or cancelled). A venue without it can only cancel everything.
+   */
+  cancelOrder?(trader: TraderKey, market: MarketId, orderId: string): Promise<boolean>;
   traderState(trader: TraderKey): Promise<TraderState>;
   updateFunding(market: MarketId): Promise<void>;
   liquidate(liquidator: TraderKey, target: TraderKey, market: MarketId): Promise<boolean>;

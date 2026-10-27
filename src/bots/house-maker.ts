@@ -14,6 +14,8 @@ import type {
   MarketInfo,
   MarketKind,
   NewOrder,
+  OrderView,
+  Side,
   TraderKey,
   TraderState,
   Venue,
@@ -261,6 +263,64 @@ export const flattenOrders = (
   ];
 };
 
+/** What the old orders may add up to on each side while the new ladder stands beside them. */
+export interface OverlapRoom {
+  /** In base units, per side. */
+  buy: bigint;
+  sell: bigint;
+  /** How many old orders each side may keep. */
+  orders: number;
+}
+
+/** The old orders of a requote that keeps some of them standing until the new ladder is up. */
+export interface Overlap {
+  /** Cancelled before the new ladder is placed: it would cross them, or they do not fit beside it. */
+  before: OrderView[];
+  /** Left standing while the new ladder is placed: the best priced ones that fit. */
+  after: OrderView[];
+}
+
+const byPriceCmp = (a: bigint, b: bigint): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Whether a post-only order of `orders` would match `old`, which the program refuses without placing it. */
+const crossedBy = (old: OrderView & { price: bigint }, orders: NewOrder[]): boolean =>
+  orders.some(
+    (order) =>
+      order.side !== old.side &&
+      order.price !== undefined &&
+      (old.side === "sell" ? order.price >= old.price : order.price <= old.price),
+  );
+
+const isPriced = (old: OrderView): old is OrderView & { price: bigint } => old.price !== null;
+
+/**
+ * Splits the maker's `standing` orders for a requote that places `orders` before it cancels the old
+ * ones. On each side the old orders nearest the market that the new ladder would not cross and that
+ * fit in `room` stand through the swap, so the book is never bare. The rest go first.
+ */
+export const splitStanding = (
+  standing: OrderView[],
+  orders: NewOrder[],
+  room: OverlapRoom,
+): Overlap => {
+  const keepOn = (side: Side): OrderView[] => {
+    const candidates = standing
+      .filter(isPriced)
+      .filter((old) => old.side === side && !crossedBy(old, orders))
+      .sort((a, b) => byPriceCmp(a.price, b.price) * (side === "buy" ? -1 : 1));
+    const kept: OrderView[] = [];
+    let size = 0n;
+    for (const old of candidates) {
+      if (kept.length >= room.orders || size + old.remainingSize > room[side]) continue;
+      kept.push(old);
+      size += old.remainingSize;
+    }
+    return kept;
+  };
+  const after = [...keepOn("buy"), ...keepOn("sell")];
+  return { before: standing.filter((old) => !after.includes(old)), after };
+};
+
 type Quoting = Extract<Plan, { action: "quote" }>;
 
 /** With no risk rules the maker quotes around the venue's mark, as it always has. */
@@ -273,9 +333,16 @@ const aroundMark = (mark: bigint): Quoting => ({
 
 /**
  * Keeps a ladder of post-only orders on both sides of a price. It requotes
- * (cancel everything, then place a fresh ladder) only when that price has moved
- * past the threshold or the requote interval has passed, so it does not churn
- * the book on every tick. Every quote expires on the venue by itself a little
+ * only when that price has moved past the threshold or the requote interval
+ * has passed, so it does not churn the book on every tick. A requote on a
+ * perpetual places the new ladder before it cancels the old orders, one by
+ * one, so the book is not bare meanwhile: the old orders the new ladder would
+ * cross, or that would not fit beside it under the position limit, the
+ * venue's position cap and the seat's margin, go first, and the best priced
+ * of the rest stand until the new ladder is up. Wherever that cannot be done
+ * (a venue that cancels only everything, a market that is not a perpetual, an
+ * order of unknown outcome, a cancel not confirmed) it cancels everything and
+ * then places a fresh ladder. Every quote expires on the venue by itself a little
  * after the requote interval, so a maker that dies leaves nothing standing.
  * While the venue would refuse its quotes it holds them instead, and requotes
  * on its first tick after the venue takes them again.
@@ -396,12 +463,118 @@ export class HouseMaker {
   }
 
   /** The operator is told once that a cancel is unconfirmed, until one is confirmed. */
-  private alertCancelUnconfirmed(error: unknown): void {
+  private alertCancelUnconfirmed(
+    error: unknown,
+    next = "It places nothing and tries again on every tick.",
+  ): void {
     if (this.cancelAlerted) return;
     this.cancelAlerted = true;
     this.options.safety?.alert(
-      `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). It places nothing and tries again on every tick.`,
+      `its quotes may still be live: the cancel was not confirmed (${firstLine(error)}). ${next}`,
     );
+  }
+
+  /**
+   * Whether a requote may keep the old orders standing while the new ladder goes up. Not where a cancel
+   * of everything is out or unconfirmed (it would take the new ladder with it when it lands), where an
+   * order may be on its way (one this maker does not know of would stand unseen), or under a hold, a
+   * flatten or a reduce-only plan.
+   */
+  private mayOverlap(venue: Venue, plan: Quoting, market: MarketInfo): boolean {
+    return (
+      venue.cancelOrder !== undefined &&
+      this.options.kind === "perp" &&
+      market.maxLeverage > 0 &&
+      !plan.reduceOnly &&
+      plan.flatten !== true &&
+      this.hold === null &&
+      this.cancelsInFlight === 0 &&
+      !this.cancelAlerted &&
+      (venue.unsettledPlaces?.(this.trader) ?? 0) === 0 &&
+      (this.options.safety?.mayGrow() ?? true)
+    );
+  }
+
+  /**
+   * How much of the old orders may stand beside `orders`: what is left of the maker's position limit,
+   * of the venue's position cap and of the margin its equity gives, once the new ladder has taken its
+   * part of each, and half the open orders it allows itself for each side. The new ladder was cut to
+   * fit the limit and the cap by itself, so nothing here can make it larger than it is.
+   */
+  private overlapRoom(
+    plan: Quoting,
+    market: MarketInfo,
+    seat: TraderState,
+    position: bigint,
+    orders: NewOrder[],
+  ): OverlapRoom {
+    const limit = divScale(this.options.positionLimitNotional, plan.centre);
+    const equity = maxBigInt(seat.equity, 0n);
+    const affordable = divScale(
+      (equity * BigInt(market.maxLeverage) * BigInt(MAKER_LIMITS.overlapMarginShareBps)) /
+        BPS_PER_WHOLE,
+      market.markPrice ?? plan.centre,
+    );
+    const cap = market.positionCap;
+    const roomOn = (side: Side): bigint => {
+      const toward = side === "buy" ? position : -position;
+      const reach = maxBigInt(toward, 0n);
+      const newTotal = orders
+        .filter((order) => order.side === side)
+        .reduce((sum, order) => sum + order.size, 0n);
+      const bounds = [limit - toward, affordable - toward];
+      if (cap !== undefined) bounds.push(cap - reach);
+      return maxBigInt(bounds.reduce(minBigInt) - newTotal, 0n);
+    };
+    return {
+      buy: roomOn("buy"),
+      sell: roomOn("sell"),
+      orders: Math.max(Math.floor((MAKER_LIMITS.overlapMaxOpenOrders - orders.length) / 2), 0),
+    };
+  }
+
+  /** The new ladder and which old orders stand beside it, or null where the requote must cancel everything first. */
+  private async overlapFor(
+    venue: Venue,
+    plan: Quoting,
+    market: MarketInfo,
+  ): Promise<(Overlap & { orders: NewOrder[] }) | null> {
+    if (!this.mayOverlap(venue, plan, market)) return null;
+    const seat = await venue.traderState(this.trader);
+    const position = this.inventory(seat);
+    const orders = this.ordersFor(plan, market, position);
+    if (orders.length === 0) return null;
+    const standing = seat.openOrders.filter((open) => open.market === this.options.market);
+    const room = this.overlapRoom(plan, market, seat, position, orders);
+    return { orders, ...splitStanding(standing, orders, room) };
+  }
+
+  /**
+   * Cancels `olds` one by one by their id. An order the venue no longer has is as good as cancelled. A
+   * cancel that fails or is not answered in time leaves the order, so the maker places nothing more
+   * and the next tick cancels everything; `next` tells the operator what to expect meanwhile.
+   */
+  private async cancelOld(
+    venue: Venue,
+    olds: OrderView[],
+    epoch: number,
+    next?: string,
+  ): Promise<void> {
+    try {
+      for (const old of olds) {
+        if (epoch !== this.epoch) return;
+        await withinDeadline(
+          venue.cancelOrder!(this.trader, this.options.market, old.orderId),
+          this.options.cancelDeadlineMs ?? CANCEL_DEADLINE_MS,
+          "the cancel",
+        );
+      }
+    } catch (error) {
+      this.lastQuoted = null;
+      this.standing = true;
+      this.alertCancelUnconfirmed(error, next);
+      throw error;
+    }
   }
 
   /** `withdraw`, telling the operator once if the venue did not confirm the cancel. The error is thrown on. */
@@ -519,17 +692,26 @@ export class HouseMaker {
     const now = this.options.clock.nowMs();
     if (!this.dueForRequote(next, now)) return;
 
-    await this.cancelStanding(venue);
-    const position = this.inventory(await venue.traderState(this.trader));
-    const orders = this.ordersFor(next, market, position);
-    // The cancel above ran, so nothing stands: the next tick's plan takes the reduce-only path.
-    if (safety && !next.reduceOnly && !safety.mayGrow()) {
-      this.lastQuoted = null;
-      return;
+    // Old orders that stand beside the new ladder until it is up, or none where everything is cancelled first.
+    const overlap = await this.overlapFor(venue, next, market);
+    let orders: NewOrder[];
+    if (overlap === null) {
+      await this.cancelStanding(venue);
+      const position = this.inventory(await venue.traderState(this.trader));
+      orders = this.ordersFor(next, market, position);
+      // The cancel above ran, so nothing stands: the next tick's plan takes the reduce-only path.
+      if (safety && !next.reduceOnly && !safety.mayGrow()) {
+        this.lastQuoted = null;
+        return;
+      }
+    } else {
+      ({ orders } = overlap);
+      await this.cancelOld(venue, overlap.before, epoch);
     }
+    const kept = overlap?.after ?? [];
     // Only a flatten sends orders under a reduce-only plan, and every one of them is flagged reduce-only.
     const flattening = next.flatten === true;
-    this.standing = orders.length > 0;
+    this.standing = orders.length > 0 || kept.length > 0;
     // Fixed once, here: the hold on disk and every order sent carry this same absolute expiry.
     const expiresAtMs = this.options.clock.nowMs() + this.expiresInSeconds * 1_000;
     const dispatching = orders.length > 0 && (await this.recordDispatch(flattening, expiresAtMs));
@@ -592,11 +774,11 @@ export class HouseMaker {
     }
     if (heldSend) await this.noteSentOrders(sentIds);
     if (tooLate && !sawUnknown) {
-      await this.abandonLadder(venue, dispatching);
+      await this.abandonLadder(venue, dispatching, overlap !== null);
       return;
     }
     if (unrunReason !== undefined && !sawUnknown) {
-      await this.abandonLadder(venue, dispatching);
+      await this.abandonLadder(venue, dispatching, overlap !== null);
       this.unrunLadders += 1;
       safety?.ladderAbandoned(unrunReason, this.unrunLadders);
       if (this.unrunLadders >= MAKER_LIMITS.unrunLaddersBeforeStop) {
@@ -614,6 +796,16 @@ export class HouseMaker {
       await this.withdraw(venue).catch(() => {});
       throw new OrderOutcomeUnknown(this.options.market, unknownReason);
     }
+    // An old order goes only once every order that replaces it on its side stands; otherwise it stays until the next requote.
+    const replaced = (side: Side): boolean =>
+      resting.filter((order) => order.side === side).length ===
+      orders.filter((order) => order.side === side).length;
+    await this.cancelOld(
+      venue,
+      kept.filter((old) => replaced(old.side)),
+      epoch,
+      "The replaced quotes expire by themselves, and it cancels everything on the next tick.",
+    );
 
     // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
     if (leftOut > 0) {
@@ -723,19 +915,27 @@ export class HouseMaker {
    * A ladder whose orders went out too late for their shared expiry: the rest is not sent, what it
    * already placed is cancelled, and the maker is not stopped, since no venue failed. Its record ends
    * only when no order of it can still be out; the next tick quotes again with a fresh expiry.
+   * Where the old orders were left standing (`overlapped`) nothing is cancelled: they and what the
+   * ladder placed stand until that next tick replaces them all.
    */
-  private async abandonLadder(venue: Venue, dispatching: boolean): Promise<void> {
+  private async abandonLadder(
+    venue: Venue,
+    dispatching: boolean,
+    overlapped: boolean,
+  ): Promise<void> {
     this.lastQuoted = null;
-    try {
-      await this.cancelQuotes(venue);
-    } catch (error) {
-      this.standing = true;
-      this.alertCancelUnconfirmed(error);
-      if (dispatching) this.hold = this.options.ledger?.state.hold ?? this.hold;
-      throw error;
+    if (!overlapped) {
+      try {
+        await this.cancelQuotes(venue);
+      } catch (error) {
+        this.standing = true;
+        this.alertCancelUnconfirmed(error);
+        if (dispatching) this.hold = this.options.ledger?.state.hold ?? this.hold;
+        throw error;
+      }
+      this.cancelAlerted = false;
+      this.standing = false;
     }
-    this.cancelAlerted = false;
-    this.standing = false;
     if (!dispatching) return;
     if ((venue.unsettledPlaces?.(this.trader) ?? 0) === 0) await this.clearDispatch(venue);
     else this.hold = this.options.ledger?.state.hold ?? this.hold;

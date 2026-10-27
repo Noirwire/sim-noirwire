@@ -577,6 +577,13 @@ export class MemoryVenue implements Venue {
     return cancelled.length;
   }
 
+  async cancelOrder(trader: TraderKey, market: MarketId, orderId: string): Promise<boolean> {
+    const runtime = this.runtime(market);
+    const cancelled = runtime.book.cancelOne(trader, orderId);
+    if (cancelled) this.releaseSpotLock(runtime, cancelled);
+    return cancelled !== null;
+  }
+
   async traderState(trader: TraderKey): Promise<TraderState> {
     const account = this.account(trader);
     const balances: TraderState["balances"] = {};

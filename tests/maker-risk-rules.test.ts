@@ -22,6 +22,7 @@ import {
   flattenOrders,
   holdLapsesAtMs,
   ladderOrders,
+  splitStanding,
 } from "../src/bots/house-maker.js";
 import {
   CONFIRM_STOP_FLAG,
@@ -36,7 +37,14 @@ import { MakerSafety, PriceHistory, worstEquity } from "../src/bots/maker-safety
 import { MakerLedger, StatePersistenceError, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
-import type { MarketInfo, NewOrder, TraderState, Venue } from "../src/engine/types.js";
+import type {
+  MarketInfo,
+  NewOrder,
+  OrderView,
+  PlaceResult,
+  TraderState,
+  Venue,
+} from "../src/engine/types.js";
 import { VenueNotReady } from "../src/engine/venue-not-ready.js";
 import type { HedgeVenue } from "../src/hedge/hedge-venue.js";
 import {
@@ -3749,5 +3757,639 @@ describe("a cancel that never answers", () => {
 
     expect(maker.quarantinedSinceMs).not.toBeNull();
     expect(book.take()).toEqual([]);
+  });
+});
+
+describe("a house maker's requote keeps the book quoted", () => {
+  /** The maker's own resting orders after one call it made. */
+  interface Step {
+    call: string;
+    bids: OrderView[];
+    asks: OrderView[];
+  }
+
+  /**
+   * A venue with a real book of the maker's own orders. A post-only order that would match one of
+   * them is refused as the program refuses it, and every call leaves a record of what then stands.
+   */
+  class StandingBook {
+    mark = dollars(150);
+    position = 0n;
+    equity = dollars(1_000);
+    positionCap: bigint | undefined;
+    resting: OrderView[] = [];
+    steps: Step[] = [];
+    calls: string[] = [];
+    placed = 0;
+    matchRefusals = 0;
+    unsettled = 0;
+    failCancellingById: Error | null = null;
+    failPlacing: Error | null = null;
+    unknownBecause: string | null = null;
+    /** Every order on this side is refused, as the program refuses one that would match. */
+    refusing: NewOrder["side"] | null = null;
+    /** From this many placements on, the venue answers that the order never ran. */
+    neverRunsFrom: number | null = null;
+    refusedBecause: string | null = null;
+    takesReduceOnly = false;
+    beforePlacing: (() => Promise<void>) | null = null;
+    private sequence = 0;
+
+    stand(side: NewOrder["side"], price: number, size = 0.1): void {
+      this.sequence += 1;
+      this.resting.push({
+        orderId: `stale-${this.sequence}`,
+        tag: 0n,
+        market: PERP,
+        side,
+        type: "postOnly",
+        price: dollars(price),
+        size: dollars(size),
+        remainingSize: dollars(size),
+        reduceOnly: false,
+      });
+    }
+
+    side(side: NewOrder["side"]): OrderView[] {
+      return this.resting.filter((order) => order.side === side);
+    }
+
+    private note(call: string): void {
+      this.calls.push(call);
+      this.steps.push({ call, bids: this.side("buy"), asks: this.side("sell") });
+    }
+
+    private rejected(order: NewOrder, reason: string, flags: Partial<PlaceResult> = {}) {
+      return {
+        orderId: "",
+        tag: 0n,
+        status: "rejected",
+        filledSize: 0n,
+        remainingSize: order.size,
+        reason,
+        ...flags,
+      } satisfies PlaceResult;
+    }
+
+    private place = async (_trader: string, order: NewOrder): Promise<PlaceResult> => {
+      await this.beforePlacing?.();
+      this.placed += 1;
+      this.note("place");
+      if (this.failPlacing) throw this.failPlacing;
+      if (this.unknownBecause !== null) {
+        return this.rejected(order, this.unknownBecause, { outcomeUnknown: true });
+      }
+      if (this.neverRunsFrom !== null && this.placed >= this.neverRunsFrom) {
+        return this.rejected(order, "no result before the order expired", { didNotRun: true });
+      }
+      if (order.reduceOnly === true) {
+        return {
+          orderId: "",
+          tag: 0n,
+          status: "filled",
+          filledSize: order.size,
+          remainingSize: 0n,
+        };
+      }
+      const price = order.price ?? 0n;
+      const crosses = this.side(order.side === "buy" ? "sell" : "buy").some((resting) =>
+        order.side === "buy" ? price >= (resting.price ?? 0n) : price <= (resting.price ?? 0n),
+      );
+      if (crosses || this.refusing === order.side) {
+        this.matchRefusals += 1;
+        return this.rejected(order, "post-only order would match");
+      }
+      this.sequence += 1;
+      const orderId = `order-${this.sequence}`;
+      this.resting.push({
+        orderId,
+        tag: 0n,
+        market: PERP,
+        side: order.side,
+        type: "postOnly",
+        price,
+        size: order.size,
+        remainingSize: order.size,
+        reduceOnly: false,
+      });
+      this.steps[this.steps.length - 1] = {
+        call: "place",
+        bids: this.side("buy"),
+        asks: this.side("sell"),
+      };
+      return { orderId, tag: 0n, status: "open", filledSize: 0n, remainingSize: order.size };
+    };
+
+    asVenue(withCancelById = true): Venue {
+      return {
+        markets: async (): Promise<MarketInfo[]> => [
+          {
+            id: PERP,
+            kind: "perp",
+            base: "SOL",
+            quote: "nUSD",
+            tickSize: dollars(0.01),
+            lotSize: dollars(0.001),
+            maxLeverage: 5,
+            markPrice: this.mark,
+            markPriceUpdatedAtMs: 0,
+            change24h: null,
+            volume24h: 0n,
+            openInterest: null,
+            ...(this.positionCap === undefined ? {} : { positionCap: this.positionCap }),
+            ...(this.refusedBecause === null ? {} : { quotesRefusedBecause: this.refusedBecause }),
+            ...(this.takesReduceOnly ? { takesReduceOnlyOrders: true } : {}),
+          },
+        ],
+        unsettledPlaces: () => this.unsettled,
+        placeOrder: this.place,
+        cancelAll: async () => {
+          const cancelled = this.resting.length;
+          this.resting = [];
+          this.note("cancelAll");
+          return cancelled;
+        },
+        ...(withCancelById
+          ? {
+              cancelOrder: async (_trader: string, _market: string, orderId: string) => {
+                if (this.failCancellingById) throw this.failCancellingById;
+                const before = this.resting.length;
+                this.resting = this.resting.filter((order) => order.orderId !== orderId);
+                this.note("cancelOrder");
+                return this.resting.length < before;
+              },
+            }
+          : {}),
+        traderState: async (): Promise<TraderState> => ({
+          trader: "maker",
+          balances: {},
+          positions: { [PERP]: { size: this.position, entryPrice: this.mark } },
+          openOrders: [...this.resting],
+          equity: this.equity,
+        }),
+      } as unknown as Venue;
+    }
+  }
+
+  const sizeOf = (orders: OrderView[]): bigint =>
+    orders.reduce((sum, order) => sum + order.remainingSize, 0n);
+
+  /** A maker over `live`, warmed up, with the record of its calls cleared. */
+  const quoting = async (
+    name: string,
+    over: Partial<HouseMakerOptions> = {},
+    live = new StandingBook(),
+    withCancelById = true,
+  ) => {
+    const made = await rig(name, over, { equityAtStart: live.equity });
+    const venue = live.asVenue(withCancelById);
+    const step = async (seconds = 1) => {
+      made.clock.advance(seconds * 1_000);
+      await made.maker.tick(venue);
+    };
+    await made.maker.tick(venue);
+    for (let second = 0; second < 10; second += 1) await step();
+    live.steps = [];
+    live.calls = [];
+    live.placed = 0;
+    live.matchRefusals = 0;
+    return { ...made, live, step, venue };
+  };
+
+  const ids = (orders: OrderView[]): string[] => orders.map((order) => order.orderId).sort();
+  const holdOnDisk = async (dir: string) =>
+    JSON.parse(await readFile(makerStatePath(dir, PERP), "utf8")).hold;
+
+  it("places the new ladder before it cancels the old one, and has quotes on both sides after every call", async () => {
+    const { live, step, feed } = await quoting("mbb-normal");
+    const old = ids([...live.side("buy"), ...live.side("sell")]);
+    expect(old).toHaveLength(6);
+
+    feed.reference = { ok: true, price: dollars(150.15) };
+    await step(11);
+
+    expect(live.calls).not.toContain("cancelAll");
+    expect(live.calls.filter((call) => call === "place")).toHaveLength(6);
+    expect(live.steps.length).toBeGreaterThan(6);
+    for (const { call, bids, asks } of live.steps) {
+      expect([call, bids.length > 0, asks.length > 0]).toEqual([call, true, true]);
+    }
+    const now = ids([...live.side("buy"), ...live.side("sell")]);
+    expect(now).toHaveLength(6);
+    expect(now.filter((id) => old.includes(id))).toEqual([]);
+    expect(live.matchRefusals).toBe(0);
+  });
+
+  it("cancels, with a position limit of 250 and levels of 0.3 SOL, one old order a side before placing and four after", async () => {
+    const { live, step } = await quoting("mbb-numbers");
+
+    await step(11);
+
+    const firstPlace = live.calls.indexOf("place");
+    expect(live.calls.slice(0, firstPlace)).toEqual(["cancelOrder", "cancelOrder"]);
+    expect(live.calls.slice(firstPlace)).toEqual([
+      ...Array<string>(6).fill("place"),
+      ...Array<string>(4).fill("cancelOrder"),
+    ]);
+  });
+
+  it("has every old order standing through the swap when the position limit has room for two ladders", async () => {
+    const { live, step } = await quoting("mbb-roomy", { positionLimitNotional: dollars(1_000) });
+
+    await step(11);
+
+    const firstPlace = live.calls.indexOf("place");
+    expect(firstPlace).toBe(0);
+    expect(live.calls).toEqual([
+      ...Array<string>(6).fill("place"),
+      ...Array<string>(6).fill("cancelOrder"),
+    ]);
+    expect(live.steps.every(({ bids, asks }) => bids.length > 0 && asks.length > 0)).toBe(true);
+  });
+
+  it("keeps what rests on a side whose new orders did not all stand, and cancels the side that was replaced", async () => {
+    let beats = 0;
+    const { live, step } = await quoting(
+      "mbb-partial-side",
+      { positionLimitNotional: dollars(1_000), afterRequote: () => (beats += 1) },
+      new StandingBook(),
+    );
+    const oldAsks = ids(live.side("sell"));
+    const beatsBefore = beats;
+    live.refusing = "sell";
+
+    await step(11);
+
+    expect(live.matchRefusals).toBe(3);
+    expect(ids(live.side("sell"))).toEqual(oldAsks);
+    expect(live.side("buy")).toHaveLength(3);
+    expect(live.steps.every(({ bids, asks }) => bids.length > 0 && asks.length > 0)).toBe(true);
+    expect(live.calls).not.toContain("cancelAll");
+    expect(beats).toBe(beatsBefore);
+
+    live.refusing = null;
+    await step(1);
+
+    expect(live.side("sell")).toHaveLength(3);
+    expect(ids(live.side("sell")).filter((id) => oldAsks.includes(id))).toEqual([]);
+    expect(live.resting).toHaveLength(6);
+    expect(beats).toBe(beatsBefore + 1);
+  });
+
+  it("leaves the old orders and what was placed standing when an order never ran, and replaces them all on the next tick", async () => {
+    const { live, step, dir, ledger } = await quoting("mbb-never-ran", {
+      positionLimitNotional: dollars(1_000),
+    });
+    live.neverRunsFrom = 3;
+
+    await step(11);
+
+    expect(live.calls).not.toContain("cancelAll");
+    expect(live.resting).toHaveLength(8);
+    expect(live.steps.every(({ bids, asks }) => bids.length > 0 && asks.length > 0)).toBe(true);
+    expect(await holdOnDisk(dir)).toBeNull();
+    expect(ledger.state.mode).toBe("run");
+
+    live.neverRunsFrom = null;
+    live.calls = [];
+    await step(1);
+
+    expect(live.resting).toHaveLength(6);
+    expect(live.calls.filter((call) => call === "place")).toHaveLength(6);
+    expect(live.calls.filter((call) => call === "cancelOrder")).toHaveLength(8);
+  });
+
+  it("writes the ladder in flight to disk before the first order and ends it once the new ladder is up", async () => {
+    const { live, step, dir, clock } = await quoting("mbb-hold", {
+      positionLimitNotional: dollars(1_000),
+    });
+    const seen: { untilMs: number }[] = [];
+    live.beforePlacing = async () => {
+      seen.push(await holdOnDisk(dir));
+    };
+    const requotedAtMs = clock.nowMs() + 11_000;
+
+    await step(11);
+
+    expect(seen).toHaveLength(6);
+    expect(seen[0]!.untilMs).toBe(holdLapsesAtMs(requotedAtMs + 20_000));
+    expect(new Set(seen.map((hold) => hold.untilMs)).size).toBe(1);
+    expect(await holdOnDisk(dir)).toBeNull();
+  });
+
+  it("leaves a restart held and the book empty when an order fails mid-requote, and cancels everything", async () => {
+    const { live, step, dir, ledger } = await quoting("mbb-crash", {
+      positionLimitNotional: dollars(1_000),
+    });
+    live.failPlacing = new Error("the connection reset");
+
+    await expect(step(11)).rejects.toThrow("the connection reset");
+
+    expect(live.calls).toContain("cancelAll");
+    expect(live.resting).toEqual([]);
+    expect(await holdOnDisk(dir)).not.toBeNull();
+    expect(ledger.state.mode).toBe("reduce");
+  });
+
+  it("cancels everything when an order's outcome is unknown, and holds", async () => {
+    const { live, step, maker } = await quoting("mbb-unknown", {
+      positionLimitNotional: dollars(1_000),
+    });
+    live.unknownBecause = "the connection dropped";
+
+    await expect(step(11)).rejects.toThrow("outcome unknown");
+
+    expect(live.calls).toContain("cancelAll");
+    expect(live.resting).toEqual([]);
+    expect(maker.quarantinedSinceMs).not.toBeNull();
+  });
+
+  it("cancels the old orders a move would cross before placing the orders that cross them", async () => {
+    const { live, step } = await quoting("mbb-crossing", {
+      positionLimitNotional: dollars(1_000),
+    });
+    // Two old asks priced through the new bids, as a big move leaves them: the program refuses a bid that would match.
+    live.stand("sell", 149.7);
+    live.stand("sell", 149.6);
+    live.steps = [];
+
+    await step(11);
+
+    expect(live.matchRefusals).toBe(0);
+    const firstPlace = live.calls.indexOf("place");
+    expect(live.calls.slice(0, firstPlace)).toEqual(["cancelOrder", "cancelOrder"]);
+    expect(live.steps.slice(0, firstPlace).every(({ bids }) => bids.length > 0)).toBe(true);
+    expect(live.calls).not.toContain("cancelAll");
+    expect(live.calls.filter((call) => call === "place")).toHaveLength(6);
+    expect(live.resting).toHaveLength(6);
+    expect(live.resting.some((order) => order.orderId.startsWith("stale"))).toBe(false);
+  });
+
+  it("refuses to place a bid through an old ask it has not cancelled, as the program would", async () => {
+    const { live } = await quoting("mbb-crossing-proof");
+    live.stand("sell", 149.7);
+
+    const refused = await live.asVenue().placeOrder("maker", {
+      market: PERP,
+      side: "buy",
+      type: "postOnly",
+      price: dollars(149.8),
+      size: dollars(0.3),
+    });
+
+    expect(refused.status).toBe("rejected");
+  });
+
+  describe("cancels everything first", () => {
+    it("when the kill switch pulls the quotes", async () => {
+      const { live, step, dir, clock, ledger } = await quoting("mbb-kill", {
+        positionLimitNotional: dollars(1_000),
+      });
+      live.position = dollars(0.5);
+
+      await requestMode(dir, "reduce", clock.nowMs() + 1);
+      await step();
+
+      expect(live.calls).toEqual(["cancelAll"]);
+      expect(live.resting).toEqual([]);
+      expect(ledger.state.mode).toBe("reduce");
+    });
+
+    it("when a loss limit makes the maker flatten", async () => {
+      const live = new StandingBook();
+      live.position = dollars(0.5);
+      const { step, ledger } = await quoting(
+        "mbb-flatten",
+        { positionLimitNotional: dollars(1_000) },
+        live,
+      );
+      live.equity = dollars(969);
+
+      await step(11);
+
+      expect(ledger.state.mode).toBe("flatten");
+      expect(live.calls[0]).toBe("cancelAll");
+      expect(live.calls).not.toContain("cancelOrder");
+      expect(live.calls.filter((call) => call === "place")).toHaveLength(1);
+      expect(live.resting).toEqual([]);
+    });
+
+    it("when it falls back to the soft stop on an error it does not understand", async () => {
+      const { live, step, ledger } = await quoting("mbb-soft-stop", {
+        positionLimitNotional: dollars(1_000),
+      });
+      live.failPlacing = new Error("something nobody expected");
+
+      await expect(step(11)).rejects.toThrow("something nobody expected");
+
+      expect(ledger.state.mode).toBe("reduce");
+      expect(live.calls).toContain("cancelAll");
+      expect(live.resting).toEqual([]);
+    });
+
+    it("when the market is reduce-only and the maker is not flattening", async () => {
+      const { live, step } = await quoting("mbb-reduce-only", {
+        positionLimitNotional: dollars(1_000),
+      });
+      live.refusedBecause = "the market is reduce-only";
+      live.takesReduceOnly = true;
+
+      await expect(step(11)).rejects.toBeInstanceOf(QuotesHeld);
+
+      expect(live.calls).toEqual(["cancelAll"]);
+      expect(live.resting).toEqual([]);
+    });
+
+    it("when the venue can only cancel everything", async () => {
+      const { live, step } = await quoting(
+        "mbb-no-cancel-by-id",
+        { positionLimitNotional: dollars(1_000) },
+        new StandingBook(),
+        false,
+      );
+
+      await step(11);
+
+      expect(live.calls[0]).toBe("cancelAll");
+      expect(live.calls.filter((call) => call === "place")).toHaveLength(6);
+      expect(live.resting).toHaveLength(6);
+    });
+
+    it("when an order call is unsettled, since an order may be on its way that the seat does not show", async () => {
+      const { live, step } = await quoting("mbb-unsettled", {
+        positionLimitNotional: dollars(1_000),
+      });
+      live.unsettled = 1;
+
+      await step(11);
+
+      expect(live.calls[0]).toBe("cancelAll");
+    });
+  });
+
+  describe("when cancelling an old order fails", () => {
+    it("tells the operator, then cancels everything on the next tick and quotes again", async () => {
+      const { live, step, said } = await quoting("mbb-cancel-fails", {
+        positionLimitNotional: dollars(1_000),
+      });
+      live.failCancellingById = new Error("the rpc is down");
+
+      await expect(step(11)).rejects.toThrow("the rpc is down");
+
+      expect(said.alerts.filter((line) => line.includes("cancel was not confirmed"))).toHaveLength(
+        1,
+      );
+      expect(live.resting).toHaveLength(12);
+
+      live.calls = [];
+      await step(1);
+
+      expect(live.calls[0]).toBe("cancelAll");
+      expect(live.resting).toHaveLength(6);
+      expect(live.calls).not.toContain("cancelOrder");
+    });
+  });
+
+  describe("how much of the old ladder stands beside the new one", () => {
+    const worst = (steps: Step[], side: "bids" | "asks"): bigint =>
+      steps.reduce((most, step) => (sizeOf(step[side]) > most ? sizeOf(step[side]) : most), 0n);
+
+    it("never passes the position limit: a limit with no room for an old order beside a ladder cancels them all first", async () => {
+      const { live, step } = await quoting("mbb-limit-tight", {
+        positionLimitNotional: dollars(150),
+      });
+
+      await step(11);
+
+      const firstPlace = live.calls.indexOf("place");
+      expect(live.calls.slice(0, firstPlace)).toEqual(Array<string>(6).fill("cancelOrder"));
+      const limit = dollars(1);
+      expect(worst(live.steps, "bids")).toBeLessThanOrEqual(limit);
+      expect(worst(live.steps, "asks")).toBeLessThanOrEqual(limit);
+    });
+
+    it("never passes the position limit, counting the position, with the default limit", async () => {
+      const live = new StandingBook();
+      live.position = dollars(0.4);
+      const { step, feed } = await quoting("mbb-limit-position", {}, live);
+
+      feed.reference = { ok: true, price: dollars(150.15) };
+      await step(11);
+
+      const limit = (dollars(250) * 1_000_000n) / dollars(150);
+      expect(live.position + worst(live.steps, "bids")).toBeLessThanOrEqual(limit);
+      expect(worst(live.steps, "asks") - live.position).toBeLessThanOrEqual(limit);
+    });
+
+    it("never passes the venue's position cap with the open orders counted", async () => {
+      const live = new StandingBook();
+      live.positionCap = dollars(1.2);
+      const { step } = await quoting("mbb-cap", { positionLimitNotional: dollars(1_000) }, live);
+
+      await step(11);
+
+      expect(worst(live.steps, "bids")).toBeLessThanOrEqual(dollars(1.2));
+      expect(worst(live.steps, "asks")).toBeLessThanOrEqual(dollars(1.2));
+      // A cap of 1.2 SOL leaves 0.3 beside a ladder of 0.9: one old order a side, so two a side go first.
+      expect(live.calls.indexOf("place")).toBe(4);
+      expect(live.resting).toHaveLength(6);
+    });
+
+    it("never lets the worst case it could grow its position to pass 80% of its equity times the leverage", async () => {
+      const live = new StandingBook();
+      live.equity = dollars(50);
+      const { step } = await quoting("mbb-margin", { positionLimitNotional: dollars(1_000) }, live);
+
+      await step(11);
+
+      const affordable = (dollars(50) * 5n * 8_000n * 1_000_000n) / (10_000n * dollars(150));
+      expect(worst(live.steps, "bids")).toBeLessThanOrEqual(affordable);
+      expect(worst(live.steps, "asks")).toBeLessThanOrEqual(affordable);
+      expect(live.calls.indexOf("place")).toBeGreaterThan(0);
+    });
+
+    it("never has more than 16 orders resting together, whatever stale orders stand", async () => {
+      const live = new StandingBook();
+      const { step } = await quoting("mbb-count", { positionLimitNotional: dollars(1_000) }, live);
+      for (let level = 1; level <= 4; level += 1) {
+        live.stand("buy", 150 - level * 0.05);
+        live.stand("sell", 150 + level * 0.05);
+      }
+      expect(live.resting).toHaveLength(14);
+      live.steps = [];
+
+      await step(11);
+
+      const placements = live.steps.filter(({ call }) => call === "place");
+      expect(placements).toHaveLength(6);
+      for (const { bids, asks } of placements) {
+        expect(bids.length + asks.length).toBeLessThanOrEqual(16);
+      }
+      expect(live.resting).toHaveLength(6);
+      expect(live.calls).not.toContain("cancelAll");
+    });
+  });
+
+  describe("splitting the standing orders", () => {
+    const standing = (side: "buy" | "sell", price: number, size = 0.3): OrderView => ({
+      orderId: `${side}-${price}`,
+      tag: 0n,
+      market: PERP,
+      side,
+      type: "postOnly",
+      price: dollars(price),
+      size: dollars(size),
+      remainingSize: dollars(size),
+      reduceOnly: false,
+    });
+    const quote = (side: "buy" | "sell", price: number): NewOrder => ({
+      market: PERP,
+      side,
+      type: "postOnly",
+      price: dollars(price),
+      size: dollars(0.3),
+    });
+    const room = { buy: dollars(0.6), sell: dollars(0.6), orders: 5 };
+
+    it("keeps the orders nearest the market that fit, and cancels the outer ones first", () => {
+      const olds = [
+        standing("buy", 149.7),
+        standing("buy", 149.8),
+        standing("buy", 149.75),
+        standing("sell", 150.3),
+        standing("sell", 150.2),
+      ];
+
+      const { before, after } = splitStanding(olds, [], room);
+
+      expect(after.map((old) => old.orderId)).toEqual([
+        "buy-149.8",
+        "buy-149.75",
+        "sell-150.2",
+        "sell-150.3",
+      ]);
+      expect(before.map((old) => old.orderId)).toEqual(["buy-149.7"]);
+    });
+
+    it("cancels first any old order a new order would match, and keeps none that are not priced", () => {
+      const olds = [
+        standing("sell", 150.2),
+        standing("sell", 150.9),
+        standing("buy", 149.8),
+        { ...standing("buy", 149.7), price: null },
+      ];
+
+      const { before, after } = splitStanding(olds, [quote("buy", 150.5)], room);
+
+      expect(before.map((old) => old.orderId).sort()).toEqual(["buy-149.7", "sell-150.2"]);
+      expect(after.map((old) => old.orderId).sort()).toEqual(["buy-149.8", "sell-150.9"]);
+    });
+
+    it("keeps at most the number of orders it is given a side, and none with no room", () => {
+      const olds = [standing("buy", 149.8), standing("buy", 149.7), standing("buy", 149.6)];
+
+      expect(splitStanding(olds, [], { ...room, orders: 1 }).after).toHaveLength(1);
+      expect(splitStanding(olds, [], { ...room, buy: 0n }).after).toEqual([]);
+    });
   });
 });

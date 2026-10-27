@@ -21,7 +21,7 @@ import {
 import { DeadlineExceeded, withinDeadline } from "../scheduling/deadline.js";
 import { idleWithin } from "../scheduling/repeating.js";
 import { BotAccounts, type BotSpec } from "./bot-accounts.js";
-import { BotOrderSecrets, originOf } from "./bot-orders.js";
+import { BotOrderSecrets, endsByMsOf, originOf } from "./bot-orders.js";
 import { ChainFeed, REREAD_INTERVAL_MS } from "./chain-feed.js";
 import {
   type ChainExchange,
@@ -436,7 +436,16 @@ export class RollupVenue implements Venue {
       return rejectedOrder(orderId, NO_TAG, order, ORDER_EXPIRY_TOO_NEAR);
     }
     const secret = newOrderSecret();
-    this.secrets.add(order.market, trader, secret);
+    const endsByMs =
+      rests && !order.reduceOnly && hasExpiry
+        ? endsByMsOf(
+            expiresAtMs !== undefined
+              ? Math.floor(expiresAtMs / MS_PER_SECOND)
+              : Math.floor((Date.now() + PLACE_DEADLINE_MS) / MS_PER_SECOND) +
+                  (order.expiresInSeconds ?? 0),
+          )
+        : null;
+    this.secrets.add(order.market, trader, secret, endsByMs);
     let outcome: PlaceOutcome;
     let owner = "";
     let dispatched = false;
@@ -480,6 +489,7 @@ export class RollupVenue implements Venue {
       return rejectedOrder(orderId, NO_TAG, order, reason);
     }
     if (outcome.settled) outcome = await this.onceSettled(outcome.settled);
+    if (outcome.orderSeq !== undefined) this.secrets.rests(secret, outcome.orderSeq);
     if (outcome.status !== "rested" && outcome.status !== "unknown") {
       this.secrets.retire(secret, Date.now());
     }
@@ -530,6 +540,16 @@ export class RollupVenue implements Venue {
     if (cancelled === null) return 0;
     this.secrets.retireAll(market, trader, Date.now(), fence);
     return Number(cancelled);
+  }
+
+  async cancelOrder(trader: TraderKey, market: MarketId, orderId: string): Promise<boolean> {
+    const orderSeq = BigInt(orderId);
+    const cancelled = await this.whileAwake(async () =>
+      (await this.bots.trader(trader)).cancelOrder(this.market(market).chain.marketId, orderSeq),
+    );
+    // Cancelled now, or already gone: either way the order cannot fill from here on.
+    this.secrets.retireResting(market, trader, orderSeq, Date.now());
+    return cancelled;
   }
 
   async traderState(trader: TraderKey): Promise<TraderState> {
