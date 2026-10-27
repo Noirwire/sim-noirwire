@@ -670,7 +670,7 @@ describe("opening an account on mainnet", () => {
     expect(decisions.filter((decision) => decision.ok)).toHaveLength(1);
   });
 
-  it("does not free the seat when an older transaction is refused after a newer one replaced it", async () => {
+  it("keeps the seat when a transaction being sent is refused, and hands out a new one afterwards", async () => {
     const { owners, desk, answer, signedBy, dir } = await serviceWith(
       (o) => `${o[0].publicKey.toBase58()}\n`,
       { outcome: { err: { InstructionError: [0, { Custom: 6000 }] } } },
@@ -686,14 +686,15 @@ describe("opening an account on mainnet", () => {
       "10.0.0.7",
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const newer = await desk.prepare(askFor(owner, "10.0.0.7"));
-    if (!newer.ok) throw new Error("not prepared");
+    expect((await desk.prepare(askFor(owner, "10.0.0.7"))).ok).toBe(false);
     answer.sendHold = null;
     release();
 
     expect((await sending).ok).toBe(false);
 
     expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("unconfirmed");
+    const newer = await desk.prepare(askFor(owner, "10.0.0.7"));
+    if (!newer.ok) throw new Error("not prepared");
     answer.outcome = "executed";
     const opened = await desk.submit(
       owner.publicKey.toBase58(),
@@ -903,6 +904,48 @@ describe("opening an account on mainnet", () => {
 
     expect(answers.map((answer) => (answer.ok ? 200 : answer.status))).toEqual([200, 409]);
     expect(sent).toHaveLength(1);
+  });
+
+  it("hands out no second transaction for an owner whose first is being sent, and sends exactly one", async () => {
+    const { owners, desk, signedBy, sent, answer } = await serviceWith(everyone);
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    const owner = owners[0].publicKey.toBase58();
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    const other = await desk.prepare({
+      ...askFor(owners[0], "10.0.0.7"),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+    });
+    const same = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    const different = await desk.prepare(askFor(owners[1], "10.0.0.8"));
+
+    expect(other.ok).toBe(false);
+    expect(same.ok).toBe(false);
+    if (!other.ok) expect(other.status).toBe(409);
+    expect(different.ok).toBe(true);
+    release();
+    expect((await sending).ok).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("hands out a transaction again once a send has failed", async () => {
+    const { owners, desk, signedBy, answer } = await serviceWith(everyone, { outcome: "silent" });
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    const owner = owners[0].publicKey.toBase58();
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    expect((await desk.prepare(askFor(owners[0], "10.0.0.7"))).ok).toBe(false);
+    release();
+    expect((await sending).ok).toBe(false);
+
+    answer.sendHold = null;
+    expect((await desk.prepare(askFor(owners[0], "10.0.0.7"))).ok).toBe(true);
   });
 
   it("keeps the seat reserved when the endpoint refuses at the door, and lets the sweep free it once the blockhash is past", async () => {

@@ -189,6 +189,7 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     await this.releaseUnsent(now);
     await this.settleExpired(now, owner);
     const outstanding = this.prepared.get(owner);
+    if (outstanding?.sending) return this.refuseWhileSending(owner);
     const asked = admission.check(owner, invite, ip, this.programSeatsPerDay());
     if (!asked.ok) {
       log(`gate: ${owner} prepare refused: ${asked.reason}`);
@@ -196,7 +197,6 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     }
     if (
       outstanding &&
-      !outstanding.sending &&
       outstanding.expiresAtMs > now &&
       outstanding.orderKeys === orderKeys.join(",")
     ) {
@@ -282,6 +282,8 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
       log(`gate: ${owner} prepare refused: the seat record could not be written`);
       return RECORD_NOT_WRITTEN;
     }
+    // A submit may have started sending the earlier transaction while this one was being built.
+    if (this.prepared.get(owner)?.sending) return this.refuseWhileSending(owner);
     this.prepared.set(owner, {
       message: transaction.serializeMessage(),
       transaction: wire,
@@ -293,6 +295,16 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
       sending: false,
     });
     return { ok: true, transaction: wire, expiresAtMs };
+  }
+
+  /** While a transaction for an owner is being sent, no other is handed out: two could both open. */
+  private refuseWhileSending(owner: string): OpenPrepared {
+    this.options.log(`gate: ${owner} prepare refused: an opening is being sent`);
+    return {
+      ok: false,
+      status: 409,
+      reason: "this account opening is already being sent, wait for it",
+    };
   }
 
   /**
