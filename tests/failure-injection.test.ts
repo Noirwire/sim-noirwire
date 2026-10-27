@@ -168,15 +168,12 @@ const pythAccountAnswer = (price: number, atMs: number) => {
 const feedBody = (host: string, price: number, atMs: number) => {
   const text = price.toFixed(2);
   if (host === "api.exchange.coinbase.com") {
-    return { price: text, time: new Date(atMs).toISOString() };
+    return { bid: text, ask: text };
   }
   if (host === "api.kraken.com") {
-    return {
-      error: [],
-      result: { SOLUSD: [[text, "0.4", atMs / SECOND, "b", "l", "", 1]], last: "1" },
-    };
+    return { error: [], result: { SOLUSD: { a: [text, "1", "1.000"], b: [text, "1", "1.000"] } } };
   }
-  return { data: [{ last: text, ts: String(atMs) }] };
+  return { data: [{ bidPx: text, askPx: text, ts: String(atMs) }] };
 };
 
 /** A hedge venue that tells the world about each order before it takes it. */
