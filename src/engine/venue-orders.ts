@@ -18,6 +18,14 @@ export const rejectedOrder = (
 export const ORDER_EXPIRY_TOO_NEAR =
   "the order's expiry is already past or within a second, so nothing was sent";
 
+/** An order the venue proves did not run, for a cause that passes by itself: shown as rejected, flagged as such. */
+export const unrunOrder = (
+  orderId: string,
+  tag: bigint,
+  order: NewOrder,
+  reason: string,
+): PlaceResult => ({ ...rejectedOrder(orderId, tag, order, reason), didNotRun: true });
+
 /** An order that failed after it may have been sent: shown as rejected, flagged as not known to be. */
 export const unknownOrder = (
   orderId: string,

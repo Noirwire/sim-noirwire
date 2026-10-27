@@ -374,6 +374,13 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   stop (a good requote in between starts the count again), an error it does not
   understand while flattening, the wider loss limit, a flattening that fails or takes over
   ten minutes (three while the reference price is down, see below).
+  - **An order that provably never ran is not such an error.** An order whose transaction
+    window (5 s) passed with no result, or that was not handed to the program before its
+    deadline, did not execute. The maker drops the rest of that ladder, cancels what it
+    placed, says so in one `dropped a ladder` line (at most once a minute) and quotes again
+    on the next tick. Only five such ladders in a row (a good ladder in between starts the
+    count again) send it to the soft stop, with an `ALERT` that gives the count and the last
+    reason. If you see that alert, check the rollup's and the RPC's health before resuming.
 - **A loss limit flattens.** Past 3% of the day's start or 5% from the peak (counted at the
   worse of the venue's mark and the reference price) the maker works its position down
   with one reduce-only order, at most 25 bps through the fresh reference price, replaced

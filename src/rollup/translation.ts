@@ -81,6 +81,8 @@ export const placeResultOf = (
     remainingSize: order.size - filledSize,
     reason: reasonOf(outcome),
     ...(outcome.status === "unknown" ? { outcomeUnknown: true as const } : {}),
+    // The rollup's clock passed the order's expiry without the program counting it: it never ran.
+    ...(outcome.status === "expired" ? { didNotRun: true as const } : {}),
   };
 };
 

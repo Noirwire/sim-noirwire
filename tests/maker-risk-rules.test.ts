@@ -408,6 +408,8 @@ class Book {
   rejectedCount = 0;
   /** Once this many orders stand, the venue refuses a resting order as too near its expiry, sending nothing. */
   refusesTooLateAfter: number | null = null;
+  /** Once this many orders stand, the venue answers a resting order as provably never run (its window passed). */
+  neverRunsAfter: number | null = null;
   /** The venue answers every order as cancelled, as it does a post-only order that did not rest. */
   cancelsPostOnly = false;
   /** The venue answers every order as rejected but possibly executed, giving this reason. */
@@ -480,6 +482,21 @@ class Book {
             filledSize: 0n,
             remainingSize: order.size,
             reason: ORDER_EXPIRY_TOO_NEAR,
+          };
+        }
+        if (
+          this.neverRunsAfter !== null &&
+          order.reduceOnly !== true &&
+          this.orders.length >= this.neverRunsAfter
+        ) {
+          return {
+            orderId: "",
+            tag: 0n,
+            status: "rejected",
+            filledSize: 0n,
+            remainingSize: order.size,
+            reason: "no result before the order expired",
+            didNotRun: true,
           };
         }
         if (this.cancelsPostOnly) {
@@ -3408,6 +3425,82 @@ describe("a ladder is recorded before any order of it is sent", () => {
     await tick(11);
     expect(book.take().length).toBeGreaterThan(2);
     expect(ledger.state.mode).toBe("run");
+  });
+
+  it("takes a ladder off without stopping when an order's window passed before any result, and quotes again on the next tick", async () => {
+    const { warmUp, book, tick, ledger, dir, said } = await rig("ladder-never-ran");
+    await warmUp();
+    book.take();
+    book.neverRunsAfter = 2;
+    const cancelsBefore = book.cancels;
+
+    await tick(11);
+
+    expect(book.cancels).toBeGreaterThan(cancelsBefore + 1);
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+    expect(said.notices.some((line) => line.includes("an order never ran"))).toBe(true);
+    expect(await holdOnDisk(dir)).toBeNull();
+
+    book.take();
+    book.neverRunsAfter = null;
+    await tick(11);
+    expect(book.take().length).toBeGreaterThan(2);
+    expect(ledger.state.mode).toBe("run");
+  });
+
+  it("falls back to the soft stop, with an alert, after repeated ladders that never ran", async () => {
+    const { warmUp, book, tick, ledger, said } = await rig("ladder-never-ran-repeats");
+    await warmUp();
+    book.take();
+    book.neverRunsAfter = 2;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+
+    for (let ladder = 1; ladder < limit; ladder += 1) {
+      await tick(11);
+      expect(ledger.state.mode).toBe("run");
+    }
+    await expect(tick(11)).rejects.toThrow(`${limit} ladders in a row`);
+
+    expect(ledger.state.mode).toBe("reduce");
+    expect(said.alerts).toHaveLength(1);
+    expect(said.alerts[0]).toContain(`${limit} ladders in a row`);
+    expect(said.alerts[0]).toContain("no result before the order expired");
+  });
+
+  it("counts only ladders in a row that never ran: a good ladder starts the count again", async () => {
+    const { warmUp, book, tick, ledger, said } = await rig("ladder-never-ran-reset");
+    await warmUp();
+    book.take();
+    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+
+    for (let round = 0; round < 2; round += 1) {
+      book.neverRunsAfter = 2;
+      for (let ladder = 1; ladder < limit; ladder += 1) await tick(11);
+      book.neverRunsAfter = null;
+      await tick(11);
+      expect(book.take().length).toBeGreaterThan(2);
+    }
+
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+  });
+
+  it("still falls back to the soft stop at once for a margin or invalid-order refusal", async () => {
+    for (const reason of [
+      "InsufficientMargin",
+      "invalid order: size is not a whole number of lots",
+    ]) {
+      const { warmUp, book, tick, ledger, said } = await rig(`ladder-refused-${reason.length}`);
+      await warmUp();
+      book.take();
+
+      book.rejecting = reason;
+      await expect(tick(11)).rejects.toThrow("order refused by the venue");
+
+      expect(ledger.state.mode).toBe("reduce");
+      expect(said.alerts).toHaveLength(1);
+    }
   });
 
   it("keeps the record of a slow ladder while an order call of it is unsettled", async () => {
