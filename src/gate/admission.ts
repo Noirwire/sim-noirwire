@@ -134,6 +134,11 @@ export class Admission {
     return this.ledger.awaitingSettlement();
   }
 
+  /** Seats reserved at or before `cutoffMs` for which no transaction was ever signed. */
+  reservedWithoutTransaction(cutoffMs: number): SeatRecord[] {
+    return this.ledger.reservedWithoutTransaction(cutoffMs);
+  }
+
   /** The rollup confirmed the seat. */
   confirm(invite: string): Promise<void> {
     return this.ledger.confirm(invite);

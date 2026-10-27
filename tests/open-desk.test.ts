@@ -134,8 +134,9 @@ const serviceWith = async (
   const problems: string[] = [];
   const program = new Program(Keypair.generate().publicKey.toBase58());
   /** A desk with its own admission and seat record read from the file: a restarted service when made again. */
-  const makeDesk = () =>
+  const makeDesk = (sweepEveryMs?: number) =>
     new OpenDesk({
+      ...(sweepEveryMs === undefined ? {} : { sweepEveryMs }),
       program,
       session: Session.of(connection),
       gate,
@@ -742,6 +743,98 @@ describe("opening an account on mainnet", () => {
     const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
     expect(seat?.state).toBe("opened");
     expect(seat?.signatures).toBeUndefined();
+  });
+
+  /** A seat reserved and saved, then the process died before any transaction was signed for it. */
+  const orphanSeat = async (dir: string, owner: Keypair) => {
+    const ledger = seatsIn(dir);
+    await ledger.ready();
+    await ledger.reserve(inviteOf(owner), owner.publicKey.toBase58(), "10.0.0.7", 1_000_000);
+  };
+
+  it("frees a seat reserved without a transaction once the grace has passed, when the service starts", async () => {
+    const { owners, makeDesk, clock, dir } = await serviceWith(everyone);
+    await orphanSeat(dir, owners[0]);
+    clock.advance(31_000);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await vi.waitFor(() => expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined());
+    } finally {
+      restarted.stopSweeping();
+    }
+    expect(seatsIn(dir).seatsToday(clock.nowMs())).toBe(0);
+  });
+
+  it("keeps a seat reserved without a transaction while it is younger than the grace", async () => {
+    const { owners, makeDesk, dir } = await serviceWith(everyone);
+    await orphanSeat(dir, owners[0]);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await restarted.prepare(askFor(owners[1], "10.0.0.8"));
+    } finally {
+      restarted.stopSweeping();
+    }
+
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+  });
+
+  it("never frees a seat that has a signed transaction, however old, until the chain says it did not land", async () => {
+    const { owners, desk, makeDesk, clock, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(600_000);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await restarted.prepare(askFor(owners[1], "10.0.0.8"));
+    } finally {
+      restarted.stopSweeping();
+    }
+
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.state).toBe("unconfirmed");
+    expect(seat?.signatures).toHaveLength(1);
+  });
+
+  it("settles an abandoned seat on the timer with no prepare", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    const restarted = makeDesk(20);
+
+    restarted.startSweeping();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+
+      answer.blockHeight = 10;
+      answer.landed = true;
+      await vi.waitFor(() =>
+        expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened"),
+      );
+    } finally {
+      restarted.stopSweeping();
+    }
+  });
+
+  it("does not sweep after it is stopped", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    const restarted = makeDesk(20);
+
+    restarted.startSweeping();
+    restarted.stopSweeping();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    answer.blockHeight = 10;
+    answer.landed = true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
   });
 
   it("keeps a seat reserved while the transaction is only processed, and records it once confirmed", async () => {

@@ -1,6 +1,6 @@
 import { Keypair } from "@solana/web3.js";
 import type { FastifyInstance } from "fastify";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Activity } from "../src/activity/activity.js";
 import { loadConfig } from "../src/config/config.js";
 import { CandleAggregator } from "../src/data/candles.js";
@@ -67,6 +67,55 @@ const serviceWith = async (desk: OpenRequests) => {
     });
   return { told, prepare, submit };
 };
+
+describe("the pace at which the open desk is asked", () => {
+  it("lets another person prepare and submit while a submit waits for the rollup to confirm", async () => {
+    let confirmed: () => void = () => {};
+    let submits = 0;
+    const { prepare, submit } = await serviceWith({
+      prepare: async () => ({ ok: true, transaction: "dHg=", expiresAtMs: 2_000_000 }),
+      submit: async () => {
+        submits += 1;
+        if (submits === 1) await new Promise<void>((resolve) => (confirmed = resolve));
+        return { ok: true, signature: "x" };
+      },
+    });
+
+    const waiting = submit();
+    await vi.waitFor(() => expect(submits).toBe(1));
+    const prepared = await prepare();
+    const second = await submit();
+    confirmed();
+
+    expect(prepared.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect((await waiting).statusCode).toBe(200);
+  });
+
+  it("takes one prepare at a time: a second one while one is under way is told the desk is busy", async () => {
+    let release: () => void = () => {};
+    let asked = 0;
+    const { prepare } = await serviceWith({
+      prepare: async () => {
+        asked += 1;
+        if (asked === 1) await new Promise<void>((resolve) => (release = resolve));
+        return { ok: true, transaction: "dHg=", expiresAtMs: 2_000_000 };
+      },
+      submit: async () => ({ ok: true, signature: "x" }),
+    });
+
+    const first = prepare();
+    await vi.waitFor(() => expect(asked).toBe(1));
+    const second = await prepare();
+    release();
+
+    expect(second.statusCode).toBe(503);
+    expect(JSON.parse(second.body).error).toContain("busy");
+    expect((await first).statusCode).toBe(200);
+    expect(asked).toBe(1);
+    expect((await prepare()).statusCode).toBe(200);
+  });
+});
 
 describe("the open desk's errors", () => {
   it("are logged when prepare fails, while the caller is only told the rollup did not answer", async () => {

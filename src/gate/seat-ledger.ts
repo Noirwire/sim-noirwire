@@ -185,6 +185,19 @@ export class SeatLedger {
   }
 
   /**
+   * Seats reserved at or before `cutoffMs` with no transaction ever recorded for them. A transaction
+   * is handed out only after `track` has saved its signature, so nothing was sent for these.
+   */
+  reservedWithoutTransaction(cutoffMs: number): SeatRecord[] {
+    return this.records.filter(
+      (record) =>
+        record.state === "unconfirmed" &&
+        (record.signatures?.length ?? 0) === 0 &&
+        record.atMs <= cutoffMs,
+    );
+  }
+
+  /**
    * Records a seat as sent and saves it. Throws if it cannot be saved: nothing may be signed unrecorded.
    * Call `ready` first: with the key made, the record is in memory before this first waits, so a
    * decision made just before it cannot be overtaken. The signatures of an earlier try for the same

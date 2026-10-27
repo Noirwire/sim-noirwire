@@ -18,7 +18,7 @@ import { executed } from "../rollup/chain-types.js";
 import { requireNetwork } from "../rollup/connections.js";
 import type { FundRequests } from "../rollup/fund-desk.js";
 import { requireMainnetDeployment } from "../rollup/mainnet-deployment.js";
-import type { OpenRequest, OpenRequests } from "../rollup/open-desk.js";
+import type { OpenDesk, OpenRequest } from "../rollup/open-desk.js";
 import { Program } from "../rollup/program.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
 import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
@@ -238,12 +238,19 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   };
 
   const admission = mainnet ? gateAdmission(config, onError) : null;
-  let openDesk: OpenRequests | null = null;
-  const viaOpenDesk = async <T>(ask: (desk: OpenRequests) => Promise<T>) => {
+  let openDesk: OpenDesk | null = null;
+  const theOpenDesk = (): OpenDesk => {
+    if (!admission) throw new Error("only mainnet opens accounts through an invite list");
+    openDesk ??= connected().openDesk(admission, (line) => onError(line, null), systemClock);
+    return openDesk;
+  };
+  /** Seats settle on a timer while the service is awake, and at each start, with or without traffic. */
+  const sweepSeatsWhileAwake = (): void => {
+    if (admission) theOpenDesk().startSweeping();
+  };
+  const viaOpenDesk = async <T>(ask: (desk: OpenDesk) => Promise<T>) => {
     try {
-      if (!admission) throw new Error("only mainnet opens accounts through an invite list");
-      openDesk ??= connected().openDesk(admission, (line) => onError(line, null), systemClock);
-      return await ask(openDesk);
+      return await ask(theOpenDesk());
     } catch (error) {
       return refusedWhileStarting(error);
     }
@@ -302,9 +309,14 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       }
       rollup ??= await connect();
       await rollup.follow();
+      sweepSeatsWhileAwake();
     },
-    resume: () => connected().resume(),
+    resume: async () => {
+      await connected().resume();
+      sweepSeatsWhileAwake();
+    },
     rest: async () => {
+      openDesk?.stopSweeping();
       await rollup?.rest();
     },
     botSizes,
@@ -316,6 +328,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       orderKeyCheckpoints: rollup?.keyCheckpoints() ?? snapshot?.orderKeyCheckpoints ?? {},
     }),
     stop: async () => {
+      openDesk?.stopSweeping();
       await rollup?.stop();
     },
   };
