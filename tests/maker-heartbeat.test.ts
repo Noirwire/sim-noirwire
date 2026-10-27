@@ -373,6 +373,7 @@ describe("a maker whose cancel failed", () => {
       assess: async () => plan,
       stopFor: async () => {},
       requoteSucceeded: () => {},
+      ladderResting: () => {},
       mayGrow: () => true,
       alert: () => {},
     } as unknown as MakerSafety;

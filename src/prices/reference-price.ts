@@ -178,9 +178,11 @@ const median = (prices: bigint[]): bigint => {
 /**
  * The reference price: the median of the oracle and the exchanges, or the
  * reason there is none. There is none when the oracle or too few exchanges
- * answered, when an exchange reading is more than ten seconds old or the oracle
- * reading more than thirty (or dated that far ahead), or when the highest and
- * lowest are more than 30 bps apart.
+ * answered, when the oracle reading is more than thirty seconds old (or dated
+ * that far ahead), when fewer than the needed exchanges are fresh (an exchange
+ * reading more than ten seconds old or dated that far ahead is dropped from
+ * the median, not fatal in itself), or when the highest and lowest of the
+ * readings kept are more than 30 bps apart.
  */
 export const referenceOf = (
   readings: PriceReading[],
@@ -189,6 +191,7 @@ export const referenceOf = (
   refusals: string[] = [],
 ): Reference => {
   const exchanges = readings.filter((reading) => reading.exchange).length;
+  const ageMs = (reading: PriceReading): number => Math.abs(nowMs - reading.atMs);
   const notes = [
     ...(silent.length > 0 ? [`no answer from ${silent.join(", ")}`] : []),
     ...refusals,
@@ -203,16 +206,31 @@ export const referenceOf = (
       reason: `only ${exchanges} exchange prices came in, ${MAKER_LIMITS.minExchanges} are needed${silentNote}`,
     };
   }
-  const stale = readings.find(
-    (reading) =>
-      Math.abs(nowMs - reading.atMs) >
-      (reading.exchange ? MAKER_LIMITS.maxSourceAgeMs : MAKER_LIMITS.maxOracleAgeMs),
+  const seconds = (reading: PriceReading): number =>
+    Math.round((nowMs - reading.atMs) / MS_PER_SECOND);
+  const staleOracle = readings.find(
+    (reading) => !reading.exchange && ageMs(reading) > MAKER_LIMITS.maxOracleAgeMs,
   );
-  if (stale) {
-    const seconds = Math.round((nowMs - stale.atMs) / MS_PER_SECOND);
-    return { ok: false, reason: `the ${stale.source} price is ${seconds} s old` };
+  if (staleOracle) {
+    return {
+      ok: false,
+      reason: `the ${staleOracle.source} price is ${seconds(staleOracle)} s old`,
+    };
   }
-  const prices = readings.map((reading) => reading.price);
+  const staleExchanges = readings.filter(
+    (reading) => reading.exchange && ageMs(reading) > MAKER_LIMITS.maxSourceAgeMs,
+  );
+  const kept = readings.filter((reading) => !staleExchanges.includes(reading));
+  if (exchanges - staleExchanges.length < MAKER_LIMITS.minExchanges) {
+    const named = staleExchanges.map((reading) => `${reading.source} is ${seconds(reading)} s old`);
+    return {
+      ok: false,
+      reason:
+        `only ${exchanges - staleExchanges.length} fresh exchange prices, ` +
+        `${MAKER_LIMITS.minExchanges} are needed (${named.join(", ")})`,
+    };
+  }
+  const prices = kept.map((reading) => reading.price);
   const middle = median(prices);
   const widest = absBigInt(
     prices.reduce((a, b) => (a > b ? a : b)) - prices.reduce((a, b) => (a < b ? a : b)),

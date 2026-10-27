@@ -588,6 +588,7 @@ export class HouseMaker {
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
     if (orders.length > 0) safety?.requoteSucceeded();
+    if (orders.length > 0 && !next.reduceOnly) safety?.ladderResting(orders);
     if (!next.reduceOnly) this.options.afterRequote?.();
   }
 

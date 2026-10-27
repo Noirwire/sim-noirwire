@@ -103,16 +103,47 @@ describe("the reference price", () => {
     });
   });
 
-  it("gives none when any reading is more than 10 s old, or dated more than 10 s ahead", () => {
-    const fresh = [pyth, reading("Coinbase", 150, now)];
-    const old = referenceOf([...fresh, reading("Kraken", 150, now - 11_000)], [], now);
-    expect(old).toEqual({ ok: false, reason: "the Kraken price is 11 s old" });
+  it("drops one exchange reading more than 10 s old, or dated more than 10 s ahead, and goes on without it", () => {
+    const fresh = [pyth, reading("Coinbase", 150.1, now), reading("OKX", 150.3, now)];
+    const kept = referenceOf(fresh, [], now);
+    const old = referenceOf([...fresh, reading("Kraken", 140, now - 11_000)], [], now);
+    expect(old).toEqual(kept);
+    expect(old).toEqual({ ok: true, price: dollars(150.1) });
 
-    const ahead = referenceOf([...fresh, reading("Kraken", 150, now + 11_000)], [], now);
-    expect(ahead.ok).toBe(false);
+    const ahead = referenceOf([...fresh, reading("Kraken", 140, now + 11_000)], [], now);
+    expect(ahead).toEqual(kept);
 
     const tenSeconds = referenceOf([...fresh, reading("Kraken", 150, now - 10_000)], [], now);
     expect(tenSeconds.ok).toBe(true);
+  });
+
+  it("gives none when too few exchange readings are fresh, and names the stale ones", () => {
+    const old = (source: string, seconds: number) => reading(source, 150, now - seconds * 1_000);
+    const two = referenceOf(
+      [pyth, reading("Coinbase", 150, now), old("Kraken", 11), old("OKX", 14)],
+      [],
+      now,
+    );
+    expect(two).toEqual({
+      ok: false,
+      reason: "only 1 fresh exchange prices, 2 are needed (Kraken is 11 s old, OKX is 14 s old)",
+    });
+  });
+
+  it("measures the disagreement over the readings kept, not the stale one dropped", () => {
+    const fresh = [pyth, reading("Coinbase", 150, now), reading("OKX", 150.1, now)];
+    const wildButStale = referenceOf([...fresh, reading("Kraken", 160, now - 11_000)], [], now);
+    expect(wildButStale.ok).toBe(true);
+
+    const wildAndFresh = referenceOf([...fresh, reading("Kraken", 160, now)], [], now);
+    expect(wildAndFresh.ok).toBe(false);
+
+    const kept = referenceOf(
+      [pyth, reading("Coinbase", 150, now), reading("OKX", 150.46, now)],
+      [],
+      now,
+    );
+    expect(kept).toEqual({ ok: false, reason: "the price sources are 30.6 bps apart" });
   });
 
   it("gives none when the sources are more than 30 bps apart, and one when they are 30 bps apart", () => {
@@ -246,7 +277,10 @@ describe("the reference price", () => {
         [],
         now,
       );
-      expect(staleExchange).toEqual({ ok: false, reason: "the Kraken price is 11 s old" });
+      expect(staleExchange).toEqual({
+        ok: false,
+        reason: "only 1 fresh exchange prices, 2 are needed (Kraken is 11 s old)",
+      });
     });
   });
 
@@ -579,7 +613,7 @@ describe("a house maker's reference price", () => {
     expect(book.orders.length).toBeGreaterThan(0);
   });
 
-  it("pulls its quotes when the sources disagree or one is stale, and quotes again after 10 quiet seconds", async () => {
+  it("pulls its quotes when the sources disagree or too few are fresh, and quotes again at once when they are back", async () => {
     const { warmUp, book, feed, tick, said } = await rig("pull-on-sources");
     await warmUp();
     book.take();
@@ -594,12 +628,74 @@ describe("a house maker's reference price", () => {
     expect(said.notices.filter((line) => line.includes("41.0 bps apart"))).toHaveLength(1);
 
     feed.reference = { ok: true, price: dollars(150) };
-    await tick(5);
-    await tick(5);
-    expect(book.orders).toHaveLength(0);
-    await tick(6);
+    await tick();
     expect(book.orders.length).toBeGreaterThan(0);
-    expect(said.notices.join()).toContain("quoting again");
+    expect(said.notices.join()).toContain("maker resting");
+  });
+
+  it("does not watch the price again after a pull that the reference caused, but does measure a jump across it", async () => {
+    const { warmUp, book, feed, tick } = await rig("pull-keeps-history");
+    await warmUp();
+    book.take();
+
+    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    for (let second = 0; second < 12; second += 1) await tick();
+    expect(book.orders).toHaveLength(0);
+
+    feed.reference = { ok: true, price: dollars(150.02) };
+    await tick();
+    expect(book.orders.length).toBeGreaterThan(0);
+    book.take();
+
+    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    for (let second = 0; second < 12; second += 1) await tick();
+    feed.reference = { ok: true, price: dollars(151) };
+    await tick();
+    expect(book.orders).toHaveLength(0);
+  });
+
+  it("says that a ladder rests once after the start, and then at most once a minute", async () => {
+    const { warmUp, book, tick, said } = await rig("resting-line");
+    const resting = () => said.notices.filter((line) => line.includes("maker resting"));
+
+    await warmUp();
+    expect(resting()).toHaveLength(1);
+    expect(resting()[0]).toMatch(
+      /^NSOL-PERP maker resting: best bid 149\.\d+, best ask 150\.\d+, 6 orders$/,
+    );
+    const orders = book.take();
+    expect(orders).toHaveLength(6);
+
+    for (let second = 0; second < 50; second += 1) await tick();
+    expect(resting()).toHaveLength(1);
+    for (let second = 0; second < 15; second += 1) await tick();
+    expect(resting()).toHaveLength(2);
+  });
+
+  it("says that a ladder rests again after a pull, and says a long pull once a minute", async () => {
+    const { warmUp, feed, tick, said } = await rig("resting-after-pull");
+    const resting = () => said.notices.filter((line) => line.includes("maker resting"));
+    await warmUp();
+    const pulls = () =>
+      said.notices.filter(
+        (line) => line.includes("pulled its quotes") && !line.includes("watching the price"),
+      );
+
+    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    await tick();
+    feed.reference = { ok: false, reason: "only 1 fresh exchange prices, 2 are needed" };
+    for (let second = 0; second < 58; second += 1) await tick();
+    expect(pulls()).toHaveLength(1);
+    await tick(3);
+    expect(pulls()).toHaveLength(2);
+    expect(pulls()[1]).toContain("only 1 fresh exchange prices");
+
+    feed.reference = { ok: true, price: dollars(150) };
+    await tick();
+    expect(resting()).toHaveLength(1);
+    // A pull past the minute of kept prices leaves none, so the maker watches the price again.
+    for (let second = 0; second < 10; second += 1) await tick();
+    expect(resting()).toHaveLength(2);
   });
 
   it("widens by the gap when the NoirWire mark lags the reference by more than 10 bps", async () => {

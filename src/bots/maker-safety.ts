@@ -1,5 +1,6 @@
 import type { Clock } from "../engine/clock.js";
-import { absBigInt, mulDivScale } from "../engine/money.js";
+import { absBigInt, maxBigInt, minBigInt, mulDivScale, toDecimalString } from "../engine/money.js";
+import type { NewOrder } from "../engine/types.js";
 import type { HedgeGate, HedgeStatus } from "../hedge/hedge-controller.js";
 import { HEDGE_LIMITS } from "../hedge/hedge-limits.js";
 import { firstLine } from "../logging/first-line.js";
@@ -34,6 +35,15 @@ interface PricePoint {
 
 const SCALE_OF_BPS = 10_000_000n;
 
+/** A line that repeats while a state goes on is said once per this long. */
+const SAY_AGAIN_MS = 60_000;
+
+/** A price in dollars with at least two decimals, and no more than it has. */
+const dollarsOf = (scaled: bigint): string => {
+  const [whole, fraction] = toDecimalString(scaled).split(".");
+  return `${whole}.${fraction.replace(/0+$/, "").padEnd(2, "0")}`;
+};
+
 /** The reference prices of the last minute, for the range they have covered. */
 export class PriceHistory {
   private points: PricePoint[] = [];
@@ -45,7 +55,7 @@ export class PriceHistory {
     );
   }
 
-  /** A gap in the prices starts the history over, so a quiet spell has to be seen again. */
+  /** Forgets every price, so a quiet spell has to be seen again. */
   clear(): void {
     this.points = [];
   }
@@ -55,11 +65,20 @@ export class PriceHistory {
     return this.points.length === 0 ? 0 : nowMs - this.points[0].atMs;
   }
 
-  /** The highest price over the lowest within the last `withinMs`, in bps. */
+  /**
+   * The highest price over the lowest within the last `withinMs`, in bps. Where
+   * the prices have a gap of more than `moveWindowMs` just before that window,
+   * the last price from before the gap counts too, so a jump across the gap
+   * reads as a move and not as a first price.
+   */
   rangeBps(withinMs: number, nowMs: number): number {
-    const prices = this.points
-      .filter((point) => nowMs - point.atMs <= withinMs)
-      .map((point) => point.price);
+    const first = this.points.findIndex((point) => nowMs - point.atMs <= withinMs);
+    if (first < 0) return 0;
+    const bridged =
+      first > 0 && this.points[first].atMs - this.points[first - 1].atMs > MAKER_LIMITS.moveWindowMs
+        ? first - 1
+        : first;
+    const prices = this.points.slice(bridged).map((point) => point.price);
     if (prices.length < 2) return 0;
     const low = prices.reduce((a, b) => (a < b ? a : b));
     const high = prices.reduce((a, b) => (a > b ? a : b));
@@ -132,6 +151,10 @@ export class MakerSafety {
   /** The newest reference price that was good, kept for the loss limits while the reference is down. */
   private lastGood: GoodReference | null = null;
   private pulled = false;
+  private pullSaidAtMs = 0;
+  /** Whether a resting ladder has been said aloud since the last pull or start. */
+  private restingSaid = false;
+  private restingSaidAtMs = 0;
   private hedgeStatus: HedgeStatus = "ok";
   /** Whether the keeper's problem has been said aloud and not yet cleared. */
   private keeperAlerted = false;
@@ -156,10 +179,7 @@ export class MakerSafety {
     if (this.isStopped()) return this.stop();
     if (equity <= 0n) return this.pull("its seat holds no equity to quote with");
 
-    if (!reference.ok) {
-      this.history.clear();
-      return this.pull(reference.reason);
-    }
+    if (!reference.ok) return this.pull(reference.reason);
     this.history.record(now, reference.price);
     const lag = bpsApart(mark, reference.price);
     if (lag > MAKER_LIMITS.markLagPullBps) {
@@ -177,18 +197,39 @@ export class MakerSafety {
     }
     const volatility = this.history.rangeBps(MAKER_LIMITS.volatilityWindowMs, now);
     const widenForLag = lag > MAKER_LIMITS.markLagWidenBps ? lag : 0;
-    if (this.pulled) this.options.voice.notice(`${this.options.market} maker is quoting again`);
     this.pulled = false;
     const hedge = this.followHedge();
     const keeperDown = this.followKeeper();
     const widenForHedge = hedge === "lagging" ? HEDGE_LIMITS.laggingExtraSpreadBps : 0;
+    const reduceOnly = risk.mode !== "run" || hedge === "blind" || keeperDown;
+    if (reduceOnly) this.restingSaid = false;
     return {
       action: "quote",
       centre: reference.price,
       extraSpreadBps: volatility * MAKER_LIMITS.volatilityShare + widenForLag + widenForHedge,
-      reduceOnly: risk.mode !== "run" || hedge === "blind" || keeperDown,
+      reduceOnly,
       flatten: risk.mode === "flatten",
     };
+  }
+
+  /**
+   * A full ladder of `orders` is resting. Said aloud the first time after the start or a pull, and
+   * then at most once a minute, so an operator can tell a ladder stands without a line per requote.
+   */
+  ladderResting(orders: NewOrder[]): void {
+    const now = this.options.clock.nowMs();
+    if (this.restingSaid && now - this.restingSaidAtMs < SAY_AGAIN_MS) return;
+    this.restingSaid = true;
+    this.restingSaidAtMs = now;
+    const prices = (side: NewOrder["side"]): bigint[] =>
+      orders.filter((order) => order.side === side).map((order) => order.price ?? 0n);
+    const bids = prices("buy");
+    const asks = prices("sell");
+    const bestBid = bids.length > 0 ? `best bid ${dollarsOf(bids.reduce(maxBigInt))}` : "no bid";
+    const bestAsk = asks.length > 0 ? `best ask ${dollarsOf(asks.reduce(minBigInt))}` : "no ask";
+    this.options.voice.notice(
+      `${this.options.market} maker resting: ${bestBid}, ${bestAsk}, ${orders.length} orders`,
+    );
   }
 
   /**
@@ -317,12 +358,20 @@ export class MakerSafety {
 
   private stop(): Plan {
     this.history.clear();
+    this.restingSaid = false;
     return { action: "stop" };
   }
 
+  /** Said when the pull starts, and again at most once a minute while it goes on, whatever its reason is by then. */
   private pull(reason: string): Plan {
-    if (!this.pulled) {
-      this.options.voice.notice(`${this.options.market} maker pulled its quotes: ${reason}`);
+    const now = this.options.clock.nowMs();
+    this.restingSaid = false;
+    if (!this.pulled || now - this.pullSaidAtMs >= SAY_AGAIN_MS) {
+      const still = this.pulled ? " (still pulled)" : "";
+      this.options.voice.notice(
+        `${this.options.market} maker pulled its quotes${still}: ${reason}`,
+      );
+      this.pullSaidAtMs = now;
     }
     this.pulled = true;
     return { action: "pull", reason };
