@@ -297,29 +297,90 @@ describe("the reference price", () => {
     pythAccount.writeInt32LE(-8, 89);
     pythAccount.writeBigInt64LE(BigInt(now / 1_000 - 2), 93);
     const answers: Record<string, unknown> = {
-      "api.exchange.coinbase.com": { price: "150.11", time: new Date(now - 500).toISOString() },
+      "api.exchange.coinbase.com": {
+        ask: "150.12",
+        bid: "150.10",
+        price: "150.12",
+        time: new Date(now - 12_000).toISOString(),
+      },
       "api.kraken.com": {
         error: [],
-        result: {
-          SOLUSD: [["150.12", "0.4", now / 1_000 - 1.5, "b", "l", "", 1234]],
-          last: "1790000000000000000",
-        },
+        result: { SOLUSD: { a: ["150.13", "1", "1.000"], b: ["150.11", "2", "2.000"] } },
       },
-      "www.okx.com": { data: [{ last: "150.13", ts: String(now - 300) }] },
+      "www.okx.com": {
+        data: [{ last: "150.20", bidPx: "150.12", askPx: "150.14", ts: String(now - 300) }],
+      },
     };
     const sources = referenceSources(
       async () => pythAccount,
       async (url) => answers[new URL(url).host],
+      () => now,
     );
 
     const readings = await Promise.all(sources.map((source) => source.read()));
 
     expect(readings).toEqual([
       { source: "Pyth", exchange: false, price: dollars(150.123456), atMs: now - 2_000 },
-      { source: "Coinbase", exchange: true, price: dollars(150.11), atMs: now - 500 },
-      { source: "Kraken", exchange: true, price: dollars(150.12), atMs: now - 1_500 },
+      { source: "Coinbase", exchange: true, price: dollars(150.11), atMs: now },
+      { source: "Kraken", exchange: true, price: dollars(150.12), atMs: now },
       { source: "OKX", exchange: true, price: dollars(150.13), atMs: now - 300 },
     ]);
+  });
+
+  describe("an exchange quote", () => {
+    const quoteOf = (name: string, answer: unknown) => {
+      const source = referenceSources(
+        async () => null,
+        async () => answer,
+        () => now,
+      ).find((candidate) => candidate.name === name);
+      if (!source) throw new Error(`no source ${name}`);
+      return source.read();
+    };
+    const coinbase = (bid: string, ask: string) => ({ bid, ask, time: "2026-10-27T13:16:46Z" });
+    const kraken = (bid: string, ask: string) => ({
+      error: [],
+      result: { SOLUSD: { a: [ask, "1", "1.000"], b: [bid, "1", "1.000"] } },
+    });
+    const okx = (bidPx: string, askPx: string) => ({
+      data: [{ last: "1", bidPx, askPx, ts: String(now - 400) }],
+    });
+
+    it("is the middle of the bid and ask, rounded down to the scale", async () => {
+      expect((await quoteOf("Coinbase", coinbase("100.49", "100.5"))).price).toBe(dollars(100.495));
+      expect((await quoteOf("Kraken", kraken("100.000001", "100.000002"))).price).toBe(
+        dollars(100.000001),
+      );
+      expect((await quoteOf("OKX", okx("100.49", "100.5"))).price).toBe(dollars(100.495));
+    });
+
+    it("is dated when Coinbase and Kraken answered, and when OKX took its snapshot", async () => {
+      expect((await quoteOf("Coinbase", coinbase("100", "101"))).atMs).toBe(now);
+      expect((await quoteOf("Kraken", kraken("100", "101"))).atMs).toBe(now);
+      expect((await quoteOf("OKX", okx("100", "101"))).atMs).toBe(now - 400);
+    });
+
+    it("may be locked, but a crossed, empty or missing side is refused", async () => {
+      expect((await quoteOf("Coinbase", coinbase("100", "100"))).price).toBe(dollars(100));
+      const cases: [string, (bid: string, ask: string) => unknown][] = [
+        ["Coinbase", coinbase],
+        ["Kraken", kraken],
+        ["OKX", okx],
+      ];
+      for (const [name, answer] of cases) {
+        await expect(quoteOf(name, answer("101", "100"))).rejects.toThrow("below the bid");
+        await expect(quoteOf(name, answer("", "100"))).rejects.toThrow();
+        await expect(quoteOf(name, answer("0", "100"))).rejects.toThrow("not above zero");
+        await expect(quoteOf(name, answer("-1", "100"))).rejects.toThrow("plain decimal");
+      }
+      await expect(quoteOf("Coinbase", { ask: "100" })).rejects.toThrow();
+      await expect(
+        quoteOf("Kraken", { error: [], result: { SOLUSD: { a: ["100"] } } }),
+      ).rejects.toThrow("no ticker");
+      await expect(
+        quoteOf("Kraken", { error: ["EQuery:Unknown asset pair"], result: {} }),
+      ).rejects.toThrow("Unknown asset pair");
+    });
   });
 });
 

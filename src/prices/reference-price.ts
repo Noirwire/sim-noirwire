@@ -88,16 +88,29 @@ const dollars = (text: string): bigint => {
   return price;
 };
 
-const coinbaseBody = z.object({ price: z.string(), time: z.string() });
-/** The answer holds the pair's trades as a list, beside a plain-text `last` cursor. */
+/** The middle of the best bid and ask, rounded down; a missing, zero or crossed quote is refused. */
+const midpoint = (bid: string, ask: string): bigint => {
+  const low = dollars(bid);
+  const high = dollars(ask);
+  if (high < low) throw new Error("the ask is below the bid");
+  return (low + high) / 2n;
+};
+
+const coinbaseBody = z.object({ bid: z.string(), ask: z.string() });
+/** The answer holds the pair's ticker, keyed by the exchange's own name for the pair. */
 const krakenBody = z.object({
   error: z.array(z.string()),
   result: z.record(z.string(), z.unknown()),
 });
-/** A trade: price, volume, then the time it happened in seconds, then fields this does not read. */
-const krakenTrade = z.tuple([z.string(), z.string(), z.number()]).rest(z.unknown());
+/** A ticker: `a` is the best ask and `b` the best bid, each led by its price, then fields this does not read. */
+const krakenTicker = z.object({
+  a: z.tuple([z.string()]).rest(z.unknown()),
+  b: z.tuple([z.string()]).rest(z.unknown()),
+});
 const okxBody = z.object({
-  data: z.array(z.object({ last: z.string(), ts: z.string().regex(/^\d+$/) })).min(1),
+  data: z
+    .array(z.object({ bidPx: z.string(), askPx: z.string(), ts: z.string().regex(/^\d+$/) }))
+    .min(1),
 });
 
 /**
@@ -105,11 +118,16 @@ const okxBody = z.object({
  * through the Solana RPC connection; the account is the one the exchange's SOL
  * market is bound to). It is pushed every few seconds, so it may be up to
  * `maxOracleAgeMs` old. The exchanges are the public SOL tickers of Coinbase,
- * Kraken and OKX, and no call carries a key.
+ * Kraken and OKX, and no call carries a key. Each exchange price is the middle
+ * of its best bid and ask, which is its quote now rather than its last trade,
+ * so a quiet market does not read as a stale one. Coinbase and Kraken say
+ * nothing of when the quote was set, so their reading is dated at the moment
+ * the answer arrived (`nowMs`); OKX dates its own snapshot.
  */
 export const referenceSources = (
   readAccount: ReadPythAccount,
   getJson: FetchJson = fetchJson,
+  nowMs: () => number = Date.now,
 ): ReferenceSource[] => [
   {
     name: "Pyth",
@@ -127,9 +145,8 @@ export const referenceSources = (
       const body = coinbaseBody.parse(
         await getJson("https://api.exchange.coinbase.com/products/SOL-USD/ticker"),
       );
-      const atMs = Date.parse(body.time);
-      if (Number.isNaN(atMs)) throw new Error(`"${body.time}" is not a time`);
-      return { source: "Coinbase", exchange: true, price: dollars(body.price), atMs };
+      const price = midpoint(body.bid, body.ask);
+      return { source: "Coinbase", exchange: true, price, atMs: nowMs() };
     },
   },
   {
@@ -137,19 +154,13 @@ export const referenceSources = (
     exchange: true,
     read: async () => {
       const body = krakenBody.parse(
-        await getJson("https://api.kraken.com/0/public/Trades?pair=SOLUSD&count=1"),
+        await getJson("https://api.kraken.com/0/public/Ticker?pair=SOLUSD"),
       );
       if (body.error.length > 0) throw new Error(body.error.join(", "));
-      const trades = Object.values(body.result).find(Array.isArray);
-      const trade = trades ? krakenTrade.safeParse(trades[trades.length - 1]) : null;
-      if (!trade?.success) throw new Error("no trade in the answer");
-      const [price, , seconds] = trade.data;
-      return {
-        source: "Kraken",
-        exchange: true,
-        price: dollars(price),
-        atMs: Math.round(seconds * MS_PER_SECOND),
-      };
+      const ticker = krakenTicker.safeParse(Object.values(body.result)[0]);
+      if (!ticker.success) throw new Error("no ticker in the answer");
+      const price = midpoint(ticker.data.b[0], ticker.data.a[0]);
+      return { source: "Kraken", exchange: true, price, atMs: nowMs() };
     },
   },
   {
@@ -162,7 +173,7 @@ export const referenceSources = (
       return {
         source: "OKX",
         exchange: true,
-        price: dollars(body.data[0].last),
+        price: midpoint(body.data[0].bidPx, body.data[0].askPx),
         atMs: Number(body.data[0].ts),
       };
     },
