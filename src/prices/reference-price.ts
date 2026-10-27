@@ -16,6 +16,8 @@ export interface PriceReading {
 export interface ReferenceSource {
   name: string;
   exchange: boolean;
+  /** The least time between two calls to `read`; a source without it is read every time. */
+  minIntervalMs?: number;
   read(): Promise<PriceReading>;
 }
 
@@ -42,6 +44,15 @@ export class SourceRefused extends Error {}
 /** The SOL/USD feed id of Pyth, as hex. The price account must carry this id. */
 export const SOL_USD_FEED_ID = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const MS_PER_SECOND = 1_000;
+/**
+ * How often each source is called, however often the price is asked for. The
+ * oracle is pushed every few seconds and may be 30 s old, so every 5 s costs
+ * it nothing (about 520,000 RPC calls a month instead of 2.6 million). An
+ * exchange reading may be 10 s old, and Kraken allows about one call a second
+ * per address, so every 2 s keeps each well inside both.
+ */
+export const PYTH_MIN_INTERVAL_MS = 5_000;
+export const EXCHANGE_MIN_INTERVAL_MS = 2_000;
 const MAX_PYTH_EXPONENT = 18;
 
 /**
@@ -132,6 +143,7 @@ export const referenceSources = (
   {
     name: "Pyth",
     exchange: false,
+    minIntervalMs: PYTH_MIN_INTERVAL_MS,
     read: async () => {
       const data = await readAccount();
       if (!data) throw new SourceRefused("the Pyth price account does not exist");
@@ -141,6 +153,7 @@ export const referenceSources = (
   {
     name: "Coinbase",
     exchange: true,
+    minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = coinbaseBody.parse(
         await getJson("https://api.exchange.coinbase.com/products/SOL-USD/ticker"),
@@ -152,6 +165,7 @@ export const referenceSources = (
   {
     name: "Kraken",
     exchange: true,
+    minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = krakenBody.parse(
         await getJson("https://api.kraken.com/0/public/Ticker?pair=SOLUSD"),
@@ -166,6 +180,7 @@ export const referenceSources = (
   {
     name: "OKX",
     exchange: true,
+    minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = okxBody.parse(
         await getJson("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDC"),
@@ -262,15 +277,37 @@ export const referenceOf = (
   };
 };
 
-/** Reads every source at once, and hands what came back to `referenceOf`. */
+/**
+ * Reads every source at once, and hands what came back to `referenceOf`. A
+ * source is called at most once per `minIntervalMs`; in between, its last
+ * answer is used again as it was, a reading keeping its own time (so it ages
+ * and goes stale when it would have) and a failure failing the same way (so a
+ * source that is down is not called every time either).
+ */
 export class ReferencePrice {
+  private readonly lastCalls = new Map<
+    ReferenceSource,
+    { atMs: number; answer: Promise<PriceReading> }
+  >();
+
   constructor(
     private readonly sources: ReferenceSource[],
     private readonly clock: Clock,
   ) {}
 
+  private readSource(source: ReferenceSource): Promise<PriceReading> {
+    const nowMs = this.clock.nowMs();
+    const last = this.lastCalls.get(source);
+    if (last && nowMs >= last.atMs && nowMs - last.atMs < (source.minIntervalMs ?? 0)) {
+      return last.answer;
+    }
+    const answer = source.read();
+    this.lastCalls.set(source, { atMs: nowMs, answer });
+    return answer;
+  }
+
   async read(): Promise<Reference> {
-    const answers = await Promise.allSettled(this.sources.map((source) => source.read()));
+    const answers = await Promise.allSettled(this.sources.map((source) => this.readSource(source)));
     const readings: PriceReading[] = [];
     const silent: string[] = [];
     const refusals: string[] = [];

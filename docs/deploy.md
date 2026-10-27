@@ -426,6 +426,12 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   (`SOLANA_RPC_URL`), from which it reads Pyth's SOL/USD price account. With one exchange
   blocked the maker keeps quoting on the rest as long as Pyth and two exchanges answer;
   with the Pyth account unreadable, or two of the exchanges blocked, it pulls its quotes.
+- **How often those sources are called:** the maker asks for the reference price every second,
+  but Pyth's account is read at most every 5 s (about 520,000 RPC calls a month, against 2.6
+  million if read every second) and each exchange at most every 2 s (Kraken allows about one
+  call a second per address). In between, the last reading is used again with its own time,
+  so it goes stale on the same limits as before (30 s for Pyth, 10 s for an exchange), and a
+  source that failed is not called again before its interval has passed.
 
 ### The hedge controller on mainnet (off by default)
 
