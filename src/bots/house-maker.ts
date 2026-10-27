@@ -379,6 +379,7 @@ export class HouseMaker {
     this.expiresInSeconds =
       Math.ceil(options.requoteIntervalMs / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
     this.hold = options.ledger?.state.hold ?? null;
+    this.unrunLadders = options.ledger?.state.unrunLadders ?? 0;
   }
 
   /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
@@ -784,9 +785,11 @@ export class HouseMaker {
       if (this.unrunLadders >= MAKER_LIMITS.unrunLaddersBeforeStop) {
         const repeated = new UnrunOrdersRepeated(this.unrunLadders, unrunReason);
         this.unrunLadders = 0;
+        await this.options.ledger?.update({ unrunLadders: 0 }).catch(() => {});
         await this.stopAfter(venue, repeated).catch(() => {});
         throw repeated;
       }
+      await this.options.ledger?.update({ unrunLadders: this.unrunLadders });
       return;
     }
     if (dispatching && this.hold === null) await this.clearDispatch(venue);
@@ -815,7 +818,10 @@ export class HouseMaker {
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
     if (orders.length > 0) {
-      this.unrunLadders = 0;
+      if (this.unrunLadders > 0) {
+        this.unrunLadders = 0;
+        await this.options.ledger?.update({ unrunLadders: 0 });
+      }
       safety?.requoteSucceeded();
     }
     if (resting.length > 0 && !next.reduceOnly) safety?.ladderResting(resting);

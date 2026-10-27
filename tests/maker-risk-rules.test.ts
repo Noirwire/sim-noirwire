@@ -3494,6 +3494,78 @@ describe("a ladder is recorded before any order of it is sent", () => {
     expect(said.alerts).toHaveLength(0);
   });
 
+  it("keeps the count of ladders that never ran across a restart", async () => {
+    const first = await rig("ladder-never-ran-restart");
+    await first.warmUp();
+    first.book.take();
+    first.book.neverRunsAfter = 2;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+
+    for (let ladder = 1; ladder < limit; ladder += 1) await first.tick(11);
+    expect(first.ledger.state.unrunLadders).toBe(limit - 1);
+
+    const { maker, ledger } = await first.open();
+    expect(ledger.state.unrunLadders).toBe(limit - 1);
+    first.book.take();
+    const keepTicking = async () => {
+      for (let second = 0; second < 40; second += 1) {
+        first.clock.advance(1_000);
+        await maker.tick(first.venue);
+      }
+    };
+    await expect(keepTicking()).rejects.toThrow(`${limit} ladders in a row`);
+
+    expect(ledger.state.mode).toBe("reduce");
+    expect(ledger.state.unrunLadders).toBe(0);
+  });
+
+  it("keeps the reset after a good ladder across a restart", async () => {
+    const first = await rig("ladder-never-ran-reset-restart");
+    await first.warmUp();
+    first.book.take();
+    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+
+    first.book.neverRunsAfter = 2;
+    for (let ladder = 1; ladder < limit; ladder += 1) await first.tick(11);
+    first.book.neverRunsAfter = null;
+    await first.tick(11);
+    expect(first.ledger.state.unrunLadders).toBe(0);
+
+    const { ledger } = await first.open();
+    expect(ledger.state.unrunLadders).toBe(0);
+    expect(ledger.state.mode).toBe("run");
+    const onDisk = JSON.parse(await readFile(makerStatePath(first.dir, PERP), "utf8"));
+    expect(onDisk.unrunLadders).toBe(0);
+  });
+
+  it("starts the count at none when the saved one is missing or not valid", async () => {
+    for (const saved of [undefined, "many", -3, 1.5, null]) {
+      const dir = join(ROOT, `ladder-count-${String(saved)}`);
+      await rm(dir, { recursive: true, force: true });
+      const path = makerStatePath(dir, PERP);
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        path,
+        JSON.stringify({
+          mode: "run",
+          reason: null,
+          flattenStartedAtMs: null,
+          day: null,
+          dayStartEquity: null,
+          peakEquity: null,
+          lastCommandAtMs: 0,
+          spotBaseAtStart: null,
+          unrunLadders: saved,
+        }),
+      );
+
+      const ledger = await MakerLedger.open(path);
+
+      expect(ledger.state.mode).toBe("run");
+      expect(ledger.state.unrunLadders).toBe(0);
+    }
+  });
+
   it("still falls back to the soft stop at once for a margin or invalid-order refusal", async () => {
     for (const reason of [
       "InsufficientMargin",
