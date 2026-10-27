@@ -44,14 +44,16 @@ export const registerOpenRoutes = (
   ctx: AppContext,
   desk: OpenRequests,
 ): void => {
-  /** The desk takes one call at a time, so a burst cannot all pass the limits before the first is written down. */
-  let deskBusy = false;
-
-  const turnedAway = (): string | null => deskUnavailable(ctx) ?? (deskBusy ? DESK_BUSY : null);
+  /**
+   * One prepare at a time, so a burst cannot all pass the limits before the first is written down.
+   * A submit does not take part: it sends a seat that is already written down, the desk allows one
+   * send per owner, and it may wait for the rollup to confirm for many seconds, which must not
+   * turn other people's prepares and submits away.
+   */
+  let preparing = false;
 
   /** The desk's answer, or null when it failed: the failure is logged, and the caller is only told to retry. */
   const asked = async <T>(what: string, ask: () => Promise<T>): Promise<T | null> => {
-    deskBusy = true;
     try {
       const answer = await ask();
       ctx.problems?.onRecovered(what);
@@ -59,8 +61,6 @@ export const registerOpenRoutes = (
     } catch (error) {
       ctx.problems?.onError(what, error);
       return null;
-    } finally {
-      deskBusy = false;
     }
   };
 
@@ -69,12 +69,15 @@ export const registerOpenRoutes = (
     if (!parsed.success) {
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
-    const reason = turnedAway();
+    const reason = deskUnavailable(ctx) ?? (preparing ? DESK_BUSY : null);
     if (reason) return reply.status(503).send({ error: reason });
 
+    preparing = true;
     const prepared = await asked("opening an account (prepare)", () =>
       desk.prepare({ ...parsed.data, ip: request.ip }),
-    );
+    ).finally(() => {
+      preparing = false;
+    });
     if (!prepared) return reply.status(502).send({ error: DESK_UNREACHABLE });
     if (!prepared.ok) return reply.status(prepared.status).send({ error: prepared.reason });
     return { transaction: prepared.transaction, expiresAtMs: prepared.expiresAtMs };
@@ -86,7 +89,7 @@ export const registerOpenRoutes = (
       return reply.status(400).send({ error: "invalid request", issues: parsed.error.issues });
     }
     const { owner, transaction } = parsed.data;
-    const reason = turnedAway();
+    const reason = deskUnavailable(ctx);
     if (reason) return reply.status(503).send({ error: reason });
 
     const opened = await asked("opening an account (submit)", () =>

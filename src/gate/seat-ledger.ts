@@ -185,6 +185,19 @@ export class SeatLedger {
   }
 
   /**
+   * Seats reserved at or before `cutoffMs` with no transaction ever recorded for them. A transaction
+   * is handed out only after `track` has saved its signature, so nothing was sent for these.
+   */
+  reservedWithoutTransaction(cutoffMs: number): SeatRecord[] {
+    return this.records.filter(
+      (record) =>
+        record.state === "unconfirmed" &&
+        (record.signatures?.length ?? 0) === 0 &&
+        record.atMs <= cutoffMs,
+    );
+  }
+
+  /**
    * Records a seat as sent and saves it. Throws if it cannot be saved: nothing may be signed unrecorded.
    * Call `ready` first: with the key made, the record is in memory before this first waits, so a
    * decision made just before it cannot be overtaken. The signatures of an earlier try for the same
@@ -219,6 +232,33 @@ export class SeatLedger {
     };
     record.signatures = [...(record.signatures ?? []), signature];
     record.lastValidBlockHeight = Math.max(record.lastValidBlockHeight ?? 0, lastValidBlockHeight);
+    try {
+      await this.save();
+    } catch (error) {
+      Object.assign(record, before);
+      throw error;
+    }
+  }
+
+  /**
+   * Takes back a transaction that `track` recorded and that was never handed out, and puts the last
+   * valid block height back to what it was before. Only for a caller that is the sole writer of the
+   * seat since that `track`. Throws, changing nothing, if it cannot be saved.
+   */
+  async untrack(
+    invite: string,
+    signature: string,
+    lastValidBlockHeight: number | undefined,
+  ): Promise<void> {
+    const record = this.forInvite(invite);
+    if (record?.state !== "unconfirmed") return;
+    const before = {
+      signatures: record.signatures,
+      lastValidBlockHeight: record.lastValidBlockHeight,
+    };
+    record.signatures = (record.signatures ?? []).filter((entry) => entry !== signature);
+    if (lastValidBlockHeight === undefined) delete record.lastValidBlockHeight;
+    else record.lastValidBlockHeight = lastValidBlockHeight;
     try {
       await this.save();
     } catch (error) {

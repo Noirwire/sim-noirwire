@@ -19,6 +19,7 @@ import { buildServer } from "../src/http/server.js";
 import type { ChainExchange } from "../src/rollup/chain-types.js";
 import { Session } from "../src/rollup/connections.js";
 import { OpenDesk } from "../src/rollup/open-desk.js";
+import { reconcileSeat } from "../src/rollup/reconcile-seat.js";
 import { Program } from "../src/rollup/program.js";
 
 const DIR = join("data-test", `open-desk-${Date.now()}`);
@@ -72,6 +73,10 @@ const serviceWith = async (
     /** Held back until released: a send, or the reading of the block height. */
     sendHold: Promise<void> | null;
     heightHold: Promise<void> | null;
+    /** Held back until released: the blockhash a transaction is built on. */
+    blockhashHold: Promise<void> | null;
+    /** The last valid block height of the next blockhash. */
+    lastValidBlockHeight: number;
     /** What the history says about one signature, when it should differ from the rest. */
     history: Record<string, { confirmationStatus: string; err: unknown } | null>;
     /** The endpoint refuses the transaction at the door. */
@@ -86,13 +91,18 @@ const serviceWith = async (
     status: "finalized",
     sendHold: null,
     heightHold: null,
+    blockhashHold: null,
+    lastValidBlockHeight: 1,
   };
   const connection = {
     rpcEndpoint: "https://rollup.example",
-    getLatestBlockhash: async () => ({
-      blockhash: Keypair.generate().publicKey.toBase58(),
-      lastValidBlockHeight: 1,
-    }),
+    getLatestBlockhash: async () => {
+      await answer.blockhashHold;
+      return {
+        blockhash: Keypair.generate().publicKey.toBase58(),
+        lastValidBlockHeight: answer.lastValidBlockHeight,
+      };
+    },
     sendRawTransaction: async (raw: Buffer) => {
       await answer.sendHold;
       if (answer.door) throw new Error("429 too many requests");
@@ -134,8 +144,9 @@ const serviceWith = async (
   const problems: string[] = [];
   const program = new Program(Keypair.generate().publicKey.toBase58());
   /** A desk with its own admission and seat record read from the file: a restarted service when made again. */
-  const makeDesk = () =>
+  const makeDesk = (sweepEveryMs?: number) =>
     new OpenDesk({
+      ...(sweepEveryMs === undefined ? {} : { sweepEveryMs }),
       program,
       session: Session.of(connection),
       gate,
@@ -226,6 +237,7 @@ const serviceWith = async (
     clock,
     desk,
     makeDesk,
+    connection,
   };
 };
 
@@ -669,7 +681,7 @@ describe("opening an account on mainnet", () => {
     expect(decisions.filter((decision) => decision.ok)).toHaveLength(1);
   });
 
-  it("does not free the seat when an older transaction is refused after a newer one replaced it", async () => {
+  it("keeps the seat when a transaction being sent is refused, and hands out a new one afterwards", async () => {
     const { owners, desk, answer, signedBy, dir } = await serviceWith(
       (o) => `${o[0].publicKey.toBase58()}\n`,
       { outcome: { err: { InstructionError: [0, { Custom: 6000 }] } } },
@@ -685,14 +697,15 @@ describe("opening an account on mainnet", () => {
       "10.0.0.7",
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const newer = await desk.prepare(askFor(owner, "10.0.0.7"));
-    if (!newer.ok) throw new Error("not prepared");
+    expect((await desk.prepare(askFor(owner, "10.0.0.7"))).ok).toBe(false);
     answer.sendHold = null;
     release();
 
     expect((await sending).ok).toBe(false);
 
     expect(seatsIn(dir).forInvite(inviteOf(owner))?.state).toBe("unconfirmed");
+    const newer = await desk.prepare(askFor(owner, "10.0.0.7"));
+    if (!newer.ok) throw new Error("not prepared");
     answer.outcome = "executed";
     const opened = await desk.submit(
       owner.publicKey.toBase58(),
@@ -742,6 +755,98 @@ describe("opening an account on mainnet", () => {
     const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
     expect(seat?.state).toBe("opened");
     expect(seat?.signatures).toBeUndefined();
+  });
+
+  /** A seat reserved and saved, then the process died before any transaction was signed for it. */
+  const orphanSeat = async (dir: string, owner: Keypair) => {
+    const ledger = seatsIn(dir);
+    await ledger.ready();
+    await ledger.reserve(inviteOf(owner), owner.publicKey.toBase58(), "10.0.0.7", 1_000_000);
+  };
+
+  it("frees a seat reserved without a transaction once the grace has passed, when the service starts", async () => {
+    const { owners, makeDesk, clock, dir } = await serviceWith(everyone);
+    await orphanSeat(dir, owners[0]);
+    clock.advance(31_000);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await vi.waitFor(() => expect(seatsIn(dir).forInvite(inviteOf(owners[0]))).toBeUndefined());
+    } finally {
+      restarted.stopSweeping();
+    }
+    expect(seatsIn(dir).seatsToday(clock.nowMs())).toBe(0);
+  });
+
+  it("keeps a seat reserved without a transaction while it is younger than the grace", async () => {
+    const { owners, makeDesk, dir } = await serviceWith(everyone);
+    await orphanSeat(dir, owners[0]);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await restarted.prepare(askFor(owners[1], "10.0.0.8"));
+    } finally {
+      restarted.stopSweeping();
+    }
+
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+  });
+
+  it("never frees a seat that has a signed transaction, however old, until the chain says it did not land", async () => {
+    const { owners, desk, makeDesk, clock, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(600_000);
+    const restarted = makeDesk(60_000);
+
+    restarted.startSweeping();
+    try {
+      await restarted.prepare(askFor(owners[1], "10.0.0.8"));
+    } finally {
+      restarted.stopSweeping();
+    }
+
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.state).toBe("unconfirmed");
+    expect(seat?.signatures).toHaveLength(1);
+  });
+
+  it("settles an abandoned seat on the timer with no prepare", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    const restarted = makeDesk(20);
+
+    restarted.startSweeping();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
+
+      answer.blockHeight = 10;
+      answer.landed = true;
+      await vi.waitFor(() =>
+        expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("opened"),
+      );
+    } finally {
+      restarted.stopSweeping();
+    }
+  });
+
+  it("does not sweep after it is stopped", async () => {
+    const { owners, desk, makeDesk, clock, answer, dir } = await serviceWith(everyone);
+    await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    clock.advance(60_000);
+    const restarted = makeDesk(20);
+
+    restarted.startSweeping();
+    restarted.stopSweeping();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    answer.blockHeight = 10;
+    answer.landed = true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(seatsIn(dir).forInvite(inviteOf(owners[0]))?.state).toBe("unconfirmed");
   });
 
   it("keeps a seat reserved while the transaction is only processed, and records it once confirmed", async () => {
@@ -810,6 +915,82 @@ describe("opening an account on mainnet", () => {
 
     expect(answers.map((answer) => (answer.ok ? 200 : answer.status))).toEqual([200, 409]);
     expect(sent).toHaveLength(1);
+  });
+
+  it("hands out no second transaction for an owner whose first is being sent, and sends exactly one", async () => {
+    const { owners, desk, signedBy, sent, answer } = await serviceWith(everyone);
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    const owner = owners[0].publicKey.toBase58();
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    const other = await desk.prepare({
+      ...askFor(owners[0], "10.0.0.7"),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+    });
+    const same = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    const different = await desk.prepare(askFor(owners[1], "10.0.0.8"));
+
+    expect(other.ok).toBe(false);
+    expect(same.ok).toBe(false);
+    if (!other.ok) expect(other.status).toBe(409);
+    expect(different.ok).toBe(true);
+    release();
+    expect((await sending).ok).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("drops the record of a transaction refused because a send began while it was built, so the sweep need not wait for its blockhash", async () => {
+    const { owners, desk, signedBy, answer, dir, connection } = await serviceWith(everyone);
+    const owner = owners[0].publicKey.toBase58();
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    answer.blockHeight = 3;
+    answer.lastValidBlockHeight = 5;
+    let building = () => {};
+    answer.blockhashHold = new Promise<void>((resolve) => (building = resolve));
+    const other = desk.prepare({
+      ...askFor(owners[0], "10.0.0.7"),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    building();
+
+    const refused = await other;
+    expect(refused.ok).toBe(false);
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.signatures).toHaveLength(1);
+    expect(seat?.lastValidBlockHeight).toBe(1);
+
+    answer.landed = true;
+    expect(await reconcileSeat(Session.of(connection), seat ?? {}, () => {})).toBe("landed");
+
+    answer.sendHold = null;
+    release();
+    await sending;
+  });
+
+  it("hands out a transaction again once a send has failed", async () => {
+    const { owners, desk, signedBy, answer } = await serviceWith(everyone, { outcome: "silent" });
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    const owner = owners[0].publicKey.toBase58();
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    expect((await desk.prepare(askFor(owners[0], "10.0.0.7"))).ok).toBe(false);
+    release();
+    expect((await sending).ok).toBe(false);
+
+    answer.sendHold = null;
+    expect((await desk.prepare(askFor(owners[0], "10.0.0.7"))).ok).toBe(true);
   });
 
   it("keeps the seat reserved when the endpoint refuses at the door, and lets the sweep free it once the blockhash is past", async () => {

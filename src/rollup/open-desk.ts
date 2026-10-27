@@ -12,6 +12,9 @@ import { checkSubmitted } from "./submitted-transaction.js";
 import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
 
 const PREPARED_FOR_MS = 45_000;
+const SWEEP_EVERY_MS = 60_000;
+/** A reserved seat with no signed transaction this old is not a prepare in progress. */
+const UNSENT_GRACE_MS = 30_000;
 
 type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
 
@@ -36,6 +39,12 @@ export interface OpenRequests {
   submit(owner: string, transactionBase64: string, ip: string): Promise<Opened>;
 }
 
+/** What the service starts and stops around the desk: the timer that settles seats. */
+export interface SeatSweeping {
+  startSweeping(): void;
+  stopSweeping(): void;
+}
+
 export interface OpenDeskOptions {
   program: Program;
   /** The gate's connection, opened again after a failure on the wire. */
@@ -48,6 +57,8 @@ export interface OpenDeskOptions {
   /** One line per decision, with the owner's public key and nothing else about the person. */
   log(line: string): void;
   onError(what: string, error: unknown): void;
+  /** How often unsettled seats are looked at without a prepare; a minute when absent. */
+  sweepEveryMs?: number;
 }
 
 interface PreparedRequest {
@@ -124,13 +135,18 @@ const accountIsThere = (error: unknown): boolean =>
  * not landed signs the replacement. The signatures and the last valid block
  * height are written in the seat record when the transaction is handed out, so
  * this also settles seats after a restart. Prepares and the sweep run one at a
- * time, so no decision is made on a count another is about to change. The user
+ * time, so no decision is made on a count another is about to change; the sweep
+ * also runs on a timer (`startSweeping`) and at its start, so seats settle with no
+ * traffic, and it frees a seat that was reserved but never got a signed transaction.
+ * The user
  * deposits in a transaction of their own. Every decision is logged with the
  * owner's public key alone.
  */
-export class OpenDesk implements OpenRequests {
+export class OpenDesk implements OpenRequests, SeatSweeping {
   private readonly prepared = new Map<string, PreparedRequest>();
   private lock: Promise<unknown> = Promise.resolve();
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  private sweeping = false;
 
   constructor(private readonly options: OpenDeskOptions) {}
 
@@ -170,8 +186,10 @@ export class OpenDesk implements OpenRequests {
     const { program, session, gate, admission, clock, log, onError } = this.options;
     const { owner, orderKeys, invite, ip } = request;
     const now = clock.nowMs();
+    await this.releaseUnsent(now);
     await this.settleExpired(now, owner);
     const outstanding = this.prepared.get(owner);
+    if (outstanding?.sending) return this.refuseWhileSending(owner);
     const asked = admission.check(owner, invite, ip, this.programSeatsPerDay());
     if (!asked.ok) {
       log(`gate: ${owner} prepare refused: ${asked.reason}`);
@@ -179,7 +197,6 @@ export class OpenDesk implements OpenRequests {
     }
     if (
       outstanding &&
-      !outstanding.sending &&
       outstanding.expiresAtMs > now &&
       outstanding.orderKeys === orderKeys.join(",")
     ) {
@@ -253,9 +270,11 @@ export class OpenDesk implements OpenRequests {
     const wire = transaction
       .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString("base64");
+    const signature = base58Of(gateSignature?.signature ?? new Uint8Array(64));
+    const heightBefore = admission.lastValidBlockHeightOf(decision.invite);
     const written = await admission.track(
       decision.invite,
-      base58Of(gateSignature?.signature ?? new Uint8Array(64)),
+      signature,
       transaction.lastValidBlockHeight ?? 0,
     );
     if (!written) {
@@ -264,6 +283,12 @@ export class OpenDesk implements OpenRequests {
       }
       log(`gate: ${owner} prepare refused: the seat record could not be written`);
       return RECORD_NOT_WRITTEN;
+    }
+    // A submit may have started sending the earlier transaction while this one was being built.
+    if (this.prepared.get(owner)?.sending) {
+      // This transaction is never handed out, so it must not hold the seat until its blockhash expires.
+      await this.settle(() => admission.untrack(decision.invite, signature, heightBefore));
+      return this.refuseWhileSending(owner);
     }
     this.prepared.set(owner, {
       message: transaction.serializeMessage(),
@@ -276,6 +301,16 @@ export class OpenDesk implements OpenRequests {
       sending: false,
     });
     return { ok: true, transaction: wire, expiresAtMs };
+  }
+
+  /** While a transaction for an owner is being sent, no other is handed out: two could both open. */
+  private refuseWhileSending(owner: string): OpenPrepared {
+    this.options.log(`gate: ${owner} prepare refused: an opening is being sent`);
+    return {
+      ok: false,
+      status: 409,
+      reason: "this account opening is already being sent, wait for it",
+    };
   }
 
   /**
@@ -323,6 +358,56 @@ export class OpenDesk implements OpenRequests {
         onError("settling an unsubmitted account opening failed, its seat stays reserved", error);
       }
     }
+  }
+
+  /**
+   * A seat reserved but never given a signature: `prepare` writes the seat, builds the
+   * transaction, and only then saves its signature, and nothing is handed out or sent before
+   * that save succeeds. A seat still without one after a short grace therefore had nothing sent
+   * for it (a crash between the two steps), and is freed. A seat with a signature is never
+   * touched here: it is settled by the chain in `settleExpired`.
+   */
+  private async releaseUnsent(nowMs: number): Promise<void> {
+    const { admission, log } = this.options;
+    for (const seat of admission.reservedWithoutTransaction(nowMs - UNSENT_GRACE_MS)) {
+      await this.settle(() => admission.release(seat.invite));
+      log(`gate: ${seat.owner} reserved seat without a transaction, freed`);
+    }
+  }
+
+  /** Settles every seat the chain or the record can settle, without waiting for a prepare. */
+  private sweepLocked = async (): Promise<void> => {
+    const now = this.options.clock.nowMs();
+    await this.releaseUnsent(now);
+    await this.settleExpired(now, "");
+  };
+
+  /**
+   * Settles seats now and then every `sweepEveryMs` until `stopSweeping`, so the day's quotas
+   * are right without anyone calling `prepare`. A sweep that finds the last one still running
+   * is skipped; a failure is reported and the next sweep tries again.
+   */
+  startSweeping(): void {
+    if (this.sweepTimer) return;
+    const sweep = async (): Promise<void> => {
+      if (this.sweeping) return;
+      this.sweeping = true;
+      try {
+        await this.locked(this.sweepLocked);
+      } catch (error) {
+        this.options.onError("settling account openings failed", error);
+      } finally {
+        this.sweeping = false;
+      }
+    };
+    this.sweepTimer = setInterval(() => void sweep(), this.options.sweepEveryMs ?? SWEEP_EVERY_MS);
+    this.sweepTimer.unref();
+    void sweep();
+  }
+
+  stopSweeping(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
   }
 
   async submit(owner: string, transactionBase64: string, ip: string): Promise<Opened> {

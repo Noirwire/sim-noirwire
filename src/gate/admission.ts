@@ -129,9 +129,24 @@ export class Admission {
     }
   }
 
+  /** The last block height at which a transaction handed out for this invite can still land. */
+  lastValidBlockHeightOf(invite: string): number | undefined {
+    return this.ledger.forInvite(invite)?.lastValidBlockHeight;
+  }
+
+  /** Takes back a transaction written down by `track` that was never handed out. */
+  untrack(invite: string, signature: string, lastValidBlockHeight: number | undefined) {
+    return this.ledger.untrack(invite, signature, lastValidBlockHeight);
+  }
+
   /** Seats sent and not confirmed that have signatures to look up. */
   awaitingSettlement(): SeatRecord[] {
     return this.ledger.awaitingSettlement();
+  }
+
+  /** Seats reserved at or before `cutoffMs` for which no transaction was ever signed. */
+  reservedWithoutTransaction(cutoffMs: number): SeatRecord[] {
+    return this.ledger.reservedWithoutTransaction(cutoffMs);
   }
 
   /** The rollup confirmed the seat. */
