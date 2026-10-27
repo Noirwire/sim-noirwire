@@ -593,9 +593,9 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
       log(`gate: ${owner} submit refused: ${decision.reason}`);
       return decision;
     }
-    // The seat counts toward the day's limits from here, in the same turn as the check above:
+    // The seat is charged to this address from here, in the same turn as the check above:
     // two submits cannot both pass the same count.
-    const committed = admission.commit(decision.invite);
+    const committed = admission.commit(decision.invite, ip);
     request.sending = true;
     if (!(await committed)) {
       request.sending = false;

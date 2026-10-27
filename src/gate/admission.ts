@@ -22,7 +22,7 @@ const NEXT_DAY = "it resets at 00:00 UTC";
 /** Prepares that nobody has submitted yet which one network address may hold at once. */
 export const HELD_RESERVATIONS_PER_ADDRESS = 1;
 
-/** Every seat left for the day is held by a prepare that has not been submitted yet. */
+/** The day is full, but some of its seats are prepares that have not been submitted and may be freed. */
 export const RESERVATIONS_HELD: NotAdmitted = {
   ok: false,
   status: 503,
@@ -49,11 +49,12 @@ export const RECORD_NOT_WRITTEN: NotAdmitted = {
  * the smaller of the configured one and one under the program's
  * `max_seats_per_day`, so the program's own limit is never the first to say no.
  *
- * The day's limits count seats whose owner submitted, or that landed, and not a
- * prepare that only holds a transaction: someone who prepares and never signs
- * must not use up the day. Such a prepare is a reservation, held under a limit
- * of its own (at most the seats left for the day, and one per network address)
- * and freed when its transaction can no longer land.
+ * A prepare hands out a gate-signed transaction that its owner can send without
+ * asking the gate, so it counts toward the day's limits like any seat until the
+ * chain shows it cannot land. What a refusal says tells the two apart: "all
+ * given out" only when seats that were submitted or landed fill the day, and
+ * "try again in a minute" while some of the counted seats are prepares that
+ * may yet be freed. One network address holds one prepare at a time.
  */
 export class Admission {
   constructor(
@@ -102,26 +103,33 @@ export class Admission {
     }
     const perDay = Math.min(this.limits.perDay, programSeatsPerDay - 1);
     const now = this.clock.nowMs();
-    const counted = this.ledger.seatsToday(now, id);
-    if (counted >= perDay) {
-      return {
-        ok: false,
-        status: 503,
-        reason: `today's new accounts are all given out: try again tomorrow, ${NEXT_DAY}`,
-      };
-    }
-    if (this.ledger.seatsTodayFor(asker, now, id) >= this.limits.perAskerPerDay) {
-      return {
-        ok: false,
-        status: 429,
-        reason: `this network address has opened its account for today: try again tomorrow, ${NEXT_DAY}`,
-      };
-    }
-    if (holding) {
-      if (this.ledger.heldReservations(id) >= perDay - counted) return RESERVATIONS_HELD;
-      if (this.ledger.heldReservationsFor(asker, id) >= HELD_RESERVATIONS_PER_ADDRESS) {
-        return ADDRESS_HOLDS_ONE;
+    // A prepare counts like any seat: its gate-signed transaction can be sent without asking the gate.
+    if (this.ledger.seatsToday(now, id, owner) >= perDay) {
+      // Sold out only when seats that were submitted or landed fill the day; else some may yet be freed.
+      if (this.ledger.submittedToday(now, id, owner) >= perDay) {
+        return {
+          ok: false,
+          status: 503,
+          reason: `today's new accounts are all given out: try again tomorrow, ${NEXT_DAY}`,
+        };
       }
+      return RESERVATIONS_HELD;
+    }
+    if (this.ledger.seatsTodayFor(asker, now, id, owner) >= this.limits.perAskerPerDay) {
+      if (this.ledger.submittedTodayFor(asker, now, id, owner) >= this.limits.perAskerPerDay) {
+        return {
+          ok: false,
+          status: 429,
+          reason: `this network address has opened its account for today: try again tomorrow, ${NEXT_DAY}`,
+        };
+      }
+      return ADDRESS_HOLDS_ONE;
+    }
+    if (
+      holding &&
+      this.ledger.heldReservationsFor(asker, id, owner) >= HELD_RESERVATIONS_PER_ADDRESS
+    ) {
+      return ADDRESS_HOLDS_ONE;
     }
     return {
       ok: true,
@@ -132,8 +140,8 @@ export class Admission {
 
   /**
    * Checks again and writes the seat down before anything is signed. A seat that cannot be written
-   * down is refused. A `held` seat is a prepare nobody has submitted: it counts toward the reservation
-   * limits only, until `commit`.
+   * down is refused. A `held` seat is a prepare nobody has submitted: it counts like any seat, and
+   * is told apart from a submitted one until `commit`.
    */
   async admit(
     owner: string,
@@ -160,13 +168,14 @@ export class Admission {
   }
 
   /**
-   * The owner submitted: the seat now counts toward the day's limits. Call it in the same turn as
-   * the `check` that allowed the submit, before anything waits, so two submits cannot pass the same
-   * count. False if the record could not be saved, and then nothing may be sent.
+   * The owner submitted from `asker`: the seat is charged to that address, the one `check` just
+   * judged. Call it in the same turn as the `check` that allowed the submit, before anything waits,
+   * so two submits cannot pass the same count. False if the record could not be saved, and then
+   * nothing may be sent.
    */
-  async commit(invite: string): Promise<boolean> {
+  async commit(invite: string, asker: string): Promise<boolean> {
     try {
-      await this.ledger.commit(invite);
+      await this.ledger.commit(invite, asker);
       return true;
     } catch {
       return false;

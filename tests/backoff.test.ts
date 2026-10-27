@@ -2,9 +2,10 @@ import { EventEmitter } from "node:events";
 import type { Connection } from "@solana/web3.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProblemLog } from "../src/logging/problem-log.js";
-import { backOffReconnects } from "../src/rollup/connections.js";
+import { backOffReconnects, connectionTo, useReconnectBackoff } from "../src/rollup/connections.js";
 import {
   MAINNET_WAKE_BACKOFF,
+  ROLLUP_BACKOFF,
   backoffDelayMs,
   retryWithBackoff,
 } from "../src/scheduling/backoff.js";
@@ -360,6 +361,42 @@ class FakeReconnectingSocket extends EventEmitter {
 
 const connectionWith = (socket: FakeReconnectingSocket): Connection =>
   ({ _rpcWebSocket: socket }) as unknown as Connection;
+
+describe("a mainnet websocket the endpoint refuses", () => {
+  it("never waits longer than 30 s for a retry", () => {
+    const socket = new FakeReconnectingSocket();
+    backOffReconnects(connectionWith(socket), MAINNET_WAKE_BACKOFF);
+    expect(socket.latest).toBe(5_000);
+
+    const waits: number[] = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      socket.emit("error", new Error("403"));
+      waits.push(socket.latest ?? 0);
+    }
+
+    expect(waits).toEqual([10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000]);
+  });
+
+  it("is what a connection opened by the service uses once mainnet is chosen", () => {
+    useReconnectBackoff(MAINNET_WAKE_BACKOFF);
+    try {
+      const connection = connectionTo("http://rollup.example", "ws://rollup.example");
+      const socket = (
+        connection as unknown as {
+          _rpcWebSocket: EventEmitter & { setReconnectInterval(ms: number): void };
+        }
+      )._rpcWebSocket;
+      const waits: number[] = [];
+      vi.spyOn(socket, "setReconnectInterval").mockImplementation((ms: number) => {
+        waits.push(ms);
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) socket.emit("error", new Error("403"));
+      expect(Math.max(...waits)).toBe(30_000);
+    } finally {
+      useReconnectBackoff(ROLLUP_BACKOFF);
+    }
+  });
+});
 
 describe("a websocket the endpoint refuses", () => {
   it("waits 5 s for the first retry, then twice as long after each refusal, up to 5 minutes", () => {

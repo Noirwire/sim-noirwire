@@ -35,33 +35,33 @@ const openGate = (limits = { perDay: 3, perAskerPerDay: 1 }) => {
 };
 
 describe("reservations and the day's quota", () => {
-  it("does not count a prepare nobody submitted toward the day or the address", async () => {
+  it("counts a prepare nobody submitted toward the day and the address", async () => {
     const { admission, ledger, clock } = openGate({ perDay: 2, perAskerPerDay: 1 });
 
     const held = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX, true);
 
     expect(held.ok).toBe(true);
-    expect(ledger.seatsToday(clock.nowMs())).toBe(0);
-    expect(ledger.seatsTodayFor("1.1.1.1", clock.nowMs())).toBe(0);
-    expect(ledger.heldReservations()).toBe(1);
+    expect(ledger.seatsToday(clock.nowMs())).toBe(1);
+    expect(ledger.seatsTodayFor("1.1.1.1", clock.nowMs())).toBe(1);
+    expect(ledger.submittedToday(clock.nowMs())).toBe(0);
   });
 
-  it("counts the seat from the commit on", async () => {
+  it("tells a submitted seat from a prepare once the owner has submitted", async () => {
     const { admission, ledger, clock } = openGate();
     const held = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX, true);
     if (!held.ok) throw new Error("expected a reservation");
 
-    expect(await admission.commit(held.invite)).toBe(true);
+    expect(await admission.commit(held.invite, "2.2.2.2")).toBe(true);
 
     expect(ledger.seatsToday(clock.nowMs())).toBe(1);
-    expect(ledger.heldReservations()).toBe(0);
+    expect(ledger.submittedToday(clock.nowMs())).toBe(1);
+    expect(ledger.seatsTodayFor("2.2.2.2", clock.nowMs())).toBe(1);
+    expect(ledger.seatsTodayFor("1.1.1.1", clock.nowMs())).toBe(0);
   });
 
-  it("holds at most the remaining seats of the day at once, and answers that openings are in progress", async () => {
+  it("answers that openings are in progress while prepares fill the day, and sold out only once submitted seats do", async () => {
     const { admission } = openGate({ perDay: 2, perAskerPerDay: 5 });
-    expect((await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX, true)).ok).toBe(
-      true,
-    );
+    const first = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX, true);
     expect((await admission.admit(newKey(), undefined, "2.2.2.2", PROGRAM_MAX, true)).ok).toBe(
       true,
     );
@@ -72,6 +72,23 @@ describe("reservations and the day's quota", () => {
     expect(refused.ok ? "" : refused.reason).toBe(
       "new accounts are being opened right now: try again in a minute",
     );
+
+    if (!first.ok) throw new Error("expected a reservation");
+    await admission.commit(first.invite, "1.1.1.1");
+    const second = await admission.admit(newKey(), undefined, "4.4.4.4", PROGRAM_MAX, true);
+    expect(second).toEqual(RESERVATIONS_HELD);
+    const held = admission.check(newKey(), undefined, "5.5.5.5", PROGRAM_MAX);
+    expect(held.ok ? "" : held.reason).not.toContain("all given out");
+  });
+
+  it("says all given out when submitted seats alone fill the day", async () => {
+    const { admission } = openGate({ perDay: 1, perAskerPerDay: 5 });
+    const only = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX);
+    expect(only.ok).toBe(true);
+
+    const refused = await admission.admit(newKey(), undefined, "2.2.2.2", PROGRAM_MAX, true);
+
+    expect(refused.ok ? "" : refused.reason).toContain("all given out");
   });
 
   it("holds one reservation per address", async () => {
@@ -85,7 +102,7 @@ describe("reservations and the day's quota", () => {
     expect(second).toMatchObject({ ok: false, status: 429 });
   });
 
-  it("never says sold out because of reservations alone", async () => {
+  it("never says sold out because of reservations alone, however many addresses prepare", async () => {
     const { admission } = openGate({ perDay: 3, perAskerPerDay: 1 });
     for (let at = 0; at < 20; at += 1) {
       await admission.admit(newKey(), undefined, `198.51.100.${at}`, PROGRAM_MAX, true);
@@ -93,27 +110,41 @@ describe("reservations and the day's quota", () => {
 
     const visitor = await admission.admit(newKey(), undefined, "203.0.113.9", PROGRAM_MAX, true);
 
+    expect(visitor.ok).toBe(false);
     expect(visitor.ok ? "" : visitor.reason).not.toContain("all given out");
   });
 
-  it("keeps the day's cap when many submits are checked and committed at once", async () => {
+  it("keeps the day's cap when many openings are decided at once", async () => {
     const { admission, ledger, clock } = openGate({ perDay: 2, perAskerPerDay: 50 });
-    const owners = Array.from({ length: 6 }, newKey);
-    // Reservations beyond the cap, as after the cap was lowered and the service restarted.
-    for (const [at, owner] of owners.entries()) {
-      await ledger.reserve(`key:${owner}`, owner, `10.0.0.${at}`, clock.nowMs(), true);
+
+    const answers = await Promise.all(
+      Array.from({ length: 6 }, (_, at) =>
+        admission.admit(newKey(), undefined, `10.0.0.${at}`, PROGRAM_MAX),
+      ),
+    );
+
+    expect(answers.filter((answer) => answer.ok)).toHaveLength(2);
+    expect(ledger.seatsToday(clock.nowMs())).toBe(2);
+  });
+
+  it("keeps the day's cap when prepared seats are submitted at once", async () => {
+    const { admission, ledger, clock } = openGate({ perDay: 3, perAskerPerDay: 50 });
+    const prepared = [];
+    for (let at = 0; at < 3; at += 1) {
+      const owner = newKey();
+      const held = await admission.admit(owner, undefined, `10.0.0.${at}`, PROGRAM_MAX, true);
+      if (held.ok) prepared.push({ owner, at });
     }
 
     const answers = await Promise.all(
-      owners.map(async (owner, at) => {
-        const decision = admission.check(owner, undefined, `10.0.0.${at}`, PROGRAM_MAX);
-        if (!decision.ok) return false;
-        return admission.commit(decision.invite);
+      prepared.map(async ({ owner, at }) => {
+        const decision = admission.check(owner, undefined, `10.0.1.${at}`, PROGRAM_MAX);
+        return decision.ok ? admission.commit(decision.invite, `10.0.1.${at}`) : false;
       }),
     );
 
-    expect(answers.filter(Boolean)).toHaveLength(2);
-    expect(ledger.seatsToday(clock.nowMs())).toBe(2);
+    expect(answers.filter(Boolean)).toHaveLength(3);
+    expect(ledger.seatsToday(clock.nowMs())).toBe(3);
   });
 
   it("keeps a seat counted when an owner prepares again after submitting", async () => {
@@ -121,11 +152,12 @@ describe("reservations and the day's quota", () => {
     const owner = newKey();
     const first = await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX, true);
     if (!first.ok) throw new Error("expected a reservation");
-    await admission.commit(first.invite);
+    await admission.commit(first.invite, "1.1.1.1");
 
     await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX, true);
 
     expect(ledger.seatsToday(clock.nowMs())).toBe(1);
+    expect(ledger.submittedToday(clock.nowMs())).toBe(1);
   });
 
   it("counts a record written before reservations existed", () => {

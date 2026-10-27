@@ -391,9 +391,20 @@ export class HouseMaker {
     else this.silence ??= { sinceMs: this.options.clock.nowMs(), because };
   }
 
-  /** Since when the book has had none of this maker's quotes, and why, or null while it quotes. */
+  /** When the newest ladder verified resting stops standing: its orders expire on the venue by themselves. */
+  private restingUntilMs: number | null = null;
+
+  /**
+   * Since when the book has had none of this maker's quotes, and why, or null while it quotes. A
+   * ladder that rested and was not replaced is silence from its expiry on, whatever the ticks
+   * since have found.
+   */
   get notQuoting(): { sinceMs: number; because: string } | null {
-    return this.silence ?? null;
+    if (this.silence) return this.silence;
+    if (this.restingUntilMs !== null && this.options.clock.nowMs() > this.restingUntilMs) {
+      return { sinceMs: this.restingUntilMs, because: "its last quotes expired" };
+    }
+    return null;
   }
 
   /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
@@ -648,13 +659,25 @@ export class HouseMaker {
    * switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
+    try {
+      await this.tickOnce(venue);
+    } catch (error) {
+      this.quoting(`its last tick failed: ${firstLine(error)}`);
+      throw error;
+    }
+  }
+
+  private async tickOnce(venue: Venue): Promise<void> {
     if (this.options.ledger?.state.mode === "stopped" && this.standing) {
       this.lastQuoted = null;
       await this.withdrawOrAlert(venue);
     }
     const epoch = this.epoch;
     const market = (await venue.markets()).find((entry) => entry.id === this.options.market);
-    if (!market || market.markPrice === null) return;
+    if (!market || market.markPrice === null) {
+      this.quoting("the market has no mark price");
+      return;
+    }
     const mark = market.markPrice;
     const { safety } = this.options;
     // The risk rules and the operator's control run every tick, held or not.
@@ -707,7 +730,13 @@ export class HouseMaker {
     }
     const next: Quoting = venueReducesOnly ? { ...plan, reduceOnly: true } : plan;
     const now = this.options.clock.nowMs();
-    if (!this.dueForRequote(next, now)) return;
+    if (!this.dueForRequote(next, now)) {
+      // The ladder from the last requote still stands, so a read that failed since is not silence.
+      if (!next.reduceOnly && this.restingUntilMs !== null && now < this.restingUntilMs) {
+        this.quoting(null);
+      }
+      return;
+    }
 
     // Old orders that stand beside the new ladder until it is up, or none where everything is cancelled first.
     const overlap = await this.overlapFor(venue, next, market);
@@ -844,6 +873,7 @@ export class HouseMaker {
           ? "it is only reducing its position"
           : "it has no room to quote",
     );
+    if (!next.reduceOnly && resting.length > 0) this.restingUntilMs = expiresAtMs;
     if (orders.length > 0) {
       if (this.unrunLadders > 0) {
         this.unrunLadders = 0;
