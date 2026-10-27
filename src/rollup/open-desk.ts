@@ -5,13 +5,21 @@ import { type Admission, RECORD_NOT_WRITTEN } from "../gate/admission.js";
 import type { Session } from "./connections.js";
 import { refusalOf } from "./fund-desk.js";
 import type { ChainExchange } from "./chain-types.js";
-import type { Program } from "./program.js";
-import { ACCOUNT_EXISTS_ERROR, SEAT_ALREADY_OPEN_ERROR } from "./program-errors.js";
+import type { OwnerMessageForm, Program } from "./program.js";
+import { ACCOUNT_EXISTS_ERROR, SEAT_ALREADY_OPEN_ERROR, ownerRefusalOf } from "./program-errors.js";
 import { reconcileSeat } from "./reconcile-seat.js";
 import { checkSubmitted } from "./submitted-transaction.js";
-import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
+import {
+  DepositRefused,
+  ProgramRefused,
+  sendDepositAndConfirm,
+  sendRawAndConfirm,
+} from "./transactions.js";
 
 const PREPARED_FOR_MS = 45_000;
+/** How long a signed-open prepare stays good: the owner's message is valid for this long on the rollup's clock. */
+const SIGNED_PREPARED_FOR_MS = 100_000;
+const SIGNATURE_BYTES = 64;
 const SWEEP_EVERY_MS = 60_000;
 /** A reserved seat with no signed transaction this old is not a prepare in progress. */
 const UNSENT_GRACE_MS = 30_000;
@@ -20,6 +28,10 @@ type Refusal<Status extends number> = { ok: false; status: Status; reason: strin
 
 export type OpenPrepared =
   { ok: true; transaction: string; expiresAtMs: number } | Refusal<400 | 403 | 409 | 429 | 503>;
+
+/** Where owners sign a message: the expiry (unix seconds on the rollup's clock) that message must carry. */
+export type MessagePrepared =
+  { ok: true; expiresAt: number; expiresAtMs: number } | Refusal<400 | 403 | 409 | 429 | 503>;
 
 export type Opened =
   { ok: true; signature: string } | Refusal<400 | 403 | 409 | 410 | 429 | 502 | 503>;
@@ -37,6 +49,18 @@ export interface OpenRequest {
 export interface OpenRequests {
   prepare(request: OpenRequest): Promise<OpenPrepared>;
   submit(owner: string, transactionBase64: string, ip: string): Promise<Opened>;
+}
+
+/** What the routes ask of an open desk where owners sign a message instead of a transaction. */
+export interface SignedOpenRequests {
+  prepareMessage(request: OpenRequest): Promise<MessagePrepared>;
+  /** The owner's signature (base64) over the open message that expires at `expiresAt`. */
+  submitSigned(
+    owner: string,
+    signatureBase64: string,
+    expiresAt: number,
+    ip: string,
+  ): Promise<Opened>;
 }
 
 /** What the service starts and stops around the desk: the timer that settles seats. */
@@ -59,6 +83,30 @@ export interface OpenDeskOptions {
   onError(what: string, error: unknown): void;
   /** How often unsettled seats are looked at without a prepare; a minute when absent. */
   sweepEveryMs?: number;
+}
+
+type Refused = Extract<Opened, { ok: false }>;
+
+/** A seat reserved, with the signed transaction that opens it, its signature already on record. */
+interface ReservedOpening {
+  ok: true;
+  raw: Buffer;
+  reservation: string;
+  /** An earlier try for this invite was sent and never confirmed, so its account may exist. */
+  afterUnconfirmed: boolean;
+}
+
+/** A prepared opening that is waiting for the owner's signature over a message. Nothing is reserved for it. */
+interface PreparedMessage {
+  orderKeys: string;
+  invite: string | undefined;
+  /** The expiry the message must carry, in unix seconds on the rollup's clock. */
+  expiresAt: number;
+  expiresAtMs: number;
+  /** The order keys of the last transaction a submit sent for this owner, which may still land. */
+  sentOrderKeys: string | undefined;
+  /** A submit is working on it now. */
+  sending: boolean;
 }
 
 interface PreparedRequest {
@@ -141,9 +189,21 @@ const accountIsThere = (error: unknown): boolean =>
  * The user
  * deposits in a transaction of their own. Every decision is logged with the
  * owner's public key alone.
+ *
+ * Where the owner signs a message instead of a transaction (`prepareMessage` and
+ * `submitSigned`), nothing signed leaves the gate before `submitSigned`, so that is where the
+ * seat is reserved. `prepareMessage` only asks the admission rules and reads the rollup's clock, for the expiry the
+ * message must carry. `submitSigned` rebuilds the message from the keys and expiry it
+ * prepared, refuses a signature that is not the owner's over exactly that, and then, one at a
+ * time with prepares and the sweep, asks the rules once more, writes the seat down, builds the
+ * transaction (the gate pays and is its only signer) and records its signature and last valid
+ * block height before sending it. A seat is never reserved without both a record and a
+ * signature to settle it by, so limits, the invite's single use, the sweep and `reconcileSeat`
+ * work as above, and a restart between the two calls loses only the prepare.
  */
-export class OpenDesk implements OpenRequests, SeatSweeping {
+export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping {
   private readonly prepared = new Map<string, PreparedRequest>();
+  private readonly preparedMessages = new Map<string, PreparedMessage>();
   private lock: Promise<unknown> = Promise.resolve();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
@@ -154,7 +214,8 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     return this.options.exchange()?.maxSeatsPerDay ?? null;
   }
 
-  async prepare(request: OpenRequest): Promise<OpenPrepared> {
+  /** The request's keys as keys, or the refusal for keys that are not, or not all different. */
+  private keysOf(request: OpenRequest): { ownerKey: PublicKey; keys: PublicKey[] } | Refusal<400> {
     const { owner, orderKeys } = request;
     const ownerKey = publicKeyOf(owner);
     const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
@@ -168,7 +229,65 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
         reason: "the order keys must differ from each other and from the owner",
       };
     }
-    return this.locked(() => this.prepareLocked(request, ownerKey, keys));
+    return { ownerKey, keys };
+  }
+
+  async prepare(request: OpenRequest): Promise<OpenPrepared> {
+    const parsed = this.keysOf(request);
+    if ("ok" in parsed) return parsed;
+    return this.locked(() => this.prepareLocked(request, parsed.ownerKey, parsed.keys));
+  }
+
+  async prepareMessage(request: OpenRequest): Promise<MessagePrepared> {
+    const parsed = this.keysOf(request);
+    if ("ok" in parsed) return parsed;
+    return this.locked(() => this.prepareMessageLocked(request));
+  }
+
+  /** Asks the rules and the rollup's clock, and reserves nothing: no signed transaction leaves the gate before submit. */
+  private async prepareMessageLocked(request: OpenRequest): Promise<MessagePrepared> {
+    const { program, session, admission, clock, log } = this.options;
+    const { owner, orderKeys, invite, ip } = request;
+    const now = clock.nowMs();
+    await this.releaseUnsent(now);
+    await this.settleExpired(now, owner);
+    this.forgetLapsed(now);
+    const outstanding = this.preparedMessages.get(owner);
+    if (outstanding?.sending) return this.refuseWhileSending(owner);
+    const asked = admission.check(owner, invite, ip, this.programSeatsPerDay());
+    if (!asked.ok) {
+      log(`gate: ${owner} prepare refused: ${asked.reason}`);
+      return asked;
+    }
+    if (
+      outstanding &&
+      outstanding.expiresAtMs > now &&
+      outstanding.orderKeys === orderKeys.join(",") &&
+      outstanding.invite === invite
+    ) {
+      log(`gate: ${owner} prepare repeated, same expiry`);
+      return {
+        ok: true,
+        expiresAt: outstanding.expiresAt,
+        expiresAtMs: outstanding.expiresAtMs,
+      };
+    }
+    const expiresAt = program.ownerExpiryFrom(
+      await session.use((connection) => program.clockSeconds(connection)),
+    );
+    // A submit may have started for the earlier prepare while the clock was being read.
+    if (this.preparedMessages.get(owner)?.sending) return this.refuseWhileSending(owner);
+    const expiresAtMs = now + SIGNED_PREPARED_FOR_MS;
+    this.preparedMessages.set(owner, {
+      orderKeys: orderKeys.join(","),
+      invite,
+      expiresAt,
+      expiresAtMs,
+      sentOrderKeys: outstanding?.sentOrderKeys,
+      sending: false,
+    });
+    log(`gate: ${owner} prepare admitted, awaiting the owner's signature`);
+    return { ok: true, expiresAt, expiresAtMs };
   }
 
   /** One at a time, so that no decision is made on a count another prepare is about to change. */
@@ -303,8 +422,22 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     return { ok: true, transaction: wire, expiresAtMs };
   }
 
+  /** A prepare nobody submitted holds nothing but memory. One that sent a transaction is kept: its keys decide what must wait. */
+  private forgetLapsed(nowMs: number): void {
+    for (const [owner, request] of this.preparedMessages) {
+      if (request.expiresAtMs <= nowMs && !request.sending && !request.sentOrderKeys) {
+        this.preparedMessages.delete(owner);
+      }
+    }
+  }
+
+  /** What is prepared for an owner under either kind of opening, if anything. */
+  private outstandingFor(owner: string): { sending: boolean; expiresAtMs: number } | undefined {
+    return this.prepared.get(owner) ?? this.preparedMessages.get(owner);
+  }
+
   /** While a transaction for an owner is being sent, no other is handed out: two could both open. */
-  private refuseWhileSending(owner: string): OpenPrepared {
+  private refuseWhileSending(owner: string): Refusal<409> {
     this.options.log(`gate: ${owner} prepare refused: an opening is being sent`);
     return {
       ok: false,
@@ -327,7 +460,7 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     const { session, admission, log, onError } = this.options;
     for (const seat of [...admission.awaitingSettlement()]) {
       const { owner, invite: reservation } = seat;
-      const request = this.prepared.get(owner);
+      const request = this.outstandingFor(owner);
       if (owner === except || request?.sending || (request && request.expiresAtMs > nowMs)) {
         continue;
       }
@@ -337,7 +470,7 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
         if (verdict === "pending") continue;
         const landed = verdict === "landed";
         // Something moved while the chain was asked: a newer transaction, a send, or a settled seat.
-        const current = this.prepared.get(owner);
+        const current = this.outstandingFor(owner);
         const unchanged =
           current === request &&
           !current?.sending &&
@@ -349,6 +482,7 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
             );
         if (!unchanged) continue;
         this.prepared.delete(owner);
+        this.preparedMessages.delete(owner);
         if (landed) await this.settle(() => admission.confirm(reservation));
         else await this.settle(() => admission.release(reservation));
         log(
@@ -499,6 +633,213 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
               "the rollup did not confirm in time. The account may have been opened: check before you try again",
           };
     }
+  }
+
+  async submitSigned(
+    owner: string,
+    signatureBase64: string,
+    expiresAt: number,
+    ip: string,
+  ): Promise<Opened> {
+    const { program, session, clock, log, onError } = this.options;
+    const request = this.preparedMessages.get(owner);
+    if (!request || request.expiresAtMs <= clock.nowMs()) {
+      return {
+        ok: false,
+        status: 410,
+        reason: "nothing is prepared for this owner: prepare again",
+      };
+    }
+    if (request.sending) {
+      return {
+        ok: false,
+        status: 409,
+        reason: "this account opening is already being sent, wait for it",
+      };
+    }
+    if (expiresAt !== request.expiresAt) {
+      log(`gate: ${owner} submit refused: the expiry is not the prepared one`);
+      return {
+        ok: false,
+        status: 400,
+        reason: "the expiry is not the one that was prepared: prepare again",
+      };
+    }
+    // The message is rebuilt here from what was prepared, never taken from the caller.
+    const ownerKey = new PublicKey(owner);
+    const orderKeys = request.orderKeys.split(",").map((key) => new PublicKey(key));
+    const signature = Buffer.from(signatureBase64, "base64");
+    const form =
+      signature.length === SIGNATURE_BYTES
+        ? program.ownerSignatureForm(
+            program.openMessage(ownerKey, orderKeys, request.expiresAt),
+            signature,
+            ownerKey,
+          )
+        : null;
+    if (!form) {
+      log(
+        `gate: ${owner} submit refused: the signature is not the owner's over the prepared message`,
+      );
+      return {
+        ok: false,
+        status: 400,
+        reason:
+          "the signature is not the owner's over this account opening: sign the message again, with the keys and expiry from the prepare",
+      };
+    }
+
+    request.sending = true;
+    let reserved: ReservedOpening | Refused;
+    try {
+      reserved = await this.locked(() =>
+        this.reserveMessageOpening(owner, request, { ownerKey, orderKeys, signature, form }, ip),
+      );
+    } catch (error) {
+      request.sending = false;
+      throw error;
+    }
+    if (!reserved.ok) {
+      request.sending = false;
+      return reserved;
+    }
+
+    try {
+      const sent = await session.use((connection) => sendRawAndConfirm(connection, reserved.raw));
+      if (this.preparedMessages.get(owner) === request) this.preparedMessages.delete(owner);
+      log(`gate: ${owner} account opened`);
+      return { ok: true, signature: sent };
+    } catch (error) {
+      onError("opening a user's account failed", error);
+      const programRefused = error instanceof ProgramRefused;
+      const doorRefused = error instanceof DepositRefused;
+      const openedBefore = reserved.afterUnconfirmed && accountIsThere(error);
+      if (openedBefore) this.preparedMessages.delete(owner);
+      else {
+        request.sending = false;
+        request.sentOrderKeys = request.orderKeys;
+      }
+      if (openedBefore)
+        await this.settle(() => this.options.admission.confirm(reserved.reservation));
+      const owners = programRefused ? ownerRefusalOf(error.code) : null;
+      const refusal = owners ? { ok: false as const, ...owners } : refusalOf(error);
+      log(
+        `gate: ${owner} account ${
+          openedBefore
+            ? "was opened by an earlier try, now recorded"
+            : programRefused || doorRefused
+              ? "refused, its seat stays reserved until it can no longer land"
+              : "may or may not be open"
+        }: ${refusal.reason}`,
+      );
+      return programRefused || doorRefused
+        ? refusal
+        : {
+            ok: false,
+            status: 502,
+            reason:
+              "the rollup did not confirm in time. The account may have been opened: check before you try again",
+          };
+    }
+  }
+
+  /**
+   * Reserves the seat and builds the transaction, one at a time with prepares and the sweep, and
+   * writes its signature and last valid block height down before anything is sent. The decision
+   * and the reservation share one step in memory, so concurrent submits cannot pass the same count.
+   */
+  private async reserveMessageOpening(
+    owner: string,
+    request: PreparedMessage,
+    signed: {
+      ownerKey: PublicKey;
+      orderKeys: PublicKey[];
+      signature: Uint8Array;
+      form: OwnerMessageForm;
+    },
+    ip: string,
+  ): Promise<ReservedOpening | Refused> {
+    const { program, session, gate, admission, clock, log, onError } = this.options;
+    if (request.expiresAtMs <= clock.nowMs()) {
+      return { ok: false, status: 410, reason: "the prepared opening expired: prepare again" };
+    }
+    const asked = admission.check(owner, request.invite, ip, this.programSeatsPerDay());
+    if (!asked.ok) {
+      log(`gate: ${owner} submit refused: ${asked.reason}`);
+      return asked;
+    }
+
+    // An earlier opening with other order keys that can still land would open the account with its own keys.
+    const earlier = admission.awaitingSettlement().find((seat) => seat.invite === asked.invite);
+    if (earlier && request.sentOrderKeys !== request.orderKeys) {
+      const verdict = await reconcileSeat(session, earlier, onError);
+      if (verdict === "pending") {
+        log(
+          `gate: ${owner} submit refused: an earlier opening with other order keys can still land`,
+        );
+        return {
+          ok: false,
+          status: 409,
+          reason:
+            "an earlier account opening for this wallet can still land: try again in about a minute",
+        };
+      }
+      if (verdict === "landed") {
+        this.preparedMessages.delete(owner);
+        await this.settle(() => admission.confirm(earlier.invite));
+        log(`gate: ${owner} submit refused: the earlier opening had landed, now recorded`);
+        return {
+          ok: false,
+          status: 409,
+          reason: "this address has an account already. Nothing changed",
+        };
+      }
+    }
+
+    const decision = await admission.admit(owner, request.invite, ip, this.programSeatsPerDay());
+    if (!decision.ok) {
+      log(`gate: ${owner} submit refused: ${decision.reason}`);
+      return decision;
+    }
+    const freeSeat = (): Promise<void> =>
+      decision.afterUnconfirmed
+        ? Promise.resolve()
+        : this.settle(() => admission.release(decision.invite));
+
+    let built: Awaited<ReturnType<Program["openSignedTransaction"]>>;
+    try {
+      built = await session.use((connection) =>
+        program.openSignedTransaction(connection, {
+          gate,
+          owner: signed.ownerKey,
+          orderKeys: signed.orderKeys,
+          expiresAt: request.expiresAt,
+          signature: signed.signature,
+          form: signed.form,
+        }),
+      );
+    } catch (error) {
+      // Nothing was signed, so nothing can have opened, unless an earlier try for this invite did.
+      await freeSeat();
+      throw error;
+    }
+    const written = await admission.track(
+      decision.invite,
+      built.signature,
+      built.lastValidBlockHeight,
+    );
+    if (!written) {
+      await freeSeat();
+      log(`gate: ${owner} submit refused: the seat record could not be written`);
+      return RECORD_NOT_WRITTEN;
+    }
+    log(`gate: ${owner} submit admitted, sending`);
+    return {
+      ok: true,
+      raw: built.raw,
+      reservation: decision.invite,
+      afterUnconfirmed: decision.afterUnconfirmed,
+    };
   }
 
   /** The seat record is already right in memory: a failure to save it is for the operator, not the user. */

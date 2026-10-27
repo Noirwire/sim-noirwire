@@ -280,6 +280,10 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
               prepare: (request: OpenRequest) => viaOpenDesk((desk) => desk.prepare(request)),
               submit: (owner: string, transaction: string, ip: string) =>
                 viaOpenDesk((desk) => desk.submit(owner, transaction, ip)),
+              prepareMessage: (request: OpenRequest) =>
+                viaOpenDesk((desk) => desk.prepareMessage(request)),
+              submitSigned: (owner: string, signature: string, expiresAt: number, ip: string) =>
+                viaOpenDesk((desk) => desk.submitSigned(owner, signature, expiresAt, ip)),
             },
           }
         : {
@@ -299,6 +303,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
             rollupRpcUrl: settings.rollupRpcUrl,
             rollupWsUrl: settings.rollupWsUrl,
           }),
+          config.SIGNED_OWNER_ACTIONS ? "message" : "transaction",
         );
         return publicDescription;
       },

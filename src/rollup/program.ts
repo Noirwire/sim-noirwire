@@ -28,12 +28,17 @@ import {
   decodeMarket,
   decodeView,
   globalSocket,
+  openSignedTransaction,
   ownFills,
+  ownerActionMessage,
+  ownerExpiry,
   pythPriceAccount,
   randomSecret,
   sendAndConfirm,
+  verifyOwnerSignature,
   websocketUrl,
   type Exchange,
+  type OwnerMessageForm,
   type MarketParams,
   type OrderResult,
   type PriceFeed,
@@ -74,7 +79,10 @@ import {
 import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.6.0";
+export type { OwnerMessageForm };
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.8.0";
+/** How long an owner's signed action stays valid, on the rollup's clock. The program allows 120 seconds. */
+const OWNER_ACTION_LIFETIME_SECONDS = 100;
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 /** The fee and insurance seats come first; traders sit from here up. */
@@ -501,6 +509,57 @@ export class Program {
     return new Transaction({ feePayer: gate, ...latest }).add(
       this.instructions.openTrader(gate, owner, orderKeys),
     );
+  }
+
+  /** The unix time, on the rollup's clock, an owner action prepared now expires at. */
+  ownerExpiryFrom(rollupClockSeconds: number): number {
+    return Number(ownerExpiry(rollupClockSeconds, OWNER_ACTION_LIFETIME_SECONDS));
+  }
+
+  /** The text an owner signs to open a seat with these order keys, until `expiresAt`. */
+  openMessage(owner: PublicKey, orderKeys: PublicKey[], expiresAt: number): Uint8Array {
+    return ownerActionMessage("open", this.programId, owner, orderKeys, BigInt(expiresAt));
+  }
+
+  /** How the owner signed `message` (as plain text or in an off-chain envelope), or null if `signature` is not theirs. */
+  ownerSignatureForm(
+    message: Uint8Array,
+    signature: Uint8Array,
+    owner: PublicKey,
+  ): OwnerMessageForm | null {
+    return verifyOwnerSignature(message, signature, owner);
+  }
+
+  /**
+   * The whole `open_trader_signed` transaction, signed by the gate alone, which also pays:
+   * the owner's proof first and then the open. `lastValidBlockHeight` is the last block at
+   * which it can still land, and `signature` its id on the chain, in base58.
+   */
+  async openSignedTransaction(
+    connection: Connection,
+    request: {
+      gate: Keypair;
+      owner: PublicKey;
+      orderKeys: PublicKey[];
+      expiresAt: number;
+      signature: Uint8Array;
+      form: OwnerMessageForm;
+    },
+  ): Promise<{ raw: Buffer; signature: string; lastValidBlockHeight: number }> {
+    const { gate, owner, orderKeys, expiresAt, signature, form } = request;
+    const blockhash = await connection.getLatestBlockhash("confirmed");
+    const built = await openSignedTransaction(
+      connection,
+      this.instructions,
+      gate,
+      { owner, orderKeys, expiresAt: BigInt(expiresAt), signature, form },
+      blockhash,
+    );
+    return {
+      raw: built.raw,
+      signature: base58Of(Buffer.from(built.signature, "base64")),
+      lastValidBlockHeight: blockhash.lastValidBlockHeight,
+    };
   }
 
   /**

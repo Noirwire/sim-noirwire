@@ -28,9 +28,16 @@ interface PublicMarket {
   tick: string;
 }
 
+/**
+ * How an owner approves opening an account: by signing a message ("message"), or by signing the
+ * transaction the gate prepared ("transaction"). "message" only where the program has the signed instructions.
+ */
+export type OwnerAuth = "message" | "transaction";
+
 /** What a browser needs to trade on the program directly. Every value is public on chain. */
 export interface PublicDeployment {
   network: string;
+  ownerAuth: OwnerAuth;
   programId: string;
   solanaRpcUrl: string;
   rollupRpcUrl: string;
@@ -83,6 +90,7 @@ export const publicDeployment = (
   deployment: Deployment,
   urls: BrowserUrls,
   markets: { chain: ChainMarket; symbol: string; addresses: PublicAddresses }[],
+  ownerAuth: OwnerAuth = "transaction",
 ): PublicDeployment => {
   const token = (index: number): PublicToken => {
     const found = deployment.tokens.find((entry) => entry.index === index);
@@ -93,6 +101,7 @@ export const publicDeployment = (
   if (!first) throw new Error("no markets to describe");
   return {
     network: deployment.network,
+    ownerAuth,
     programId: deployment.programId,
     solanaRpcUrl: urls.solanaRpcUrl,
     rollupRpcUrl: urls.rollupRpcUrl,

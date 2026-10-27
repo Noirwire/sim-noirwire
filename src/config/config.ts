@@ -85,6 +85,9 @@ const envSchema = z.object({
   /** Trading is not ready when that sweep is older than this. */
   KEEPER_HEARTBEAT_MAX_AGE_MS: positiveInt(30_000),
 
+  /** Accounts are opened with a message the owner signs, not a transaction. Only valid once the deployed program has the signed instructions. */
+  SIGNED_OWNER_ACTIONS: boolFlag("0"),
+
   /** The hedge controller offsets the maker's SOL exposure on an outside perpetuals venue. Off, nothing hedge-related runs. */
   HEDGE_ENABLED: boolFlag("0"),
   /** Absolute path of the module that supplies the hedge venue. Required with HEDGE_ENABLED=1, ignored otherwise. */
