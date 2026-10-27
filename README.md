@@ -317,9 +317,11 @@ elsewhere is off by default and on mainnet cannot be set to 0):
 - **Quotes expire.** Every resting order carries the program's own expiry, the requote
   interval plus 10 s, so a maker that dies leaves no quote standing for longer than that.
   A stop of the service cancels its quotes first.
-- **A reference price.** It quotes around the median of Pyth's latest price (Hermes) and
-  the public tickers of Coinbase, Kraken and OKX, not around the NoirWire mark. It needs the
-  oracle and at least two exchanges, none older than 10 s, within 30 bps of each other; else
+- **A reference price.** It quotes around the median of Pyth's SOL/USD price and the
+  public tickers of Coinbase, Kraken and OKX, not around the NoirWire mark. Pyth's price is
+  read from its price account on Solana mainnet through `SOLANA_RPC_URL` (the account must be
+  fully verified and carry the SOL/USD feed id). It needs the oracle (none older than 30 s)
+  and at least two exchanges (none older than 10 s), within 30 bps of each other; else
   it pulls its quotes and, once the prices are back, watches them for 10 s before quoting.
 - **Widen and pull.** The half-spread is at least 15 bps and grows by half the price range
   of the last minute. A NoirWire mark more than 10 bps behind the reference widens it by

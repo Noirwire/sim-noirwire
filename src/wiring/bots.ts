@@ -17,7 +17,15 @@ import { type Config, isMainnet } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
-import { ReferencePrice, referenceSources } from "../prices/reference-price.js";
+import { PublicKey } from "@solana/web3.js";
+import {
+  ReferencePrice,
+  type ReadPythAccount,
+  SOL_USD_FEED_ID,
+  referenceSources,
+} from "../prices/reference-price.js";
+import { connectionTo } from "../rollup/connections.js";
+import { pythPriceAccountOf } from "../rollup/program.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import { KeeperHeartbeat } from "./keeper-heartbeat.js";
 import { TradingWatch } from "./trading-watch.js";
@@ -227,6 +235,17 @@ export interface OpenedBots {
  * separate from opening so that the loops can be stopped and started again
  * without opening anything twice. Opening is safe to repeat after a failure.
  */
+/** Reads Pyth's SOL/USD price account over the service's own Solana RPC address. */
+const pythAccountReader = (solanaRpcUrl: string | undefined): ReadPythAccount => {
+  const account = new PublicKey(pythPriceAccountOf(SOL_USD_FEED_ID));
+  const connection = solanaRpcUrl ? connectionTo(solanaRpcUrl) : null;
+  return async () => {
+    if (!connection)
+      throw new Error("SOLANA_RPC_URL is not set, so Pyth's price account is not read");
+    return (await connection.getAccountInfo(account))?.data ?? null;
+  };
+};
+
 export const openBots = async (
   config: Config,
   wiring: VenueWiring,
@@ -245,7 +264,9 @@ export const openBots = async (
       "the hedge couples to the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
     );
   }
-  const reference = rules ? new ReferencePrice(referenceSources(), systemClock) : null;
+  const reference = rules
+    ? new ReferencePrice(referenceSources(pythAccountReader(config.SOLANA_RPC_URL)), systemClock)
+    : null;
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)

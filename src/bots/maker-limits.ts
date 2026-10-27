@@ -13,8 +13,10 @@ export const MAKER_LIMITS = {
   /** The most the position limit may be set to, in nUSD of notional. */
   maxPositionLimitNusd: 250n * SCALE,
 
-  /** A price source older than this, or dated this far ahead, is not believed. */
+  /** An exchange price older than this, or dated this far ahead, is not believed. */
   maxSourceAgeMs: 10_000,
+  /** The oracle price, pushed on chain every few seconds, gets longer: it is 3 to 12 s old when read. */
+  maxOracleAgeMs: 30_000,
   /** Sources further apart than this (highest to lowest, against the median) pull the quotes. */
   maxSourceDisagreementBps: 30,
   /** Large exchanges that must answer, besides the oracle. */
