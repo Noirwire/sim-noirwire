@@ -80,7 +80,7 @@ import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
 export type { OwnerMessageForm };
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.8.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.8.1";
 /** How long an owner's signed action stays valid, on the rollup's clock. The program allows 120 seconds. */
 const OWNER_ACTION_LIFETIME_SECONDS = 100;
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
@@ -521,13 +521,13 @@ export class Program {
     return ownerActionMessage("open", this.programId, owner, orderKeys, BigInt(expiresAt));
   }
 
-  /** How the owner signed `message` (as plain text or in an off-chain envelope), or null if `signature` is not theirs. */
+  /** How the owner signed `message` (as plain text or in an off-chain envelope, with or without this program's id in its header), or null if `signature` is not theirs. */
   ownerSignatureForm(
     message: Uint8Array,
     signature: Uint8Array,
     owner: PublicKey,
   ): OwnerMessageForm | null {
-    return verifyOwnerSignature(message, signature, owner);
+    return verifyOwnerSignature(message, signature, owner, this.programId);
   }
 
   /**

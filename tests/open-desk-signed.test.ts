@@ -2,6 +2,7 @@ import { createPrivateKey, sign } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Connection, Ed25519Program, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { ownerActionSpecEnvelope } from "@noirwire/orderbook";
 import type { FastifyInstance } from "fastify";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Activity } from "../src/activity/activity.js";
@@ -309,6 +310,48 @@ describe("opening an account with a signed message", () => {
     } finally {
       restarted.stopSweeping();
     }
+  });
+
+  it("opens the account for a signature over the specification's header naming this program, carrying that form", async () => {
+    const { owners, program, prepare, submitSigned, messageFor, sent } = await serviceWith();
+    const prepared = bodyOf(await prepare(owners[0])) as { expiresAt: number };
+    const enveloped = ownerActionSpecEnvelope(messageFor(owners[0], prepared.expiresAt), {
+      programId: program.programId,
+      owner: owners[0].publicKey,
+    });
+
+    const opened = await submitSigned(owners[0], prepared, {
+      signature: signedBy(owners[0], enveloped),
+    });
+
+    expect(opened.statusCode).toBe(200);
+    expect(sent).toHaveLength(1);
+    expect(Buffer.from(sent[0].instructions[0].data).includes(Buffer.from(enveloped))).toBe(true);
+    expect(
+      program.ownerSignatureForm(
+        messageFor(owners[0], prepared.expiresAt),
+        Buffer.from(signedBy(owners[0], enveloped), "base64"),
+        owners[0].publicKey,
+      ),
+    ).toBe("spec");
+  });
+
+  it("refuses a signature over the specification's header naming another program, before anything is spent", async () => {
+    const { owners, prepare, submitSigned, messageFor, sent, ledger } = await serviceWith();
+    const prepared = bodyOf(await prepare(owners[0])) as { expiresAt: number };
+    const enveloped = ownerActionSpecEnvelope(messageFor(owners[0], prepared.expiresAt), {
+      programId: Keypair.generate().publicKey,
+      owner: owners[0].publicKey,
+    });
+
+    const answer = await submitSigned(owners[0], prepared, {
+      signature: signedBy(owners[0], enveloped),
+    });
+
+    expect(answer.statusCode).toBe(400);
+    expect(bodyOf(answer).error).toContain("not the owner's");
+    expect(sent).toHaveLength(0);
+    expect(ledger().seatsToday(START_MS)).toBe(0);
   });
 
   it("refuses a signature that is not the owner's, before anything is spent", async () => {
