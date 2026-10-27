@@ -258,7 +258,8 @@ export class SeatLedger {
    * Call `ready` first: with the key made, the record is in memory before this first waits, so a
    * decision made just before it cannot be overtaken. The signatures of an earlier try for the same
    * invite are kept. A seat `held` is a prepare in progress, told from a submitted one until
-   * `commit`; one that an earlier try already committed stays committed. Either way it counts.
+   * `commit`, even when an earlier try was already committed: a fresh transaction not yet sent is
+   * not a submitted one. Either way it counts, once.
    */
   async reserve(
     invite: string,
@@ -270,7 +271,7 @@ export class SeatLedger {
     const asker = this.askerOf(ip, this.key ?? (await this.ensureKey()));
     const replaced = this.forInvite(invite);
     const record: SeatRecord = { invite, owner, atMs: nowMs, state: "unconfirmed", asker };
-    if (held && (!replaced || replaced.unsubmitted)) record.unsubmitted = true;
+    if (held) record.unsubmitted = true;
     if (replaced?.signatures) record.signatures = replaced.signatures;
     if (replaced?.lastValidBlockHeight !== undefined) {
       record.lastValidBlockHeight = replaced.lastValidBlockHeight;

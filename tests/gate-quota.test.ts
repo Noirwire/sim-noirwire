@@ -147,7 +147,7 @@ describe("reservations and the day's quota", () => {
     expect(ledger.seatsToday(clock.nowMs())).toBe(3);
   });
 
-  it("keeps a seat counted when an owner prepares again after submitting", async () => {
+  it("holds a seat again when an owner prepares after submitting, counted once, and commits it on the next submit", async () => {
     const { admission, ledger, clock } = openGate();
     const owner = newKey();
     const first = await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX, true);
@@ -155,6 +155,15 @@ describe("reservations and the day's quota", () => {
     await admission.commit(first.invite, "1.1.1.1");
 
     await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX, true);
+
+    expect(ledger.seatsToday(clock.nowMs())).toBe(1);
+    expect(ledger.seatsTodayFor("1.1.1.1", clock.nowMs())).toBe(1);
+    expect(ledger.submittedToday(clock.nowMs())).toBe(0);
+    expect(admission.check(newKey(), undefined, "2.2.2.2", PROGRAM_MAX)).toMatchObject({
+      ok: true,
+    });
+
+    await admission.commit(first.invite, "1.1.1.1");
 
     expect(ledger.seatsToday(clock.nowMs())).toBe(1);
     expect(ledger.submittedToday(clock.nowMs())).toBe(1);

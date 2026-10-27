@@ -388,7 +388,7 @@ export class HouseMaker {
 
   private quoting(because: string | null): void {
     if (because === null) this.silence = null;
-    else this.silence ??= { sinceMs: this.options.clock.nowMs(), because };
+    else this.silence = { sinceMs: this.silence?.sinceMs ?? this.options.clock.nowMs(), because };
   }
 
   /** When the newest ladder verified resting stops standing: its orders expire on the venue by themselves. */
@@ -867,13 +867,13 @@ export class HouseMaker {
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
     this.quoting(
-      !next.reduceOnly && (resting.length > 0 || kept.length > 0)
+      resting.length > 0 || (!next.reduceOnly && kept.length > 0)
         ? null
         : next.reduceOnly
           ? "it is only reducing its position"
           : "it has no room to quote",
     );
-    if (!next.reduceOnly && resting.length > 0) this.restingUntilMs = expiresAtMs;
+    if (resting.length > 0) this.restingUntilMs = expiresAtMs;
     if (orders.length > 0) {
       if (this.unrunLadders > 0) {
         this.unrunLadders = 0;
