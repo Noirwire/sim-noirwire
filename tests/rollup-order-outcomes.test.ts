@@ -15,6 +15,8 @@ import { dollars } from "./helpers.js";
 const fakeTrader = vi.hoisted(() => ({
   place: undefined as undefined | (() => Promise<unknown>),
   cancel: undefined as undefined | (() => Promise<unknown>),
+  /** Answers a cancel of one order, by the sequence number it was named by. */
+  cancelOne: undefined as undefined | ((orderSeq: bigint) => Promise<boolean>),
   failToOpen: false,
   /** While set, opening the trader waits for it. */
   opening: undefined as undefined | Promise<void>,
@@ -31,6 +33,7 @@ vi.mock("../src/rollup/bot-accounts.js", () => ({
       return {
         address: "owner",
         cancelAll: () => fakeTrader.cancel?.(),
+        cancelOrder: (_market: number, orderSeq: bigint) => fakeTrader.cancelOne?.(orderSeq),
         place: (_market: number, params: { restingExpirySeconds?: number }) => {
           fakeTrader.placed += 1;
           fakeTrader.expiries.push(params.restingExpirySeconds);
@@ -205,9 +208,84 @@ describe("a cancel that completes late", () => {
 
     complete(1n);
     await cancelling;
-    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 1_000_000);
+    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 20_000);
 
     expect(secrets()).toHaveLength(1);
+  });
+});
+
+describe("cancelling one resting order", () => {
+  const restedAs = (orderSeq: bigint) => () =>
+    Promise.resolve<PlaceOutcome>({
+      status: "rested",
+      filled: 0n,
+      rested: 1n,
+      orderSeq,
+      sendToResultMs: 1,
+    });
+  const forgetAll = (venue: unknown) =>
+    (
+      venue as { secrets: { forgetEndedBefore(market: string, tapeReadAtMs: number): void } }
+    ).secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 20_000);
+
+  it("names the order by the sequence number the program gave it, and ends only that order", async () => {
+    const { venue, secrets } = venueWith();
+    fakeTrader.place = restedAs(41n);
+    await venue.placeOrder(TRADER, order());
+    fakeTrader.place = restedAs(42n);
+    await venue.placeOrder(TRADER, order());
+    const named: bigint[] = [];
+    fakeTrader.cancelOne = async (orderSeq) => {
+      named.push(orderSeq);
+      return true;
+    };
+
+    expect(await venue.cancelOrder(TRADER, "NSOL-PERP", "41")).toBe(true);
+    forgetAll(venue);
+
+    expect(named).toEqual([41n]);
+    expect(secrets()).toHaveLength(1);
+  });
+
+  it("counts an order the program no longer had as gone: its secret ends too", async () => {
+    const { venue, secrets } = venueWith();
+    fakeTrader.place = restedAs(41n);
+    await venue.placeOrder(TRADER, order());
+    fakeTrader.cancelOne = async () => false;
+
+    expect(await venue.cancelOrder(TRADER, "NSOL-PERP", "41")).toBe(false);
+    forgetAll(venue);
+
+    expect(secrets()).toHaveLength(0);
+  });
+
+  it("keeps the secret of an order whose cancel failed, since the order may still fill", async () => {
+    const { venue, secrets } = venueWith();
+    fakeTrader.place = restedAs(41n);
+    await venue.placeOrder(TRADER, order());
+    fakeTrader.cancelOne = async () => {
+      throw new Error("the cancel never ran, so the order may still stand");
+    };
+
+    await expect(venue.cancelOrder(TRADER, "NSOL-PERP", "41")).rejects.toThrow("never ran");
+    forgetAll(venue);
+
+    expect(secrets()).toHaveLength(1);
+  });
+
+  it("forgets the secret of an order nobody cancelled once it can no longer fill", async () => {
+    const { venue, secrets } = venueWith();
+    fakeTrader.place = restedAs(41n);
+    await venue.placeOrder(TRADER, order({ expiresInSeconds: 30 }));
+    const book = venue as unknown as {
+      secrets: { forgetEndedBefore(market: string, tapeReadAtMs: number): void };
+    };
+
+    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 40_000);
+    expect(secrets()).toHaveLength(1);
+
+    book.secrets.forgetEndedBefore("NSOL-PERP", Date.now() + 100_000);
+    expect(secrets()).toHaveLength(0);
   });
 });
 

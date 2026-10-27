@@ -104,6 +104,8 @@ export interface PlaceOutcome {
   status: PlaceStatus;
   filled: bigint;
   rested: bigint;
+  /** The sequence number the program gave the resting remainder, which a cancel names it by. Only when something rests. */
+  orderSeq?: bigint;
   /** From the send to the result showing in the trader's private view, as the client timed it. */
   sendToResultMs: number;
   reason?: string;

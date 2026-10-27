@@ -42,6 +42,9 @@ export const placingOrdersThrough = (venue: Venue, placeOrder: Venue["placeOrder
   deposit: (trader, token, amount) => venue.deposit(trader, token, amount),
   placeOrder,
   cancelAll: (trader, market) => venue.cancelAll(trader, market),
+  ...(venue.cancelOrder
+    ? { cancelOrder: (trader, market, orderId) => venue.cancelOrder!(trader, market, orderId) }
+    : {}),
   traderState: (trader) => venue.traderState(trader),
   updateFunding: (market) => venue.updateFunding(market),
   liquidate: (liquidator, target, market) => venue.liquidate(liquidator, target, market),

@@ -115,6 +115,14 @@ export class OrderBook {
     return cancelled;
   }
 
+  cancelOne(trader: TraderKey, orderId: string): RestingOrder | null {
+    for (const levels of [this.bids, this.asks]) {
+      const at = levels.findIndex((order) => order.trader === trader && order.orderId === orderId);
+      if (at >= 0) return levels.splice(at, 1)[0] ?? null;
+    }
+    return null;
+  }
+
   openOrdersForTrader(trader: TraderKey): RestingOrder[] {
     return [...this.bids, ...this.asks].filter((order) => order.trader === trader);
   }

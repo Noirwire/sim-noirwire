@@ -122,6 +122,9 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
  */
 export const MAKER_NOT_LISTED_ERROR = 6091;
 
+/** `OrderNotFound`: a cancel named an order the book no longer holds for that seat. */
+export const ORDER_NOT_FOUND_ERROR = 6050;
+
 /** `SeatAlreadyOpen`: the owner key already holds a trader seat. */
 export const SEAT_ALREADY_OPEN_ERROR = 6014;
 

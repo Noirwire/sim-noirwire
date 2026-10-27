@@ -377,10 +377,24 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   - **An order that provably never ran is not such an error.** An order whose transaction
     window (5 s) passed with no result, or that was not handed to the program before its
     deadline, did not execute. The maker drops the rest of that ladder, cancels what it
-    placed, says so in one `dropped a ladder` line (at most once a minute) and quotes again
-    on the next tick. Only five such ladders in a row (a good ladder in between starts the
+    placed (under a make-before-break requote, see below, it leaves what stands, old
+    orders included, for the next tick to replace), says so in one `dropped a ladder` line
+    (at most once a minute) and quotes again on the next tick. Only five such ladders in a row (a good ladder in between starts the
     count again) send it to the soft stop, with an `ALERT` that gives the count and the last
     reason. If you see that alert, check the rollup's and the RPC's health before resuming.
+- **A requote places before it cancels.** So the book is never bare while it requotes, the
+  maker places the new ladder first and then cancels the old orders one by one (each its
+  own transaction). Before placing it cancels the old orders the new ladder would match
+  (the program refuses a post-only order that would) and the outermost ones that would
+  not fit beside it: the old and new orders together stay within the position limit, the
+  market's position cap, 80% of the seat's equity times the market's leverage, and 16
+  resting orders. With the mainnet defaults (limit 250 nUSD, 3 levels of 50 nUSD) one old
+  level of the three stands on each side through the swap. A requote still cancels
+  everything first, in one transaction, for a pull, a flatten, either stop, the kill
+  switch, a market that holds quotes, an order of unknown outcome or still in flight, an
+  unconfirmed cancel, and a venue or market without cancel by order. A cancel of one old
+  order that fails alerts once (`cancel was not confirmed`); the next tick then cancels
+  everything.
 - **A loss limit flattens.** Past 3% of the day's start or 5% from the peak (counted at the
   worse of the venue's mark and the reference price) the maker works its position down
   with one reduce-only order, at most 25 bps through the fresh reference price, replaced

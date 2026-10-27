@@ -190,6 +190,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     deposit: (trader, token, amount) => connected().deposit(trader, token, amount),
     placeOrder: (trader, order) => connected().placeOrder(trader, order),
     cancelAll: (trader, market) => connected().cancelAll(trader, market),
+    cancelOrder: (trader, market, orderId) => connected().cancelOrder(trader, market, orderId),
     traderState: (trader) => connected().traderState(trader),
     updateFunding: () => connected().updateFunding(),
     liquidate: (liquidator, target, market) => connected().liquidate(liquidator, target, market),

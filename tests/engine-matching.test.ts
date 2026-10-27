@@ -249,6 +249,32 @@ describe("MemoryVenue spot matching", () => {
     expect(afterCancel.balances.nUSD!.balance).toBe(dollars(1000));
   });
 
+  it("cancels one resting order by its id and leaves the trader's others, and its spot lock, alone", async () => {
+    const { venue } = makeVenue();
+    await openFunded(venue, "buyer", { nUSD: 1000 });
+    const place = (price: number) =>
+      venue.placeOrder("buyer", {
+        market: SPOT,
+        side: "buy",
+        type: "limit",
+        price: dollars(price),
+        size: dollars(2),
+      });
+    const first = await place(100);
+    const second = await place(99);
+    const lockedWithBoth = (await venue.traderState("buyer")).balances.nUSD!.locked;
+
+    expect(await venue.cancelOrder!("buyer", SPOT, first.orderId)).toBe(true);
+
+    const after = await venue.traderState("buyer");
+    expect(after.openOrders.map((open) => open.orderId)).toEqual([second.orderId]);
+    expect(after.balances.nUSD!.locked).toBeGreaterThan(0n);
+    expect(after.balances.nUSD!.locked).toBeLessThan(lockedWithBoth);
+    expect(await venue.cancelOrder!("buyer", SPOT, first.orderId)).toBe(false);
+    expect(await venue.cancelOrder!("someone else", SPOT, second.orderId)).toBe(false);
+    expect((await venue.traderState("buyer")).openOrders).toHaveLength(1);
+  });
+
   it("charges the taker a fee and credits it to the house fee account, never the maker", async () => {
     const { venue } = makeVenue();
     await openFunded(venue, "seller", { SOL: 5 });
