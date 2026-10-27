@@ -9,7 +9,7 @@ import type { Venue } from "../engine/types.js";
 import { placingOrdersThrough } from "../engine/venue-orders.js";
 import { STILL_STARTING, VenueNotReady } from "../engine/venue-not-ready.js";
 import { Admission } from "../gate/admission.js";
-import { InviteList } from "../gate/invite-list.js";
+import { InviteList, OpenInvitations } from "../gate/invite-list.js";
 import { SeatLedger } from "../gate/seat-ledger.js";
 import { hideAddresses } from "../logging/first-line.js";
 import { type PublicDeployment, browserUrlsFor } from "../rollup/public-deployment.js";
@@ -58,11 +58,15 @@ const refusedWhileStarting = (error: unknown) => {
 
 const SEAT_RECORD_FILE = "gate-seats.json";
 
+const inviteList = (config: Config, onError: RollupWiringOptions["onError"]): InviteList => {
+  if (!config.GATE_INVITES_FILE) throw new Error("GATE_INVITES_FILE is not set");
+  return new InviteList(config.GATE_INVITES_FILE, (line) => onError(`gate: ${line}`, null));
+};
+
 /** The mainnet gate's rules: its invite list, the record of the seats it signed for, and the day's limits. */
 const gateAdmission = (config: Config, onError: RollupWiringOptions["onError"]): Admission => {
-  if (!config.GATE_INVITES_FILE) throw new Error("GATE_INVITES_FILE is not set");
   return new Admission(
-    new InviteList(config.GATE_INVITES_FILE, (line) => onError(`gate: ${line}`, null)),
+    config.GATE_OPEN ? new OpenInvitations() : inviteList(config, onError),
     new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock),
     { perDay: config.GATE_SEATS_PER_DAY, perAskerPerDay: config.GATE_SEATS_PER_IP_PER_DAY },
     systemClock,

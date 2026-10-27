@@ -156,7 +156,7 @@ const proxyHops = (config: Config): string[] =>
     : [];
 
 const gateSettings = (config: Config, env: Env): string[] => [
-  ...(isSet(env, "GATE_INVITES_FILE")
+  ...(config.GATE_OPEN || isSet(env, "GATE_INVITES_FILE")
     ? []
     : [
         "GATE_INVITES_FILE is not set. On mainnet the gate signs only for the people on an invite list, " +

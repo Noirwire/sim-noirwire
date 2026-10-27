@@ -15,6 +15,12 @@ const boolFlag = (defaultValue: "0" | "1") =>
     .default(defaultValue)
     .transform((value) => value === "1");
 
+const onOffFlag = (defaultValue: "on" | "off") =>
+  z
+    .enum(["on", "off"])
+    .default(defaultValue)
+    .transform((value) => value === "on");
+
 const positiveInt = (defaultValue: number) =>
   z.coerce.number().int().positive().default(defaultValue);
 
@@ -127,6 +133,8 @@ const envSchema = z.object({
   BOT_TRADER_SEEDS_FILE: z.string().optional(),
   /** Mainnet: the file of invited owner keys and invite codes the gate signs for. Required there. */
   GATE_INVITES_FILE: z.string().optional(),
+  /** Mainnet: on, the gate signs for any owner key and needs no invite list. The day's limits and one seat per owner still apply. */
+  GATE_OPEN: onOffFlag("off"),
   /** Mainnet: accounts the gate opens in a UTC day. The program's own `max_seats_per_day` caps it from above. */
   GATE_SEATS_PER_DAY: positiveInt(3),
   /** Mainnet: accounts the gate opens in a UTC day for one network address. */

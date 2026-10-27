@@ -521,6 +521,7 @@ ones:
 | `FUND_AMOUNT_NUSD`                              | `5000`                  | One-time grant size                                                                  |
 | `FUND_IP_RATE_LIMIT` / `FUND_IP_RATE_WINDOW_MS` | `20` / `3600000`        | Per-IP cap on fund grants                                                            |
 | `GATE_INVITES_FILE`                             | none                    | Mainnet, required: the invite list the gate signs for (see "The gate")               |
+| `GATE_OPEN`                                     | `off`                   | Mainnet: `on` admits any owner key and needs no invite list; the limits still apply  |
 | `GATE_SEATS_PER_DAY`                            | `3`                     | Mainnet: accounts opened a UTC day, always below the program's own limit             |
 | `GATE_SEATS_PER_IP_PER_DAY`                     | `1`                     | Mainnet: accounts opened a UTC day for one network address                           |
 | `JUPITER_POLL_INTERVAL_MS`                      | `4000`                  | How often every market's price is fetched, in one request                            |
