@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ManualClock } from "../src/engine/clock.js";
 import { DAY_MS } from "../src/engine/day-window.js";
 import { Admission } from "../src/gate/admission.js";
-import { InviteList } from "../src/gate/invite-list.js";
+import { InviteList, OpenInvitations } from "../src/gate/invite-list.js";
 import { SeatLedger } from "../src/gate/seat-ledger.js";
 
 const DIR = join("data-test", `gate-${Date.now()}`);
@@ -340,5 +340,79 @@ describe("admission", () => {
 
     expect(second).toMatchObject({ ok: false, status: 409 });
     expect(reason(second)).toContain("has an account already");
+  });
+});
+
+describe("admission with the gate open", () => {
+  const setup = (limits = { perDay: 3, perAskerPerDay: 1 }) => {
+    const dir = freshDir();
+    const clock = new ManualClock(DAY_START_MS + 3_600_000);
+    const ledgerPath = join(dir, "seats.json");
+    const make = () =>
+      new Admission(new OpenInvitations(), new SeatLedger(ledgerPath, clock), limits, clock);
+    return { admission: make(), make };
+  };
+
+  const reason = (decision: { ok: boolean; reason?: string }): string => decision.reason ?? "";
+
+  it("signs for an owner key that is on no list", async () => {
+    const { admission } = setup();
+
+    const decision = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX);
+
+    expect(decision.ok).toBe(true);
+  });
+
+  it("still stops at the day's limit", async () => {
+    const { admission } = setup({ perDay: 2, perAskerPerDay: 2 });
+    for (const ip of ["1.1.1.1", "2.2.2.2"]) {
+      expect((await admission.admit(newKey(), undefined, ip, PROGRAM_MAX)).ok).toBe(true);
+    }
+
+    const third = await admission.admit(newKey(), undefined, "3.3.3.3", PROGRAM_MAX);
+
+    expect(third).toMatchObject({ ok: false, status: 503 });
+    expect(reason(third)).toContain("all given out");
+  });
+
+  it("keeps the day's limit under the program's own", async () => {
+    const { admission } = setup({ perDay: 10, perAskerPerDay: 10 });
+
+    const refused = await admission.admit(newKey(), undefined, "1.1.1.1", 1);
+
+    expect(refused).toMatchObject({ ok: false, status: 503 });
+  });
+
+  it("still stops one network address at its limit", async () => {
+    const { admission } = setup();
+    expect((await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX)).ok).toBe(true);
+
+    const second = await admission.admit(newKey(), undefined, "1.1.1.1", PROGRAM_MAX);
+
+    expect(second).toMatchObject({ ok: false, status: 429 });
+    expect((await admission.admit(newKey(), undefined, "2.2.2.2", PROGRAM_MAX)).ok).toBe(true);
+  });
+
+  it("opens one account per owner key, also across a restart, and says the address has one", async () => {
+    const owner = newKey();
+    const { admission, make } = setup();
+    const first = await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX);
+    expect(first.ok).toBe(true);
+    if (first.ok) await admission.confirm(first.invite);
+
+    for (const gate of [admission, make()]) {
+      const again = await gate.admit(owner, undefined, "9.9.9.9", PROGRAM_MAX);
+      expect(again).toMatchObject({ ok: false, status: 409 });
+      expect(reason(again)).toContain("has an account already");
+    }
+  });
+
+  it("frees the owner key again when its seat was not opened", async () => {
+    const owner = newKey();
+    const { admission } = setup();
+    const first = await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX);
+    if (first.ok) await admission.release(first.invite);
+
+    expect((await admission.admit(owner, undefined, "1.1.1.1", PROGRAM_MAX)).ok).toBe(true);
   });
 });

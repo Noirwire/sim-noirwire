@@ -1,5 +1,5 @@
 import type { Clock } from "../engine/clock.js";
-import type { InviteList } from "./invite-list.js";
+import type { Invitations } from "./invite-list.js";
 import type { SeatLedger, SeatRecord } from "./seat-ledger.js";
 
 export interface AdmissionLimits {
@@ -34,7 +34,7 @@ export const RECORD_NOT_WRITTEN: NotAdmitted = {
  */
 export class Admission {
   constructor(
-    private readonly invites: InviteList,
+    private readonly invites: Invitations,
     private readonly ledger: SeatLedger,
     private readonly limits: AdmissionLimits,
     private readonly clock: Clock,
@@ -51,7 +51,7 @@ export class Admission {
     if (!invitation.ok) return { ok: false, status: 403, reason: invitation.reason };
     const { id } = invitation;
 
-    if (this.ledger.forInvite(id)?.state === "opened") {
+    if (!this.invites.open && this.ledger.forInvite(id)?.state === "opened") {
       return {
         ok: false,
         status: 409,

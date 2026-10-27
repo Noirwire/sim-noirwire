@@ -7,6 +7,22 @@ const CODE_PATTERN = /^[A-Za-z0-9_-]{12,64}$/;
 /** Who an entry names, and the id a seat opened for it is recorded under. */
 export type Invitation = { ok: true; id: string } | { ok: false; reason: string };
 
+/** What the gate asks to learn who may be given a seat: the invite list, or everyone. */
+export interface Invitations {
+  /** True when no invitation is needed: every owner key is admitted. */
+  readonly open: boolean;
+  check(owner: string, code: string | undefined): Invitation;
+}
+
+/** An open gate: any owner key is admitted, and a seat is recorded under the key itself, so one key opens one account. */
+export class OpenInvitations implements Invitations {
+  readonly open = true;
+
+  check(owner: string): Invitation {
+    return { ok: true, id: `key:${owner}` };
+  }
+}
+
 interface Parsed {
   /** Owner keys invited by their address alone. */
   byKey: Set<string>;
@@ -71,7 +87,8 @@ const parse = (text: string, onProblem: (line: string) => void): Parsed => {
  * needs no restart. A file that cannot be read after it once was is treated
  * as an empty list until it can be: nobody is admitted on a stale copy.
  */
-export class InviteList {
+export class InviteList implements Invitations {
+  readonly open = false;
   private parsed: Parsed = { byKey: new Set(), codesByOwner: new Map() };
   private seenVersion = "";
   private readable = true;

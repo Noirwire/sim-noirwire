@@ -136,6 +136,16 @@ describe("NETWORK=mainnet", () => {
     expect(config.GATE_SEATS_PER_IP_PER_DAY).toBe(1);
   });
 
+  it("starts without an invite list when the gate is open, and still asks for one otherwise", () => {
+    expect(problemsOf(mainnetEnv({ GATE_INVITES_FILE: undefined, GATE_OPEN: "on" }))).toEqual([]);
+    expect(problemsOf(mainnetEnv({ GATE_OPEN: "on" }))).toEqual([]);
+    expect(problemsOf(mainnetEnv({ GATE_INVITES_FILE: undefined, GATE_OPEN: "off" }))).toEqual([
+      expect.stringContaining("GATE_INVITES_FILE is not set"),
+    ]);
+    expect(loadConfig(mainnetEnv()).GATE_OPEN).toBe(false);
+    expect(loadConfig(mainnetEnv({ GATE_OPEN: "on" })).GATE_OPEN).toBe(true);
+  });
+
   it("requires a public address for each of the three a browser is told, with no fallback", () => {
     const problems = problemsOf(
       mainnetEnv({

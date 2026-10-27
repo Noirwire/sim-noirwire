@@ -279,6 +279,9 @@ export const startApp = async (
     console.log(
       "sim-noirwire: mainnet mode: running the house maker, the gate and the market data only",
     );
+    if (config.GATE_OPEN) {
+      console.log("sim-noirwire: the gate is open: any owner key may open an account");
+    }
   }
 
   priceSource?.start((point) => {

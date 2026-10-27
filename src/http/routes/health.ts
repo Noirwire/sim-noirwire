@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { isMainnet } from "../../config/config.js";
 import type { AppContext } from "../context.js";
 
 /**
@@ -23,6 +24,7 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
       venue: ctx.config.VENUE,
       network: ctx.config.NETWORK,
       awake: ctx.activity.awake,
+      ...(isMainnet(ctx.config) ? { gate: ctx.config.GATE_OPEN ? "open" : "invite-only" } : {}),
     };
     const trading = ctx.activity.awake ? ctx.trading?.() : undefined;
     const tradingField = trading ? { trading } : {};
