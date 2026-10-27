@@ -656,7 +656,7 @@ const abs = (value: bigint): bigint => (value < 0n ? -value : value);
 
 beforeEach(() => {
   vi.useFakeTimers({
-    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
   });
   vi.setSystemTime(START_MS);
   disk.failState = false;

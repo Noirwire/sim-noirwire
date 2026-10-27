@@ -287,22 +287,28 @@ export const referenceOf = (
 export class ReferencePrice {
   private readonly lastCalls = new Map<
     ReferenceSource,
-    { atMs: number; answer: Promise<PriceReading> }
+    { monotonicAtMs: number; answer: Promise<PriceReading> }
   >();
 
+  /**
+   * `monotonicMs` times the gap between calls and nothing else: the wall clock
+   * can be corrected backward or forward, which must neither bring a source's
+   * next call early nor push it late. Readings are dated, and aged, by `clock`.
+   */
   constructor(
     private readonly sources: ReferenceSource[],
     private readonly clock: Clock,
+    private readonly monotonicMs: () => number = () => performance.now(),
   ) {}
 
   private readSource(source: ReferenceSource): Promise<PriceReading> {
-    const nowMs = this.clock.nowMs();
+    const monotonicNowMs = this.monotonicMs();
     const last = this.lastCalls.get(source);
-    if (last && nowMs >= last.atMs && nowMs - last.atMs < (source.minIntervalMs ?? 0)) {
+    if (last && monotonicNowMs - last.monotonicAtMs < (source.minIntervalMs ?? 0)) {
       return last.answer;
     }
     const answer = source.read();
-    this.lastCalls.set(source, { atMs: nowMs, answer });
+    this.lastCalls.set(source, { monotonicAtMs: monotonicNowMs, answer });
     return answer;
   }
 
