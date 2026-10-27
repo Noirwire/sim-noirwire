@@ -421,10 +421,11 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   and `maker-control.json` (the last kill switch request). If the first cannot be read, the
   service stops at start and says so: fix or move it away on purpose, since starting
   without it would forget the limits.
-- **Outbound addresses the maker needs** (public, no key): `hermes.pyth.network`,
-  `api.exchange.coinbase.com`, `api.kraken.com` and `www.okx.com`, on port 443. With one of
-  them blocked the maker keeps quoting on the rest as long as Pyth and two exchanges
-  answer; with Pyth blocked, or two of the exchanges, it pulls its quotes.
+- **Outbound addresses the maker needs** (public, no key): `api.exchange.coinbase.com`,
+  `api.kraken.com` and `www.okx.com`, on port 443, and the Solana RPC address
+  (`SOLANA_RPC_URL`), from which it reads Pyth's SOL/USD price account. With one exchange
+  blocked the maker keeps quoting on the rest as long as Pyth and two exchanges answer;
+  with the Pyth account unreadable, or two of the exchanges blocked, it pulls its quotes.
 
 ### The hedge controller on mainnet (off by default)
 

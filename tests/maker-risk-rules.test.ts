@@ -42,9 +42,12 @@ import {
   type PriceReading,
   type Reference,
   ReferencePrice,
+  SOL_USD_FEED_ID,
+  readPythAccount,
   referenceOf,
   referenceSources,
 } from "../src/prices/reference-price.js";
+import { pythPriceAccountOf } from "../src/rollup/program.js";
 import { MARKETS } from "../src/engine/markets.js";
 import { ORDER_EXPIRY_TOO_NEAR, placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
@@ -145,11 +148,116 @@ describe("the reference price", () => {
     });
   });
 
-  it("reads the public answers of Pyth, Coinbase, Kraken and OKX", async () => {
+  describe("the Pyth price account", () => {
+    const FEED = Buffer.from(SOL_USD_FEED_ID, "hex");
+    /** A PriceUpdateV2 account as the chain holds it: 134 bytes, a Full one using 133 of them. */
+    const account = (
+      over: {
+        level?: number;
+        feed?: Buffer;
+        price?: bigint;
+        expo?: number;
+        publishS?: number;
+      } = {},
+    ): Buffer => {
+      const data = Buffer.alloc(134);
+      Buffer.from("22f123639d7ef4cd", "hex").copy(data, 0);
+      data.fill(7, 8, 40);
+      const level = over.level ?? 1;
+      data[40] = level;
+      let at = 41;
+      if (level === 0) data[at++] = 5;
+      (over.feed ?? FEED).copy(data, at);
+      data.writeBigInt64LE(over.price ?? 15012345678n, at + 32);
+      data.writeBigUInt64LE(1_000_000n, at + 40);
+      data.writeInt32LE(over.expo ?? -8, at + 48);
+      data.writeBigInt64LE(BigInt(over.publishS ?? now / 1_000 - 4), at + 52);
+      return data;
+    };
+
+    it("is read from a real shaped 134 byte account", () => {
+      expect(readPythAccount(account())).toEqual({
+        source: "Pyth",
+        exchange: false,
+        price: dollars(150.123456),
+        atMs: now - 4_000,
+      });
+    });
+
+    it("is the account the exchange's SOL market is bound to", () => {
+      expect(pythPriceAccountOf(SOL_USD_FEED_ID)).toBe(
+        "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+      );
+    });
+
+    it("is refused unless fully verified, with the reason", () => {
+      expect(() => readPythAccount(account({ level: 0 }))).toThrow(
+        "the Pyth price account is not fully verified",
+      );
+    });
+
+    it("is refused for another feed id", () => {
+      const other = Buffer.from(FEED);
+      other[0] ^= 1;
+      expect(() => readPythAccount(account({ feed: other }))).toThrow(
+        "the Pyth price account is not the SOL/USD feed",
+      );
+    });
+
+    it("is refused when too short, out of range or not above zero", () => {
+      expect(() => readPythAccount(account().subarray(0, 100))).toThrow("too short");
+      expect(() => readPythAccount(account({ expo: 3 }))).toThrow("exponent");
+      expect(() => readPythAccount(account({ price: -5n }))).toThrow("not above zero");
+    });
+
+    it("puts the reason in the maker's pull reason", async () => {
+      const sources = referenceSources(
+        async () => account({ level: 0 }),
+        async () => ({}),
+      );
+      const reference = await new ReferencePrice(sources, new ManualClock(now)).read();
+      expect(reference).toEqual({
+        ok: false,
+        reason: expect.stringContaining(
+          "the oracle price is missing (no answer from Coinbase, Kraken, OKX; the Pyth price account is not fully verified)",
+        ),
+      });
+    });
+
+    it("says so when the account does not exist", async () => {
+      const read = referenceSources(async () => null)[0].read();
+      await expect(read).rejects.toThrow("the Pyth price account does not exist");
+    });
+
+    it("may be 29 s old, but not 31 s, while exchanges stay at 10 s", () => {
+      const exchanges = [reading("Coinbase", 150, now), reading("Kraken", 150, now)];
+      const oracleAged = (seconds: number) =>
+        referenceOf([...exchanges, reading("Pyth", 150, now - seconds * 1_000, false)], [], now);
+
+      expect(oracleAged(29).ok).toBe(true);
+      expect(oracleAged(30).ok).toBe(true);
+      expect(oracleAged(31)).toEqual({ ok: false, reason: "the Pyth price is 31 s old" });
+      const staleExchange = referenceOf(
+        [
+          reading("Pyth", 150, now - 29_000, false),
+          exchanges[0],
+          reading("Kraken", 150, now - 11_000),
+        ],
+        [],
+        now,
+      );
+      expect(staleExchange).toEqual({ ok: false, reason: "the Kraken price is 11 s old" });
+    });
+  });
+
+  it("reads the public answers of Pyth's account, Coinbase, Kraken and OKX", async () => {
+    const pythAccount = Buffer.alloc(134);
+    pythAccount[40] = 1;
+    Buffer.from(SOL_USD_FEED_ID, "hex").copy(pythAccount, 41);
+    pythAccount.writeBigInt64LE(15012345678n, 73);
+    pythAccount.writeInt32LE(-8, 89);
+    pythAccount.writeBigInt64LE(BigInt(now / 1_000 - 2), 93);
     const answers: Record<string, unknown> = {
-      "hermes.pyth.network": {
-        parsed: [{ price: { price: "15012345678", expo: -8, publish_time: now / 1_000 - 2 } }],
-      },
       "api.exchange.coinbase.com": { price: "150.11", time: new Date(now - 500).toISOString() },
       "api.kraken.com": {
         error: [],
@@ -160,7 +268,10 @@ describe("the reference price", () => {
       },
       "www.okx.com": { data: [{ last: "150.13", ts: String(now - 300) }] },
     };
-    const sources = referenceSources(async (url) => answers[new URL(url).host]);
+    const sources = referenceSources(
+      async () => pythAccount,
+      async (url) => answers[new URL(url).host],
+    );
 
     const readings = await Promise.all(sources.map((source) => source.read()));
 

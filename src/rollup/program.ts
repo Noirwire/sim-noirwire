@@ -29,6 +29,7 @@ import {
   decodeView,
   globalSocket,
   ownFills,
+  pythPriceAccount,
   randomSecret,
   sendAndConfirm,
   websocketUrl,
@@ -75,6 +76,10 @@ export const DAILY_SEAT_LIMIT_ERROR = 6137;
 /** The fee and insurance seats come first; traders sit from here up. */
 export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
 export const SEAT_COUNT = SEATS;
+
+/** The address of Pyth's price account for a feed id (64 hex characters): the one a market bound to that feed reads. */
+export const pythPriceAccountOf = (feedIdHex: string): string =>
+  pythPriceAccount(Uint8Array.from(Buffer.from(feedIdHex, "hex"))).toBase58();
 
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
