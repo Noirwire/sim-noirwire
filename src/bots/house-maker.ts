@@ -810,6 +810,10 @@ export class HouseMaker {
       "The replaced quotes expire by themselves, and it cancels everything on the next tick.",
     );
 
+    if (resting.length > 0 && this.unrunLadders > 0) {
+      this.unrunLadders = 0;
+      await this.options.ledger?.update({ unrunLadders: 0 });
+    }
     // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
     if (leftOut > 0) {
       this.lastQuoted = null;

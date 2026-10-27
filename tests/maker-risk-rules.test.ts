@@ -4131,6 +4131,35 @@ describe("a house maker's requote keeps the book quoted", () => {
     expect(live.calls.filter((call) => call === "cancelOrder")).toHaveLength(8);
   });
 
+  it("starts the count of ladders that never ran again when a ladder with an order missing still rests", async () => {
+    const { live, step, ledger, said } = await quoting("mbb-partial-resets-unrun", {
+      positionLimitNotional: dollars(1_000),
+    });
+    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+
+    for (let ladder = 1; ladder < limit; ladder += 1) {
+      live.neverRunsFrom = live.placed + 3;
+      await step(11);
+    }
+    live.neverRunsFrom = null;
+    expect(ledger.state.unrunLadders).toBe(limit - 1);
+
+    live.refusing = "sell";
+    await step(11);
+    live.refusing = null;
+    expect(live.matchRefusals).toBeGreaterThan(0);
+    expect(live.side("buy").length).toBeGreaterThan(0);
+    expect(ledger.state.unrunLadders).toBe(0);
+
+    live.neverRunsFrom = live.placed + 3;
+    await step(11);
+    live.neverRunsFrom = null;
+
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+    expect(ledger.state.unrunLadders).toBe(1);
+  });
+
   it("writes the ladder in flight to disk before the first order and ends it once the new ladder is up", async () => {
     const { live, step, dir, clock } = await quoting("mbb-hold", {
       positionLimitNotional: dollars(1_000),
