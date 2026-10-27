@@ -240,6 +240,33 @@ export class SeatLedger {
     }
   }
 
+  /**
+   * Takes back a transaction that `track` recorded and that was never handed out, and puts the last
+   * valid block height back to what it was before. Only for a caller that is the sole writer of the
+   * seat since that `track`. Throws, changing nothing, if it cannot be saved.
+   */
+  async untrack(
+    invite: string,
+    signature: string,
+    lastValidBlockHeight: number | undefined,
+  ): Promise<void> {
+    const record = this.forInvite(invite);
+    if (record?.state !== "unconfirmed") return;
+    const before = {
+      signatures: record.signatures,
+      lastValidBlockHeight: record.lastValidBlockHeight,
+    };
+    record.signatures = (record.signatures ?? []).filter((entry) => entry !== signature);
+    if (lastValidBlockHeight === undefined) delete record.lastValidBlockHeight;
+    else record.lastValidBlockHeight = lastValidBlockHeight;
+    try {
+      await this.save();
+    } catch (error) {
+      Object.assign(record, before);
+      throw error;
+    }
+  }
+
   /** The rollup confirmed the seat. */
   async confirm(invite: string): Promise<void> {
     const record = this.forInvite(invite);

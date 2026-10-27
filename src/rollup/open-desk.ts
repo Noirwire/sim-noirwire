@@ -270,9 +270,11 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
     const wire = transaction
       .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString("base64");
+    const signature = base58Of(gateSignature?.signature ?? new Uint8Array(64));
+    const heightBefore = admission.lastValidBlockHeightOf(decision.invite);
     const written = await admission.track(
       decision.invite,
-      base58Of(gateSignature?.signature ?? new Uint8Array(64)),
+      signature,
       transaction.lastValidBlockHeight ?? 0,
     );
     if (!written) {
@@ -283,7 +285,11 @@ export class OpenDesk implements OpenRequests, SeatSweeping {
       return RECORD_NOT_WRITTEN;
     }
     // A submit may have started sending the earlier transaction while this one was being built.
-    if (this.prepared.get(owner)?.sending) return this.refuseWhileSending(owner);
+    if (this.prepared.get(owner)?.sending) {
+      // This transaction is never handed out, so it must not hold the seat until its blockhash expires.
+      await this.settle(() => admission.untrack(decision.invite, signature, heightBefore));
+      return this.refuseWhileSending(owner);
+    }
     this.prepared.set(owner, {
       message: transaction.serializeMessage(),
       transaction: wire,

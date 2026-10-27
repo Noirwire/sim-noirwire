@@ -19,6 +19,7 @@ import { buildServer } from "../src/http/server.js";
 import type { ChainExchange } from "../src/rollup/chain-types.js";
 import { Session } from "../src/rollup/connections.js";
 import { OpenDesk } from "../src/rollup/open-desk.js";
+import { reconcileSeat } from "../src/rollup/reconcile-seat.js";
 import { Program } from "../src/rollup/program.js";
 
 const DIR = join("data-test", `open-desk-${Date.now()}`);
@@ -72,6 +73,10 @@ const serviceWith = async (
     /** Held back until released: a send, or the reading of the block height. */
     sendHold: Promise<void> | null;
     heightHold: Promise<void> | null;
+    /** Held back until released: the blockhash a transaction is built on. */
+    blockhashHold: Promise<void> | null;
+    /** The last valid block height of the next blockhash. */
+    lastValidBlockHeight: number;
     /** What the history says about one signature, when it should differ from the rest. */
     history: Record<string, { confirmationStatus: string; err: unknown } | null>;
     /** The endpoint refuses the transaction at the door. */
@@ -86,13 +91,18 @@ const serviceWith = async (
     status: "finalized",
     sendHold: null,
     heightHold: null,
+    blockhashHold: null,
+    lastValidBlockHeight: 1,
   };
   const connection = {
     rpcEndpoint: "https://rollup.example",
-    getLatestBlockhash: async () => ({
-      blockhash: Keypair.generate().publicKey.toBase58(),
-      lastValidBlockHeight: 1,
-    }),
+    getLatestBlockhash: async () => {
+      await answer.blockhashHold;
+      return {
+        blockhash: Keypair.generate().publicKey.toBase58(),
+        lastValidBlockHeight: answer.lastValidBlockHeight,
+      };
+    },
     sendRawTransaction: async (raw: Buffer) => {
       await answer.sendHold;
       if (answer.door) throw new Error("429 too many requests");
@@ -227,6 +237,7 @@ const serviceWith = async (
     clock,
     desk,
     makeDesk,
+    connection,
   };
 };
 
@@ -929,6 +940,40 @@ describe("opening an account on mainnet", () => {
     release();
     expect((await sending).ok).toBe(true);
     expect(sent).toHaveLength(1);
+  });
+
+  it("drops the record of a transaction refused because a send began while it was built, so the sweep need not wait for its blockhash", async () => {
+    const { owners, desk, signedBy, answer, dir, connection } = await serviceWith(everyone);
+    const owner = owners[0].publicKey.toBase58();
+    const first = await desk.prepare(askFor(owners[0], "10.0.0.7"));
+    if (!first.ok) throw new Error("not prepared");
+    answer.blockHeight = 3;
+    answer.lastValidBlockHeight = 5;
+    let building = () => {};
+    answer.blockhashHold = new Promise<void>((resolve) => (building = resolve));
+    const other = desk.prepare({
+      ...askFor(owners[0], "10.0.0.7"),
+      orderKeys: Array.from({ length: 4 }, () => Keypair.generate().publicKey.toBase58()),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    let release = () => {};
+    answer.sendHold = new Promise<void>((resolve) => (release = resolve));
+    const sending = desk.submit(owner, signedBy(owners[0], first.transaction), "10.0.0.7");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    building();
+
+    const refused = await other;
+    expect(refused.ok).toBe(false);
+    const seat = seatsIn(dir).forInvite(inviteOf(owners[0]));
+    expect(seat?.signatures).toHaveLength(1);
+    expect(seat?.lastValidBlockHeight).toBe(1);
+
+    answer.landed = true;
+    expect(await reconcileSeat(Session.of(connection), seat ?? {}, () => {})).toBe("landed");
+
+    answer.sendHold = null;
+    release();
+    await sending;
   });
 
   it("hands out a transaction again once a send has failed", async () => {
