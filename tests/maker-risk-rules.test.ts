@@ -4101,6 +4101,15 @@ describe("a house maker's requote keeps the book quoted", () => {
           remainingSize: 0n,
         };
       }
+      if (order.type === "ioc") {
+        return {
+          orderId: "",
+          tag: 0n,
+          status: "cancelled",
+          filledSize: 0n,
+          remainingSize: order.size,
+        };
+      }
       const price = order.price ?? 0n;
       const crosses = this.side(order.side === "buy" ? "sell" : "buy").some((resting) =>
         order.side === "buy" ? price >= (resting.price ?? 0n) : price <= (resting.price ?? 0n),
@@ -4270,7 +4279,7 @@ describe("a house maker's requote keeps the book quoted", () => {
 
     await step(11);
 
-    expect(live.matchRefusals).toBe(3);
+    expect(live.matchRefusals).toBe(6);
     expect(ids(live.side("sell"))).toEqual(oldAsks);
     expect(live.side("buy")).toHaveLength(3);
     expect(live.steps.every(({ bids, asks }) => bids.length > 0 && asks.length > 0)).toBe(true);

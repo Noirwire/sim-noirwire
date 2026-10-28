@@ -155,6 +155,10 @@ const isRoutineRefusal = (order: NewOrder, reason: string | undefined): boolean 
   ROUTINE_REFUSAL.test(reason ?? "") ||
   (order.reduceOnly === true && NOTHING_TO_REDUCE.test(reason ?? ""));
 
+/** A post-only quote the venue refused because it would match: the maker takes that order instead of dropping it. */
+const wouldTake = (order: NewOrder, reason: string | undefined): boolean =>
+  order.type === "postOnly" && ROUTINE_REFUSAL.test(reason ?? "");
+
 /** `size` where a side that already reaches `reach` has room for a whole level under the cap, else nothing. */
 const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigint): bigint =>
   positionCap === undefined || positionCap - reach >= size ? size : 0n;
@@ -853,7 +857,7 @@ export class HouseMaker {
     let tooLate = false;
     let unrunReason: string | undefined;
     try {
-      for (const order of orders) {
+      ladder: for (const order of orders) {
         if (epoch !== this.epoch) {
           cutShort = true;
           break;
@@ -864,31 +868,54 @@ export class HouseMaker {
           expiresInSeconds: this.expiresInSeconds,
           expiresAtMs,
         };
-        const placed = await venue.placeOrder(this.trader, sent);
-        if (placed.outcomeUnknown) {
-          await this.holdForUnknown(sent, placed.orderId);
-          sawUnknown = true;
-          unknownReason = placed.reason;
-          break;
+        // A quote that would cross is taken once, then what the take left of it is quoted once more.
+        let attempt: NewOrder | null = sent;
+        let taken = false;
+        while (attempt !== null) {
+          if (epoch !== this.epoch) {
+            cutShort = true;
+            break ladder;
+          }
+          const current: NewOrder = attempt;
+          attempt = null;
+          const placed = await venue.placeOrder(this.trader, current);
+          if (placed.outcomeUnknown) {
+            await this.holdForUnknown(current, placed.orderId);
+            sawUnknown = true;
+            unknownReason = placed.reason;
+            break ladder;
+          }
+          if (placed.status !== "rejected") sentIds.push(placed.orderId);
+          const stands =
+            current.type !== "ioc" &&
+            (placed.status === "open" || placed.status === "partiallyFilled") &&
+            placed.remainingSize > 0n;
+          if (stands) resting.push({ ...order, size: placed.remainingSize });
+          if (current.type === "ioc" && placed.status !== "rejected") {
+            const left = roundDownToStep(current.size - placed.filledSize, this.options.lotSize);
+            if (left > 0n) attempt = { ...sent, size: left };
+            continue;
+          }
+          if (placed.status === "rejected" && placed.reason === ORDER_EXPIRY_TOO_NEAR) {
+            tooLate = true;
+            break ladder;
+          }
+          if (placed.status !== "rejected") continue;
+          if (!placed.didNotRun && !taken && !flattening && wouldTake(current, placed.reason)) {
+            taken = true;
+            attempt = { ...current, type: "ioc" };
+            continue;
+          }
+          if (!safety) continue;
+          if (placed.didNotRun) {
+            unrunReason = placed.reason || "no reason given";
+            break ladder;
+          }
+          if (!isRoutineRefusal(current, placed.reason)) {
+            throw new OrderRefused(this.options.market, placed.reason);
+          }
+          leftOut += 1;
         }
-        if (placed.status !== "rejected") sentIds.push(placed.orderId);
-        const stands =
-          (placed.status === "open" || placed.status === "partiallyFilled") &&
-          placed.remainingSize > 0n;
-        if (stands) resting.push({ ...order, size: placed.remainingSize });
-        if (placed.status === "rejected" && placed.reason === ORDER_EXPIRY_TOO_NEAR) {
-          tooLate = true;
-          break;
-        }
-        if (!safety || placed.status !== "rejected") continue;
-        if (placed.didNotRun) {
-          unrunReason = placed.reason || "no reason given";
-          break;
-        }
-        if (!isRoutineRefusal(sent, placed.reason)) {
-          throw new OrderRefused(this.options.market, placed.reason);
-        }
-        leftOut += 1;
       }
     } catch (error) {
       // The record of the ladder in flight stays on disk: a failed order may still have been sent.
@@ -983,7 +1010,7 @@ export class HouseMaker {
 
   /**
    * Holds the maker until `order`, which may have been dispatched, can no longer rest or fill: its own
-   * absolute expiry for a resting order. A reduce-only or non-resting order has no such bound, so
+   * absolute expiry, for a quote or a take that carries one. A reduce-only or market order has no such bound, so
    * it holds the maker until an operator has looked (`reconcile`); without a ledger to record that
    * in, `UNKNOWN_ORDER_QUARANTINE_MS` from now. The hold is written to the ledger before this
    * returns; if that write fails the ledger stops the maker and the hold stays in memory.
@@ -991,8 +1018,11 @@ export class HouseMaker {
   private async holdForUnknown(order: NewOrder, orderId: string): Promise<void> {
     const now = this.options.clock.nowMs();
     const { ledger } = this.options;
-    const resting = order.type === "limit" || order.type === "postOnly";
-    const bounded = resting && !order.reduceOnly && order.expiresInSeconds !== undefined;
+    const expires = order.type !== "market";
+    const bounded =
+      expires &&
+      !order.reduceOnly &&
+      (order.expiresAtMs !== undefined || order.expiresInSeconds !== undefined);
     const lastsMs = ledger ? null : UNKNOWN_ORDER_QUARANTINE_MS;
     const until = bounded
       ? holdLapsesAtMs(order.expiresAtMs ?? now + (order.expiresInSeconds ?? 0) * 1_000)
