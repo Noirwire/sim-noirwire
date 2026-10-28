@@ -1587,7 +1587,13 @@ describe("the makers opened by the service", () => {
 
         hung.on = false;
         await vi.advanceTimersByTimeAsync(60_000);
-        expect(bots.trading()).toEqual({ ready: true });
+        // The market has no mark in this rig, so the maker stays silent: that is the other cause of not ready.
+        expect(bots.trading().reason ?? "").not.toContain("could not be read");
+        expect(bots.trading().reason ?? "").not.toContain("has not been read yet");
+        expect(bots.trading().ready).toBe(false);
+        expect(bots.trading().reason).toMatch(
+          /NSOL-PERP maker has had no quotes resting for \d+ s: it has not quoted yet/,
+        );
       } finally {
         for (const loop of loops) loop.stop();
       }

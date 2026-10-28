@@ -2,6 +2,15 @@ import { type Keypair, PublicKey } from "@solana/web3.js";
 import type { Clock } from "../engine/clock.js";
 import type { Session } from "./connections.js";
 import { type CustodyTokenRef, DAILY_SEAT_LIMIT_ERROR, type Program } from "./program.js";
+import {
+  ACCOUNT_EXISTS_ERROR,
+  BELOW_RENT_ERROR,
+  EXCHANGE_PAUSED_ERROR,
+  GATE_MISSING_ERROR,
+  SEAT_ALREADY_OPEN_ERROR,
+  SEAT_TABLE_FULL_ERROR,
+  programErrorName,
+} from "./program-errors.js";
 import { checkSubmitted } from "./submitted-transaction.js";
 import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transactions.js";
 
@@ -47,6 +56,14 @@ const publicKeyOf = (value: string): PublicKey | null => {
 
 const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
 
+/** The causes of a refused opening that a person can be told in plain words. */
+const OPENING_REFUSED_BECAUSE: Record<number, string> = {
+  [EXCHANGE_PAUSED_ERROR]: "the exchange is paused",
+  [SEAT_TABLE_FULL_ERROR]: "the exchange has no free seat left",
+  [GATE_MISSING_ERROR]: "the exchange does not list this gate",
+  [BELOW_RENT_ERROR]: "the payment for the new account is below the rent it needs",
+};
+
 export const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
   if (error instanceof ProgramRefused && error.code === DAILY_SEAT_LIMIT_ERROR) {
     return {
@@ -55,11 +72,25 @@ export const refusalOf = (error: unknown): Refusal<409 | 502 | 503> => {
       reason: "daily limit reached: no more new accounts can be opened today, try again tomorrow",
     };
   }
-  if (error instanceof ProgramRefused) {
+  if (
+    error instanceof ProgramRefused &&
+    (error.code === SEAT_ALREADY_OPEN_ERROR || error.code === ACCOUNT_EXISTS_ERROR)
+  ) {
     return {
       ok: false,
       status: 409,
       reason: "the account was not opened: it exists already. Nothing changed",
+    };
+  }
+  if (error instanceof ProgramRefused) {
+    const cause = error.code === null ? undefined : OPENING_REFUSED_BECAUSE[error.code];
+    const named = error.code === null ? "unnamed program error" : programErrorName(error.code);
+    return {
+      ok: false,
+      status: 503,
+      reason: cause
+        ? `${cause}: no account can be opened right now. Nothing was opened.`
+        : `the exchange refused the opening: ${named}. Nothing was opened.`,
     };
   }
   return {

@@ -4,6 +4,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Clock } from "../engine/clock.js";
 import { DAY_MS } from "../engine/day-window.js";
+import { clientAddressOf } from "../http/client-address.js";
 
 /** "opened": the rollup confirmed the seat. "unconfirmed": the transaction was sent and its fate is not known. */
 export type SeatState = "opened" | "unconfirmed";
@@ -19,6 +20,13 @@ export interface SeatRecord {
    * the hash is dropped once the UTC day it counts for is over.
    */
   asker?: string;
+  /**
+   * A gate-signed transaction was handed out for this seat and its owner has not submitted it: a
+   * prepare in progress. It counts toward the day's limits all the same, since the owner can send
+   * the bytes without asking the gate, and it stops counting only when the chain shows it cannot
+   * land. The flag only tells it from a seat that was submitted or landed, for what a refusal says.
+   */
+  unsubmitted?: boolean;
   /**
    * The gate's signature on each transaction handed out for this seat while it is
    * unconfirmed (each is also the transaction's id on the chain), and the last block
@@ -44,6 +52,7 @@ const isRecord = (value: unknown): value is SeatRecord => {
     typeof record.owner === "string" &&
     typeof record.atMs === "number" &&
     (record.asker === undefined || typeof record.asker === "string") &&
+    (record.unsubmitted === undefined || typeof record.unsubmitted === "boolean") &&
     (record.signatures === undefined ||
       (Array.isArray(record.signatures) &&
         record.signatures.every((entry) => typeof entry === "string"))) &&
@@ -63,6 +72,7 @@ export class SeatLedger {
   private records: SeatRecord[];
   private saving: Promise<void> = Promise.resolve();
   private key: string | null;
+  private keyMaking: Promise<string> | null = null;
   private readonly keyPath: string;
 
   constructor(
@@ -97,8 +107,17 @@ export class SeatLedger {
   }
 
   /** Creates the key, readable by this service alone, the first time a seat is reserved. */
-  private async ensureKey(): Promise<string> {
-    if (this.key !== null) return this.key;
+  private ensureKey(): Promise<string> {
+    if (this.key !== null) return Promise.resolve(this.key);
+    // One making at a time: a second caller waits for it rather than failing on the file it is writing.
+    this.keyMaking ??= this.makeKey().catch((error: unknown) => {
+      this.keyMaking = null;
+      throw error;
+    });
+    return this.keyMaking;
+  }
+
+  private async makeKey(): Promise<string> {
     const fresh = randomBytes(32).toString("hex");
     await mkdir(dirname(this.keyPath), { recursive: true });
     await writeFile(this.keyPath, `${fresh}\n`, { mode: 0o600, flag: "wx" });
@@ -106,8 +125,9 @@ export class SeatLedger {
     return fresh;
   }
 
+  /** An IPv4-mapped address is its IPv4 address and an IPv6 one its /64, so one person is one asker. */
   private askerOf(ip: string, key: string): string {
-    return createHmac("sha256", key).update(ip).digest("hex").slice(0, 16);
+    return createHmac("sha256", key).update(clientAddressOf(ip)).digest("hex").slice(0, 16);
   }
 
   /** An address is only needed for the day it counts in. Older records keep their seat and lose the hash. */
@@ -154,22 +174,58 @@ export class SeatLedger {
     return this.records.find((record) => record.owner === owner && record.state === "opened");
   }
 
-  /** Seats signed for in the UTC day of `nowMs`, not counting those under `except`. */
-  seatsToday(nowMs: number, except?: string): number {
-    return this.today(nowMs, except).length;
+  /**
+   * Seats signed for in the UTC day of `nowMs`, not counting those under the invite `except` or
+   * held by `owner`: an owner's own earlier seat is the one a new try replaces, never a second.
+   */
+  seatsToday(nowMs: number, except?: string, owner?: string): number {
+    return this.today(nowMs, except, owner).length;
   }
 
   /** As `seatsToday`, for one asker. */
-  seatsTodayFor(ip: string, nowMs: number, except?: string): number {
+  seatsTodayFor(ip: string, nowMs: number, except?: string, owner?: string): number {
     if (this.key === null) return 0;
     const asker = this.askerOf(ip, this.key);
-    return this.today(nowMs, except).filter((record) => record.asker === asker).length;
+    return this.today(nowMs, except, owner).filter((record) => record.asker === asker).length;
   }
 
-  private today(nowMs: number, except?: string): SeatRecord[] {
+  /** As `seatsToday`, of those whose owner submitted or that landed: not a prepare still waiting. */
+  submittedToday(nowMs: number, except?: string, owner?: string): number {
+    return this.today(nowMs, except, owner).filter((record) => !record.unsubmitted).length;
+  }
+
+  /** As `submittedToday`, for one asker. */
+  submittedTodayFor(ip: string, nowMs: number, except?: string, owner?: string): number {
+    if (this.key === null) return 0;
+    const asker = this.askerOf(ip, this.key);
+    return this.today(nowMs, except, owner).filter(
+      (record) => !record.unsubmitted && record.asker === asker,
+    ).length;
+  }
+
+  private today(nowMs: number, except?: string, owner?: string): SeatRecord[] {
     return this.records.filter(
-      (record) => record.invite !== except && utcDay(record.atMs) === utcDay(nowMs),
+      (record) =>
+        record.invite !== except && record.owner !== owner && utcDay(record.atMs) === utcDay(nowMs),
     );
+  }
+
+  /** Prepares waiting for their owner's submit from this asker, not counting those under `except` or held by `owner`. */
+  heldReservationsFor(ip: string, except?: string, owner?: string): number {
+    if (this.key === null) return 0;
+    const asker = this.askerOf(ip, this.key);
+    return this.records.filter(
+      (record) =>
+        record.invite !== except &&
+        record.owner !== owner &&
+        record.unsubmitted &&
+        record.asker === asker,
+    ).length;
+  }
+
+  /** The seat of `owner` that was sent and is not confirmed yet, whichever invite it was reserved under. */
+  unconfirmedFor(owner: string): SeatRecord | undefined {
+    return this.awaitingSettlement().find((record) => record.owner === owner);
   }
 
   /** Makes the key the addresses are hashed with, so that `reserve` has nothing to wait for. */
@@ -201,12 +257,21 @@ export class SeatLedger {
    * Records a seat as sent and saves it. Throws if it cannot be saved: nothing may be signed unrecorded.
    * Call `ready` first: with the key made, the record is in memory before this first waits, so a
    * decision made just before it cannot be overtaken. The signatures of an earlier try for the same
-   * invite are kept.
+   * invite are kept. A seat `held` is a prepare in progress, told from a submitted one until
+   * `commit`, even when an earlier try was already committed: a fresh transaction not yet sent is
+   * not a submitted one. Either way it counts, once.
    */
-  async reserve(invite: string, owner: string, ip: string, nowMs: number): Promise<void> {
+  async reserve(
+    invite: string,
+    owner: string,
+    ip: string,
+    nowMs: number,
+    held = false,
+  ): Promise<void> {
     const asker = this.askerOf(ip, this.key ?? (await this.ensureKey()));
     const replaced = this.forInvite(invite);
     const record: SeatRecord = { invite, owner, atMs: nowMs, state: "unconfirmed", asker };
+    if (held) record.unsubmitted = true;
     if (replaced?.signatures) record.signatures = replaced.signatures;
     if (replaced?.lastValidBlockHeight !== undefined) {
       record.lastValidBlockHeight = replaced.lastValidBlockHeight;
@@ -218,6 +283,26 @@ export class SeatLedger {
     } catch (error) {
       this.records = this.records.filter((entry) => entry !== record);
       if (replaced) this.records.push(replaced);
+      throw error;
+    }
+  }
+
+  /**
+   * The owner submitted from `ip`: the seat is charged to that address from this call on, before
+   * it first waits, so a check made just before it cannot be overtaken. Throws, changing nothing,
+   * if it cannot be saved: nothing may be sent unrecorded.
+   */
+  async commit(invite: string, ip: string): Promise<void> {
+    const record = this.forInvite(invite);
+    if (!record) return;
+    const before = { asker: record.asker, unsubmitted: record.unsubmitted };
+    delete record.unsubmitted;
+    record.asker = this.askerOf(ip, this.key ?? (await this.ensureKey()));
+    try {
+      await this.save();
+    } catch (error) {
+      record.asker = before.asker;
+      if (before.unsubmitted) record.unsubmitted = true;
       throw error;
     }
   }
@@ -272,6 +357,7 @@ export class SeatLedger {
     const record = this.forInvite(invite);
     if (record) {
       record.state = "opened";
+      delete record.unsubmitted;
       delete record.signatures;
       delete record.lastValidBlockHeight;
     }

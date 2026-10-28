@@ -1,5 +1,5 @@
 import { Connection, type FetchFn } from "@solana/web3.js";
-import { ROLLUP_BACKOFF, backoffDelayMs } from "../scheduling/backoff.js";
+import { type Backoff, ROLLUP_BACKOFF, backoffDelayMs } from "../scheduling/backoff.js";
 import type { Generation } from "./generation.js";
 import { REQUEST_TIMEOUT_MS, fetchWithin } from "./timeouts.js";
 import { ProgramRefused } from "./transactions.js";
@@ -9,6 +9,14 @@ interface ReconnectingSocket {
   on(event: "open" | "close" | "error", listener: () => void): unknown;
   setReconnectInterval(intervalMs: number): void;
 }
+
+/** What every connection opened from now on waits between websocket reconnects. */
+let reconnectBackoff: Backoff = ROLLUP_BACKOFF;
+
+/** Sets the wait between websocket reconnects of every connection opened after this call. */
+export const useReconnectBackoff = (backoff: Backoff): void => {
+  reconnectBackoff = backoff;
+};
 
 /**
  * Makes a connection's websocket wait longer after each failed reconnect.
@@ -22,19 +30,22 @@ interface ReconnectingSocket {
  * A socket that never opened reports an `error` and no `close`; one that
  * opened reports a `close`, so each failure is counted once.
  */
-export const backOffReconnects = (connection: Connection): void => {
+export const backOffReconnects = (
+  connection: Connection,
+  backoff: Backoff = reconnectBackoff,
+): void => {
   const socket = (connection as unknown as { _rpcWebSocket: ReconnectingSocket })._rpcWebSocket;
   let failures = 0;
   let open = false;
   const failed = (): void => {
     failures += 1;
-    socket.setReconnectInterval(backoffDelayMs(failures + 1));
+    socket.setReconnectInterval(backoffDelayMs(failures + 1, backoff));
   };
-  socket.setReconnectInterval(ROLLUP_BACKOFF.baseMs);
+  socket.setReconnectInterval(backoff.baseMs);
   socket.on("open", () => {
     open = true;
     failures = 0;
-    socket.setReconnectInterval(ROLLUP_BACKOFF.baseMs);
+    socket.setReconnectInterval(backoff.baseMs);
   });
   socket.on("error", () => {
     if (!open) failed();

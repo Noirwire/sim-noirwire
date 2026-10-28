@@ -1,3 +1,4 @@
+import { firstLine } from "../logging/first-line.js";
 import { type Backoff, backoffDelayMs } from "./backoff.js";
 
 export interface Repeating {
@@ -58,9 +59,16 @@ export const every = (
       turnsToSkip -= 1;
       return;
     }
-    running = run().finally(() => {
-      running = null;
-    });
+    // A handler that throws is logged and ends the run: it must never become an unhandled rejection.
+    running = run()
+      .catch((error: unknown) => {
+        process.stderr.write(
+          `sim-noirwire: a repeating loop's handler threw: ${firstLine(error)}\n`,
+        );
+      })
+      .finally(() => {
+        running = null;
+      });
   }, intervalMs);
   return {
     stop: () => {

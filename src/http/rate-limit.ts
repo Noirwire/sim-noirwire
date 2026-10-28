@@ -1,4 +1,5 @@
 import type { Clock } from "../engine/clock.js";
+import { clientAddressOf } from "./client-address.js";
 
 const WINDOW_MS = 60_000;
 
@@ -19,8 +20,12 @@ export class RateLimiter {
     this.sweptAtMs = clock.nowMs();
   }
 
-  /** Counts a request, and returns 0 if it may go ahead or else the seconds until the address may try again. */
-  hit(address: string): number {
+  /**
+   * Counts a request, and returns 0 if it may go ahead or else the seconds until the address may try again.
+   * An IPv4-mapped address counts as its IPv4 address, and an IPv6 one as its /64 network.
+   */
+  hit(caller: string): number {
+    const address = clientAddressOf(caller);
     const now = this.clock.nowMs();
     this.sweepIfDue(now);
     const window = this.windows.get(address);
@@ -50,7 +55,8 @@ export class SocketLimiter {
   constructor(private readonly perAddress: number) {}
 
   /** Returns the function to call when the socket closes, or null if the address already holds its share. */
-  acquire(address: string): (() => void) | null {
+  acquire(caller: string): (() => void) | null {
+    const address = clientAddressOf(caller);
     const held = this.open.get(address) ?? 0;
     if (held >= this.perAddress) return null;
     this.open.set(address, held + 1);
