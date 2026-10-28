@@ -1,5 +1,7 @@
 import type { Clock } from "../engine/clock.js";
-import { toDecimalString } from "../engine/money.js";
+import { mulDivScale, toDecimalString } from "../engine/money.js";
+import type { OrderView } from "../engine/types.js";
+import { sol } from "../hedge/hedge-controller.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
 import { type ControlCommand, STOP_STRANDS_USERS } from "./maker-control.js";
 import type { MakerLedger, MakerMode, MakerState } from "./maker-state.js";
@@ -66,6 +68,7 @@ interface Verdict {
 export class MakerRisk {
   private unknownErrorsInARow = 0;
   private flatAnnounced = false;
+  private reportedAtMs = -Infinity;
 
   constructor(
     private readonly ledger: MakerLedger,
@@ -149,6 +152,29 @@ export class MakerRisk {
     } finally {
       if (verdict) this.voice.alert(verdict.alert);
     }
+  }
+
+  /**
+   * Says what the maker holds, as a plain notice: at the first reading and then at most once every
+   * `statusEveryMs`. `equity` and `position` are the seat's at the venue's `mark`, and `resting` its
+   * open orders. A figure the ledger has not recorded yet is said as unknown.
+   */
+  report(equity: bigint, position: bigint, mark: bigint, resting: OrderView[]): void {
+    const nowMs = this.clock.nowMs();
+    if (nowMs - this.reportedAtMs < MAKER_LIMITS.statusEveryMs) return;
+    this.reportedAtMs = nowMs;
+    const { dayStartEquity, peakEquity, mode } = this.ledger.state;
+    const amount = (value: bigint | null): string =>
+      value === null ? "unknown" : `${nusd(value)} nUSD`;
+    const bids = resting.filter((order) => order.side === "buy");
+    const asks = resting.filter((order) => order.side === "sell");
+    const sizeOf = (orders: OrderView[]): string =>
+      sol(orders.reduce((sum, order) => sum + order.remainingSize, 0n));
+    this.voice.notice(
+      `${this.market} maker: equity ${amount(equity)}, position ${sol(position)} SOL (${amount(mulDivScale(position, mark))}), ` +
+        `resting ${bids.length} bids / ${asks.length} asks (${sizeOf(bids)} / ${sizeOf(asks)} SOL), ` +
+        `day start ${amount(dayStartEquity)}, peak ${amount(peakEquity)}, mode ${mode}`,
+    );
   }
 
   /** A good requote went out, so the errors it met before were not a pattern. */
