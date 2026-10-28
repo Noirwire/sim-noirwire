@@ -321,6 +321,13 @@ export const splitStanding = (
   return { before: standing.filter((old) => !after.includes(old)), after };
 };
 
+/** The total size of `orders` on each side. */
+const sizesBySide = (orders: { side: Side; size: bigint }[]): { buy: bigint; sell: bigint } => {
+  const total = (side: Side): bigint =>
+    orders.filter((order) => order.side === side).reduce((sum, order) => sum + order.size, 0n);
+  return { buy: total("buy"), sell: total("sell") };
+};
+
 type Quoting = Extract<Plan, { action: "quote" }>;
 
 /** With no risk rules the maker quotes around the venue's mark, as it always has. */
@@ -373,6 +380,13 @@ export class HouseMaker {
    */
   private hold: UnresolvedHold | null;
   private readonly expiresInSeconds: number;
+  /** What the last ladder placed on each side, and the position it was cut for. Null while it did not quote both sides. */
+  private placed: { buy: bigint; sell: bigint; position: bigint } | null = null;
+  private lastSideReadAtMs = -Infinity;
+  /** A seat read found the ladder consumed, so the next tick requotes. */
+  private consumed = false;
+  /** Since when a side the ladder placed orders on has had none resting, per side. Null outside normal quoting. */
+  private emptySince: { buy: number | null; sell: number | null } | null = null;
 
   constructor(private readonly options: HouseMakerOptions) {
     this.trader = makerTraderKey(options.market);
@@ -405,6 +419,22 @@ export class HouseMaker {
       return { sinceMs: this.restingUntilMs, because: "its last quotes expired" };
     }
     return null;
+  }
+
+  /**
+   * The side that has had no resting level the longest while the maker quotes normally, or null. A side
+   * the ladder left empty on purpose (no room under the position limit or the venue's cap) is not one.
+   */
+  get emptySide(): { side: "bids" | "asks"; sinceMs: number } | null {
+    const empty = this.emptySince;
+    if (empty === null) return null;
+    const sides = [
+      { side: "bids" as const, sinceMs: empty.buy },
+      { side: "asks" as const, sinceMs: empty.sell },
+    ].flatMap((entry) =>
+      entry.sinceMs === null ? [] : [{ side: entry.side, sinceMs: entry.sinceMs }],
+    );
+    return sides.sort((a, b) => a.sinceMs - b.sinceMs)[0] ?? null;
   }
 
   /** Since when an order of unknown outcome has held the maker, or null while it is free to quote. */
@@ -460,6 +490,7 @@ export class HouseMaker {
   async withdraw(venue: Venue): Promise<void> {
     this.epoch += 1;
     this.lastQuoted = null;
+    this.emptySince = null;
     await this.cancelQuotes(venue);
     // Only once the venue has taken them off: a cancel that failed or never answered is tried again on the next tick.
     this.standing = false;
@@ -564,7 +595,7 @@ export class HouseMaker {
     venue: Venue,
     plan: Quoting,
     market: MarketInfo,
-  ): Promise<(Overlap & { orders: NewOrder[] }) | null> {
+  ): Promise<(Overlap & { orders: NewOrder[]; position: bigint }) | null> {
     if (!this.mayOverlap(venue, plan, market)) return null;
     const seat = await venue.traderState(this.trader);
     const position = this.inventory(seat);
@@ -572,7 +603,7 @@ export class HouseMaker {
     if (orders.length === 0) return null;
     const standing = seat.openOrders.filter((open) => open.market === this.options.market);
     const room = this.overlapRoom(plan, market, seat, position, orders);
-    return { orders, ...splitStanding(standing, orders, room) };
+    return { orders, position, ...splitStanding(standing, orders, room) };
   }
 
   /**
@@ -616,7 +647,7 @@ export class HouseMaker {
 
   private dueForRequote(next: Quoting, nowMs: number): boolean {
     const last = this.lastQuoted;
-    if (last === null) return true;
+    if (last === null || this.consumed) return true;
     if (nowMs - this.lastQuotedAtMs >= this.options.requoteIntervalMs) return true;
     const { requoteThresholdBps } = this.options;
     if (next.reduceOnly !== last.reduceOnly) return true;
@@ -624,6 +655,49 @@ export class HouseMaker {
     if (Math.abs(next.extraSpreadBps - last.extraSpreadBps) >= requoteThresholdBps) return true;
     const moved = absBigInt(next.centre - last.centre) * BPS_PER_WHOLE;
     return !(moved < BigInt(Math.round(requoteThresholdBps)) * last.centre);
+  }
+
+  /**
+   * Whether a taker has consumed the ladder: a fill moved the position since it was cut, or a side
+   * rests with less than half of what the ladder placed there. Reads the seat at most once per
+   * `sideReadEveryMs`, and notes the sides that rest nothing. A read that fails is no reason to requote.
+   */
+  private async sidesConsumed(
+    venue: Venue,
+    next: Quoting,
+    now: number,
+    epoch: number,
+  ): Promise<boolean> {
+    const placed = this.placed;
+    if (placed === null || next.reduceOnly || next.flatten === true) return false;
+    if (now - this.lastSideReadAtMs < MAKER_LIMITS.sideReadEveryMs) return false;
+    this.lastSideReadAtMs = now;
+    let seat: TraderState;
+    try {
+      seat = await venue.traderState(this.trader);
+    } catch {
+      return false;
+    }
+    if (epoch !== this.epoch) return false;
+    const resting = sizesBySide(
+      seat.openOrders
+        .filter((open) => open.market === this.options.market)
+        .map((open) => ({ side: open.side, size: open.remainingSize })),
+    );
+    this.noteEmptySides(placed, resting, now);
+    const thin = (side: Side): boolean => placed[side] > 0n && resting[side] * 2n < placed[side];
+    return thin("buy") || thin("sell") || this.inventory(seat) !== placed.position;
+  }
+
+  /** A side that was given orders and has none resting is empty from when that was first seen. */
+  private noteEmptySides(
+    placed: { buy: bigint; sell: bigint },
+    resting: { buy: bigint; sell: bigint },
+    now: number,
+  ): void {
+    const since = (side: Side): number | null =>
+      placed[side] > 0n && resting[side] === 0n ? (this.emptySince?.[side] ?? now) : null;
+    this.emptySince = { buy: since("buy"), sell: since("sell") };
   }
 
   /** A perpetual's position, or on spot how much base it holds beyond what it started with. */
@@ -708,6 +782,7 @@ export class HouseMaker {
     if (plan.action !== "quote") {
       this.quoting(plan.action === "pull" ? plan.reason : "it is stopped");
       this.lastQuoted = null;
+      this.emptySince = null;
       if (this.standing) await this.withdrawOrAlert(venue);
       if (heldProblem !== undefined) throw heldProblem;
       return;
@@ -716,6 +791,7 @@ export class HouseMaker {
     if (held && !plan.flatten) {
       this.quoting("an order of unknown outcome holds it");
       this.lastQuoted = null;
+      this.emptySince = null;
       if (heldProblem !== undefined) throw heldProblem;
       return;
     }
@@ -725,12 +801,15 @@ export class HouseMaker {
     // Anything else pulls what is standing first: old two-sided quotes would still fill there.
     if (refused !== undefined && !(venueReducesOnly && plan.flatten)) {
       this.lastQuoted = null;
+      this.emptySince = null;
       if (venueReducesOnly && this.standing) await this.cancelStanding(venue);
       throw new QuotesHeld(this.options.market, refused);
     }
     const next: Quoting = venueReducesOnly ? { ...plan, reduceOnly: true } : plan;
     const now = this.options.clock.nowMs();
     if (!this.dueForRequote(next, now)) {
+      // A consumed ladder is requoted on the next tick, so the risk rules first see the seat after the fill.
+      if (await this.sidesConsumed(venue, next, now, epoch)) this.consumed = true;
       // The ladder from the last requote still stands, so a read that failed since is not silence.
       if (!next.reduceOnly && this.restingUntilMs !== null && now < this.restingUntilMs) {
         this.quoting(null);
@@ -741,9 +820,10 @@ export class HouseMaker {
     // Old orders that stand beside the new ladder until it is up, or none where everything is cancelled first.
     const overlap = await this.overlapFor(venue, next, market);
     let orders: NewOrder[];
+    let position: bigint;
     if (overlap === null) {
       await this.cancelStanding(venue);
-      const position = this.inventory(await venue.traderState(this.trader));
+      position = this.inventory(await venue.traderState(this.trader));
       orders = this.ordersFor(next, market, position);
       // The cancel above ran, so nothing stands: the next tick's plan takes the reduce-only path.
       if (safety && !next.reduceOnly && !safety.mayGrow()) {
@@ -751,7 +831,7 @@ export class HouseMaker {
         return;
       }
     } else {
-      ({ orders } = overlap);
+      ({ orders, position } = overlap);
       await this.cancelOld(venue, overlap.before, epoch);
     }
     const kept = overlap?.after ?? [];
@@ -859,6 +939,19 @@ export class HouseMaker {
       this.unrunLadders = 0;
       await this.options.ledger?.update({ unrunLadders: 0 });
     }
+    const planned = sizesBySide(orders);
+    const normal = !next.reduceOnly && !flattening;
+    if (normal) {
+      const standingNow = sizesBySide([
+        ...resting,
+        ...kept
+          .filter((old) => !replaced(old.side))
+          .map((old) => ({ side: old.side, size: old.remainingSize })),
+      ]);
+      this.noteEmptySides(planned, standingNow, now);
+    } else {
+      this.emptySince = null;
+    }
     // A ladder with an order missing is not a requote: the next tick sends it again, and no heartbeat says all is well.
     if (leftOut > 0) {
       this.lastQuoted = null;
@@ -866,6 +959,9 @@ export class HouseMaker {
     }
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
+    this.lastSideReadAtMs = now;
+    this.consumed = false;
+    this.placed = normal ? { ...planned, position } : null;
     this.quoting(
       resting.length > 0 || (!next.reduceOnly && kept.length > 0)
         ? null

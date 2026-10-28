@@ -42,6 +42,8 @@ const MARKETS_READ_DEADLINE_MS = 10_000;
 const MARKET_NOT_READ_YET = "the market has not been read yet";
 /** A maker with no quotes resting for longer than this while the service is awake makes trading not ready. */
 const MAKER_SILENT_NOT_READY_MS = 60_000;
+/** A maker quoting normally with one side empty for longer than this while the service is awake makes trading not ready. */
+const MAKER_SIDE_EMPTY_NOT_READY_MS = 15_000;
 
 /** `read`'s answer, or an error once the deadline passes. An answer that comes later is dropped. */
 const readWithinDeadline = <T>(
@@ -460,7 +462,16 @@ export const openBots = async (
         ledgers.some(
           ({ market, ledger }) => market === botMarkets[at].id && ledger.state.mode === "stopped",
         ) || maker.quarantinedSinceMs !== null;
-      if (!silence || reported) return [];
+      if (reported) return [];
+      const empty = maker.emptySide;
+      if (!silence && empty) {
+        const emptyMs = nowMs - Math.max(empty.sinceMs, awakeSinceMs);
+        if (emptyMs <= MAKER_SIDE_EMPTY_NOT_READY_MS) return [];
+        return [
+          `${botMarkets[at].id} maker has no ${empty.side} resting (for ${Math.floor(emptyMs / 1_000)} s)`,
+        ];
+      }
+      if (!silence) return [];
       const silentMs = nowMs - Math.max(silence.sinceMs, awakeSinceMs);
       if (silentMs <= MAKER_SILENT_NOT_READY_MS) return [];
       return [
