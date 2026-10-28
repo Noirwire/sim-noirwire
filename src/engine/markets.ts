@@ -58,9 +58,6 @@ export const MARKETS: readonly MarketConfig[] = [
 
 export const MARKET_IDS = MARKETS.map((market) => market.id) as [MarketId, ...MarketId[]];
 
-export const marketById = (id: MarketId): MarketConfig | undefined =>
-  MARKETS.find((market) => market.id === id);
-
 const BPS_PER_WHOLE = 10_000;
 
 /** A market with no margin requirement has no leverage to speak of. */
