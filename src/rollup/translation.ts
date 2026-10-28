@@ -127,7 +127,7 @@ export const traderStateOf = (
         });
       }
     }
-    const slot = view.perp[chain.marketId];
+    const slot = view.perp.find((held) => held.marketId === chain.marketId);
     if (chain.kind !== "perp" || !slot || slot.base === 0n) continue;
     positions[config.id] = {
       size: toSimSize(units, slot.base),

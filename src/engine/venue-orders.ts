@@ -18,6 +18,16 @@ export const rejectedOrder = (
 export const ORDER_EXPIRY_TOO_NEAR =
   "the order's expiry is already past or within a second, so nothing was sent";
 
+/** The name a venue gives the refusal of an order from a trader that holds no seat. The program's own is `NotSeated` (6155). */
+export const NOT_SEATED = "NotSeated";
+
+/** Whether `reason` is a venue telling that the trader holds no seat: a deposit takes one. */
+export const isNotSeated = (reason: string | undefined): boolean =>
+  (reason ?? "").includes(NOT_SEATED);
+
+/** The name a venue gives the refusal of an order that needs a fifth market on a seat. The program's own is `SlotsFull` (93). */
+export const SLOTS_FULL = "SlotsFull";
+
 /** An order the venue proves did not run, for a cause that passes by itself: shown as rejected, flagged as such. */
 export const unrunOrder = (
   orderId: string,

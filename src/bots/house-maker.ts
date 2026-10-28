@@ -20,7 +20,7 @@ import type {
   TraderState,
   Venue,
 } from "../engine/types.js";
-import { ORDER_EXPIRY_TOO_NEAR } from "../engine/venue-orders.js";
+import { ORDER_EXPIRY_TOO_NEAR, isNotSeated } from "../engine/venue-orders.js";
 import { VenueNotReady } from "../engine/venue-not-ready.js";
 import { firstLine } from "../logging/first-line.js";
 import { withinDeadline } from "../scheduling/deadline.js";
@@ -479,15 +479,23 @@ export class HouseMaker {
   }
 
   async ensureOpen(venue: Venue): Promise<void> {
-    const { kind, baseToken, quoteToken, startingQuoteBalance, startingBaseBalance, ledger } =
-      this.options;
+    const { kind, startingBaseBalance, ledger } = this.options;
     await venue.openTrader(this.trader);
-    await venue.deposit(this.trader, quoteToken, startingQuoteBalance);
+    await this.depositFloat(venue);
     if (kind !== "spot") return;
-    await venue.deposit(this.trader, baseToken, startingBaseBalance);
     const kept = ledger?.state.spotBaseAtStart ?? null;
     if (kept === null) await ledger?.update({ spotBaseAtStart: startingBaseBalance });
     this.baseHeldAtStart = kept ?? startingBaseBalance;
+  }
+
+  /**
+   * Puts the maker's float on its account. A view holds no seat until a deposit takes one, so this
+   * is also what seats the maker, at start and again if the venue says it has none.
+   */
+  private async depositFloat(venue: Venue): Promise<void> {
+    const { kind, baseToken, quoteToken, startingQuoteBalance, startingBaseBalance } = this.options;
+    await venue.deposit(this.trader, quoteToken, startingQuoteBalance);
+    if (kind === "spot") await venue.deposit(this.trader, baseToken, startingBaseBalance);
   }
 
   /** Takes every quote off the venue, and keeps the tick that may be running from placing more. */
@@ -856,6 +864,7 @@ export class HouseMaker {
     let cutShort = false;
     let tooLate = false;
     let unrunReason: string | undefined;
+    let seatedAgain = false;
     try {
       ladder: for (const order of orders) {
         if (epoch !== this.epoch) {
@@ -901,6 +910,12 @@ export class HouseMaker {
             break ladder;
           }
           if (placed.status !== "rejected") continue;
+          if (!placed.didNotRun && !seatedAgain && isNotSeated(placed.reason)) {
+            seatedAgain = true;
+            await this.depositFloat(venue);
+            attempt = current;
+            continue;
+          }
           if (!placed.didNotRun && !taken && !flattening && wouldTake(current, placed.reason)) {
             taken = true;
             attempt = { ...current, type: "ioc" };

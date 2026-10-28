@@ -29,8 +29,6 @@ export interface RollupWiringOptions {
   config: Config;
   data: PublicData;
   snapshot: SnapshotData | null;
-  /** How many user accounts this service has opened, ever. */
-  usersEverOpened(): number;
   onError(what: string, error: unknown): void;
   onRecovered(what: string): void;
   onUnreachable(): void;
@@ -155,7 +153,6 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       bots: roles.map((role, at) => ({ ...role, owner: settings.botOwners[at] })),
       recordedThrough: snapshot?.tapeCursors ?? {},
       keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
-      usersEverOpened: options.usersEverOpened,
       handlers: {
         onFill: ({ fill, origin, replayed }) => {
           if (replayed) {
@@ -285,6 +282,10 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
               submitSigned: (owner: string, signature: string, expiresAt: number, ip: string) =>
                 viaOpenDesk((desk) => desk.submitSigned(owner, signature, expiresAt, ip)),
             },
+            seatOccupancy: () => ({
+              viewsOpened: admission?.viewsOpened() ?? 0,
+              seatCapacity: rollup?.seatCapacity() ?? null,
+            }),
           }
         : {
             fundDesk: {

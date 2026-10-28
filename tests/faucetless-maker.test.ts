@@ -240,7 +240,6 @@ describe("the rollup wiring on a deployment without a faucet", () => {
       config: configWith(flags),
       data: {} as never,
       snapshot: null,
-      usersEverOpened: () => 0,
       onError,
       onRecovered: () => {},
       onUnreachable: () => {},
@@ -305,6 +304,7 @@ const OPEN: ChainExchange = {
   paused: false,
   quoteGuardOkUntilSeconds: PUBLISHED_AT_S + 180,
   maxSeatsPerDay: 5,
+  seatCapacity: 2_048,
 };
 
 const marketWith = (over: Partial<ChainMarket> = {}): RollupMarket => {

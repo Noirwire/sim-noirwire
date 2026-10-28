@@ -11,7 +11,7 @@ import { Session } from "../src/rollup/connections.js";
 import { FundDesk, type Funded } from "../src/rollup/fund-desk.js";
 import { Program, fillRoles } from "../src/rollup/program.js";
 import { publicDeployment } from "../src/rollup/public-deployment.js";
-import { SeatSweep } from "../src/rollup/seat-sweep.js";
+import { SeatSweep, seatRangeOfTarget, seatRangeTarget } from "../src/rollup/seat-sweep.js";
 import {
   deployedMarket,
   deployedMarkets,
@@ -163,18 +163,40 @@ describe("telling a bot's fill from a user's by receipt", () => {
 });
 
 describe("the liquidator's blind sweep", () => {
-  it("walks the seats a few at a time and wraps at the end of the table", () => {
-    const sweep = new SeatSweep(2, 6, () => 2_000);
-    expect(sweep.next(3)).toEqual([2, 3, 4]);
-    expect(sweep.next(3)).toEqual([5, 2, 3]);
+  it("walks the seats a range at a time and wraps at the exchange's seat capacity", () => {
+    const sweep = new SeatSweep(2, () => 6);
+    expect(sweep.next(3)).toEqual({ start: 2, count: 3 });
+    expect(sweep.next(3)).toEqual({ start: 5, count: 1 });
+    expect(sweep.next(3)).toEqual({ start: 2, count: 3 });
   });
 
-  it("walks only as far as the gate ever opened seats, and further once it opens more", () => {
-    let opened = 3;
-    const sweep = new SeatSweep(2, 2_048, () => opened);
-    expect(sweep.next(4)).toEqual([2, 3, 4, 2]);
-    opened = 5;
-    expect(sweep.next(4)).toEqual([3, 4, 5, 6]);
+  it("reaches further once the ledger grows, and sweeps nothing while the capacity is unknown", () => {
+    let capacity: number | null = null;
+    const sweep = new SeatSweep(2, () => capacity);
+    expect(sweep.next(4)).toBeNull();
+    capacity = 4;
+    expect(sweep.next(4)).toEqual({ start: 2, count: 2 });
+    capacity = 2_048;
+    expect(sweep.next(4)).toEqual({ start: 4, count: 4 });
+  });
+
+  it("carries on from the seat a sweep stopped at, never before the first trader seat", () => {
+    const sweep = new SeatSweep(2, () => 100);
+    sweep.next(10);
+    sweep.resumeAt(7);
+    expect(sweep.next(2)).toEqual({ start: 7, count: 2 });
+    sweep.resumeAt(0);
+    expect(sweep.next(2)).toEqual({ start: 2, count: 2 });
+  });
+
+  it("names a range as a target and reads it back", () => {
+    expect(seatRangeOfTarget(seatRangeTarget({ start: 258, count: 256 }))).toEqual({
+      start: 258,
+      count: 256,
+    });
+    expect(seatRangeOfTarget("bot:maker")).toBeNull();
+    expect(seatRangeOfTarget("seats:5")).toBeNull();
+    expect(seatRangeOfTarget("seats:5:0")).toBeNull();
   });
 });
 

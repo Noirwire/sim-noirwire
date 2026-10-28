@@ -18,7 +18,6 @@ import {
   OrderKeyManager,
   OutcomeUnknown,
   RESULT_STATUS,
-  SEATS,
   SIDE,
   TraderClient,
   TransactionFailed,
@@ -65,7 +64,10 @@ import type {
   PlaceOutcome,
   PlaceStatus,
   PublicAddresses,
+  RangeLiquidation,
+  SeatRange,
   SeatView,
+  SweepStop,
   Unsubscribe,
 } from "./chain-types.js";
 import { backedOffSockets } from "./bot-socket.js";
@@ -75,19 +77,19 @@ import {
   MAKER_NOT_LISTED_ERROR,
   ORDER_NOT_FOUND_ERROR,
   programErrorLabel,
+  programRefusalText,
 } from "./program-errors.js";
 import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
 export type { OwnerMessageForm };
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.8.1";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.9.0";
 /** How long an owner's signed action stays valid, on the rollup's clock. The program allows 120 seconds. */
 const OWNER_ACTION_LIFETIME_SECONDS = 100;
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 /** The fee and insurance seats come first; traders sit from here up. */
 export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
-export const SEAT_COUNT = SEATS;
 
 /** The address of Pyth's price account for a feed id (64 hex characters): the one a market bound to that feed reads. */
 export const pythPriceAccountOf = (feedIdHex: string): string =>
@@ -96,6 +98,8 @@ export const pythPriceAccountOf = (feedIdHex: string): string =>
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const LIQUIDATE_UP_TO_LOTS = 1_000_000_000n;
+/** The most takeovers one range liquidation makes before it ends; the sweep carries on from where it stopped. */
+const TAKEOVERS_PER_SWEEP = 4;
 const SIGN_IN_TIMEOUT_MS = 10_000;
 const NO_RESTING_EXPIRY = 0n;
 
@@ -114,6 +118,17 @@ const placeStatusOf = (status: number, rested: bigint): PlaceStatus => {
   if (status === RESULT_STATUS.rested || rested > 0n) return "rested";
   if (status === RESULT_STATUS.refusedPostOnlyWouldMatch) return "refused";
   return "cancelled";
+};
+
+/** Why a range liquidation ended early, from the status its result records; null when it reached the end of its range. */
+const sweepStopOf = (status: number): SweepStop | null => {
+  if (status === 0) return null;
+  if (status === LIQUIDATION_STATUS.stalePrice) return "stalePrice";
+  if (status === LIQUIDATION_STATUS.liquidatorMarginInsufficient) {
+    return "liquidatorMarginInsufficient";
+  }
+  if (status === LIQUIDATION_STATUS.liquidatorSlotsFull) return "liquidatorSlotsFull";
+  return "unrecognised";
 };
 
 const NOTHING_PLACED = { filled: 0n, rested: 0n, sendToResultMs: 0 };
@@ -194,6 +209,7 @@ const chainExchangeOf = (exchange: Exchange): ChainExchange => ({
     ? null
     : Number(exchange.quote.okUntil),
   maxSeatsPerDay: exchange.maxSeatsPerDay,
+  seatCapacity: exchange.seatCapacity,
 });
 
 const chainStatsOf = ({ orders, fills, openInterest }: Stats): ChainStats => ({
@@ -206,7 +222,11 @@ const seatViewOf = (view: View): SeatView => ({
   seat: view.seat,
   collateral: view.snapshot.seat.collateral,
   spot: view.snapshot.seat.spot.map((balance) => ({ ...balance })),
-  perp: view.snapshot.seat.perp.map((slot) => ({ base: slot.base, quote: slot.quote })),
+  perp: view.snapshot.seat.positions.map(({ marketId, base, quote }) => ({
+    marketId,
+    base,
+    quote,
+  })),
   ordersMarketId: view.snapshot.marketId,
   orders: view.snapshot.orders.map((order) => ({
     side: sideOf(order.side),
@@ -824,13 +844,16 @@ export class ProgramTrader {
       if (error instanceof TransactionFailed) {
         const { code } = error;
         const label = code === null ? "program error, unnumbered" : programErrorLabel(code);
+        const plain = code === null ? null : programRefusalText(code);
         return {
           status: "failed",
           ...NOTHING_PLACED,
           reason:
             code === MAKER_NOT_LISTED_ERROR
               ? `${label}: the seat is not listed as a maker on this market`
-              : label,
+              : plain === null
+                ? label
+                : `${label}: ${plain}`,
           programError: code ?? undefined,
         };
       }
@@ -873,19 +896,37 @@ export class ProgramTrader {
   }
 
   /**
-   * Whether seat `seat` was liquidated. Nobody can read another seat, so
-   * this is tried blind: a seat that is empty, healthy or without a position
-   * all answer the same. `worstPrice` set to the mark accepts a liquidation
-   * in either direction: below the mark from a long, above it from a short.
+   * Tries the seats of `range` for liquidation in one call, or null when the
+   * instruction never ran. Nobody can read another seat, so this is blind: a
+   * seat that is empty, healthy or without a position all answer the same.
+   * `worstPrice` set to the mark accepts a liquidation in either direction:
+   * below the mark from a long, above it from a short. The sweep ends early at
+   * a stale price, at a takeover the liquidator's margin cannot carry, or at
+   * one its four market slots cannot hold; `nextSeat` is then where it stopped.
    */
-  liquidate(marketId: number, seat: number, worstPrice: bigint): Promise<boolean> {
+  liquidateRange(
+    marketId: number,
+    range: SeatRange,
+    worstPrice: bigint,
+  ): Promise<RangeLiquidation | null> {
     return this.run(async (client) => {
       const result = await this.resultOf(
-        client.liquidate(marketId, seat, LIQUIDATE_UP_TO_LOTS, worstPrice),
+        client.liquidateRange(marketId, {
+          start: range.start,
+          count: range.count,
+          size: LIQUIDATE_UP_TO_LOTS,
+          worstPrice,
+          maxTakeovers: TAKEOVERS_PER_SWEEP,
+        }),
       );
-      return result?.status === LIQUIDATION_STATUS.liquidated;
+      if (result === null) return null;
+      return {
+        taken: result.code,
+        nextSeat: Number(result.orderSeq),
+        stopped: sweepStopOf(result.status),
+      };
     }).catch((error: unknown) => {
-      if (error instanceof TransactionFailed) return false;
+      if (error instanceof TransactionFailed) return null;
       throw error;
     });
   }

@@ -270,7 +270,7 @@ describe("the service on the real program (local network)", () => {
       });
       expect(placed.status).toBe("filled");
       expect(placed.filled).toBe(lots);
-      expect((await trader.view()).perp[PERP_ID]!.base).toBe(lots);
+      expect((await trader.view()).perp.find((held) => held.marketId === PERP_ID)!.base).toBe(lots);
 
       const message = await fillMessage;
       expect(message.market).toBe(PERP);
