@@ -1211,7 +1211,7 @@ export class HouseMaker {
   /** The seat's equity and position are what the risk rules judge the maker by. */
   private async assess(safety: MakerSafety, venue: Venue, mark: bigint): Promise<Plan> {
     const seat = await venue.traderState(this.trader);
-    return safety.assess(mark, seat.equity, this.inventory(seat));
+    return safety.assess(mark, seat.equity, this.inventory(seat), seat.openOrders);
   }
 
   /**

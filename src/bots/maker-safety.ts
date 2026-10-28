@@ -1,6 +1,6 @@
 import type { Clock } from "../engine/clock.js";
 import { absBigInt, maxBigInt, minBigInt, mulDivScale, toDecimalString } from "../engine/money.js";
-import type { NewOrder } from "../engine/types.js";
+import type { NewOrder, OrderView } from "../engine/types.js";
 import type { HedgeGate, HedgeStatus } from "../hedge/hedge-controller.js";
 import { HEDGE_LIMITS } from "../hedge/hedge-limits.js";
 import { firstLine } from "../logging/first-line.js";
@@ -169,9 +169,15 @@ export class MakerSafety {
    * limits are counted at the worse of that mark and the reference price, and
    * while the reference is down as `railsView` says.
    */
-  async assess(mark: bigint, equity: bigint, position: bigint): Promise<Plan> {
+  async assess(
+    mark: bigint,
+    equity: bigint,
+    position: bigint,
+    resting: OrderView[] = [],
+  ): Promise<Plan> {
     const { risk, clock } = this.options;
     await risk.follow(await this.command(), equity);
+    risk.report(equity, position, mark, resting);
     if (this.isStopped()) return this.stop();
 
     const reference = await this.options.reference.read();

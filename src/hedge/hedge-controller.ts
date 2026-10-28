@@ -70,7 +70,8 @@ interface UnexplainedOrder {
   call: { live: boolean };
 }
 
-const sol = (size: bigint): string => toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
+export const sol = (size: bigint): string =>
+  toDecimalString(size).replace(/0+$/, "").replace(/\.$/, ".0");
 
 /**
  * Keeps the maker's net SOL exposure near flat by trading the opposite

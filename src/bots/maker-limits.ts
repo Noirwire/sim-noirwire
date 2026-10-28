@@ -68,6 +68,8 @@ export const MAKER_LIMITS = {
   overlapMaxOpenOrders: 16,
   overlapMarginShareBps: 8_000,
 
+  /** The least time between two status lines that say what the maker holds. */
+  statusEveryMs: 300_000,
   /** A resting quote lives at most the requote interval plus this long. */
   expiryMarginSeconds: 10,
   /** How far the host clock may run ahead of the chain's: 30 s is far above the drift of a synced host, and costs only a longer hold. */
