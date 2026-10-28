@@ -383,6 +383,8 @@ export class HouseMaker {
   /** What the last ladder placed on each side, and the position it was cut for. Null while it did not quote both sides. */
   private placed: { buy: bigint; sell: bigint; position: bigint } | null = null;
   private lastSideReadAtMs = -Infinity;
+  /** A seat read found the ladder consumed, so the next tick requotes. */
+  private consumed = false;
   /** Since when a side the ladder placed orders on has had none resting, per side. Null outside normal quoting. */
   private emptySince: { buy: number | null; sell: number | null } | null = null;
 
@@ -645,7 +647,7 @@ export class HouseMaker {
 
   private dueForRequote(next: Quoting, nowMs: number): boolean {
     const last = this.lastQuoted;
-    if (last === null) return true;
+    if (last === null || this.consumed) return true;
     if (nowMs - this.lastQuotedAtMs >= this.options.requoteIntervalMs) return true;
     const { requoteThresholdBps } = this.options;
     if (next.reduceOnly !== last.reduceOnly) return true;
@@ -805,7 +807,9 @@ export class HouseMaker {
     }
     const next: Quoting = venueReducesOnly ? { ...plan, reduceOnly: true } : plan;
     const now = this.options.clock.nowMs();
-    if (!this.dueForRequote(next, now) && !(await this.sidesConsumed(venue, next, now, epoch))) {
+    if (!this.dueForRequote(next, now)) {
+      // A consumed ladder is requoted on the next tick, so the risk rules first see the seat after the fill.
+      if (await this.sidesConsumed(venue, next, now, epoch)) this.consumed = true;
       // The ladder from the last requote still stands, so a read that failed since is not silence.
       if (!next.reduceOnly && this.restingUntilMs !== null && now < this.restingUntilMs) {
         this.quoting(null);
@@ -956,6 +960,7 @@ export class HouseMaker {
     this.lastQuoted = next;
     this.lastQuotedAtMs = now;
     this.lastSideReadAtMs = now;
+    this.consumed = false;
     this.placed = normal ? { ...planned, position } : null;
     this.quoting(
       resting.length > 0 || (!next.reduceOnly && kept.length > 0)

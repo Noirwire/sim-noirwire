@@ -103,13 +103,16 @@ const steeredSafety = (plan: { action: string }): MakerSafety =>
   }) as unknown as MakerSafety;
 
 describe("when a taker consumes one side of the house maker's ladder", () => {
-  it("requotes on the next tick that reads the seat, long before the requote interval", async () => {
+  it("requotes on the tick after the seat read that finds it consumed, long before the requote interval", async () => {
     const { venue, maker, count, later, takeAsks } = await makerOf();
     await maker.tick(venue);
     expect(count.placed).toBe(4);
 
     await takeAsks(2);
     await later(2_000);
+    await maker.tick(venue);
+    expect(count.placed).toBe(4);
+    await later(1_000);
     await maker.tick(venue);
 
     expect(count.placed).toBe(8);
@@ -121,6 +124,8 @@ describe("when a taker consumes one side of the house maker's ladder", () => {
 
     await takeAsks(1.5);
     await later(2_000);
+    await maker.tick(venue);
+    await later(1_000);
     await maker.tick(venue);
 
     expect(count.placed).toBe(8);
@@ -140,6 +145,9 @@ describe("when a taker consumes one side of the house maker's ladder", () => {
     expect(count.placed).toBe(4);
 
     await later(500);
+    await maker.tick(venue);
+    expect(count.placed).toBe(4);
+    await later(1_000);
     await maker.tick(venue);
     expect(count.placed).toBe(8);
   });
