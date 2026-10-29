@@ -39,7 +39,42 @@ interface UnknownOutcomes {
   stillUnknown: number;
 }
 
+/** The counters as they are written to disk: volumes as decimal strings, since JSON has no bigint. */
+export interface StoredStats {
+  user: StoredCounters;
+  bot: StoredCounters;
+  userTraders: string[];
+  botTraders: string[];
+  unknown: UnknownOutcomes;
+}
+
+type StoredCounters = Omit<ActivityCounters, "volume"> & { volume: string };
+
 const emptyCounters = (): ActivityCounters => ({ orders: 0, fills: 0, volume: 0n });
+
+const storedCounters = (counters: ActivityCounters): StoredCounters => ({
+  ...counters,
+  volume: counters.volume.toString(),
+});
+
+const loadCounters = (target: ActivityCounters, stored: StoredCounters): void => {
+  target.orders = stored.orders;
+  target.fills = stored.fills;
+  target.volume = BigInt(stored.volume);
+};
+
+/**
+ * Whether a fill past the saved tape cursor belongs in the counters (a fill at
+ * or below it was counted before the snapshot and never gets here). With
+ * counters restored from a snapshot, each such fill counts once, whether it
+ * arrived live or while the process was down. Without them, only what
+ * happened since this process started counts.
+ */
+export const countsFill = (
+  fill: { timestampMs: number },
+  restored: boolean,
+  countingSinceMs: number,
+): boolean => restored || fill.timestampMs >= countingSinceMs;
 
 const DEFAULT_LATENCY_WINDOW = 500;
 
@@ -103,6 +138,24 @@ export class StatsTracker {
     const counters = origin === "bot" ? this.botCounters : this.userCounters;
     counters.fills += 1;
     counters.volume += mulDivScale(fill.price, fill.size);
+  }
+
+  toStored(): StoredStats {
+    return {
+      user: storedCounters(this.userCounters),
+      bot: storedCounters(this.botCounters),
+      userTraders: [...this.userTraders],
+      botTraders: [...this.botTraders],
+      unknown: { ...this.unknown },
+    };
+  }
+
+  restore(stored: StoredStats): void {
+    loadCounters(this.userCounters, stored.user);
+    loadCounters(this.botCounters, stored.bot);
+    for (const trader of stored.userTraders) this.userTraders.add(trader);
+    for (const trader of stored.botTraders) this.botTraders.add(trader);
+    Object.assign(this.unknown, stored.unknown);
   }
 
   recordLatency(sampleMs: number): void {

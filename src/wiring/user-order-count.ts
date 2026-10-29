@@ -21,6 +21,19 @@ export class UserOrderCount {
     this.botOrdersExecuted += 1;
   }
 
+  /** The chain's order count that is not users', to carry across a restart; undefined before the first reading. */
+  baseline(): bigint | undefined {
+    return this.chainOrdersAtStart === null
+      ? undefined
+      : this.chainOrdersAtStart + BigInt(this.botOrdersExecuted);
+  }
+
+  /** Measures from a baseline an earlier process saved, so orders placed while down still count. */
+  startFrom(baseline: bigint): void {
+    this.chainOrdersAtStart = baseline;
+    this.botOrdersExecuted = 0;
+  }
+
   /** Takes the chain's order counter and returns the user count it implies. */
   afterChainOrders(total: bigint): number {
     this.chainOrdersAtStart ??= total;
