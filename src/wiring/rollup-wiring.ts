@@ -22,6 +22,7 @@ import type { OpenDesk, OpenRequest } from "../rollup/open-desk.js";
 import { Program } from "../rollup/program.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
 import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
+import { countsFill } from "../data/stats.js";
 import { UserOrderCount } from "./user-order-count.js";
 import { type PublicData, type VenueWiring, recordAndBroadcastFill } from "./venue-wiring.js";
 
@@ -136,6 +137,11 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   // The counters cover what this process saw happen, not what the tape still holds from before.
   const countingSinceMs = Date.now();
   const userOrders = new UserOrderCount();
+  const restoredStats = snapshot?.stats !== undefined;
+  if (snapshot?.stats) data.stats.restore(snapshot.stats);
+  if (snapshot?.userOrderBaseline !== undefined) {
+    userOrders.startFrom(BigInt(snapshot.userOrderBaseline));
+  }
 
   let rollup: RollupVenue | null = null;
   let networkChecked = false;
@@ -160,7 +166,9 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
             return;
           }
           recordAndBroadcastFill(fill, data);
-          if (fill.timestampMs >= countingSinceMs) data.stats.recordFill(fill, origin);
+          if (countsFill(fill, restoredStats, countingSinceMs)) {
+            data.stats.recordFill(fill, origin);
+          }
         },
         onPrice: (market, price, publishedAtMs) =>
           data.hub.broadcastPrice(market, price, publishedAtMs),
@@ -332,6 +340,8 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     needsFundingUpdater: false,
     snapshotExtras: () => ({
       tapeCursors: rollup?.tapeCursors() ?? snapshot?.tapeCursors ?? {},
+      stats: data.stats.toStored(),
+      userOrderBaseline: (userOrders.baseline() ?? undefined)?.toString(),
       orderKeyCheckpoints: rollup?.keyCheckpoints() ?? snapshot?.orderKeyCheckpoints ?? {},
     }),
     stop: async () => {
