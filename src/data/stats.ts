@@ -41,21 +41,23 @@ interface UnknownOutcomes {
 
 /** The counters as they are written to disk: volumes as decimal strings, since JSON has no bigint. */
 export interface StoredStats {
-  user: { orders: number; fills: number; volume: string };
-  bot: { orders: number; fills: number; volume: string };
+  user: StoredCounters;
+  bot: StoredCounters;
   userTraders: string[];
   botTraders: string[];
   unknown: UnknownOutcomes;
 }
 
+type StoredCounters = Omit<ActivityCounters, "volume"> & { volume: string };
+
 const emptyCounters = (): ActivityCounters => ({ orders: 0, fills: 0, volume: 0n });
 
-const storedCounters = (counters: ActivityCounters): StoredStats["user"] => ({
+const storedCounters = (counters: ActivityCounters): StoredCounters => ({
   ...counters,
   volume: counters.volume.toString(),
 });
 
-const loadCounters = (target: ActivityCounters, stored: StoredStats["user"]): void => {
+const loadCounters = (target: ActivityCounters, stored: StoredCounters): void => {
   target.orders = stored.orders;
   target.fills = stored.fills;
   target.volume = BigInt(stored.volume);

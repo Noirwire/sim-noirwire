@@ -21,10 +21,10 @@ export class UserOrderCount {
     this.botOrdersExecuted += 1;
   }
 
-  /** The chain's order count that is not users', to carry across a restart; null before the first reading. */
-  baseline(): bigint | null {
+  /** The chain's order count that is not users', to carry across a restart; undefined before the first reading. */
+  baseline(): bigint | undefined {
     return this.chainOrdersAtStart === null
-      ? null
+      ? undefined
       : this.chainOrdersAtStart + BigInt(this.botOrdersExecuted);
   }
 

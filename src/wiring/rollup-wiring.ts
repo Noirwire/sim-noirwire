@@ -341,7 +341,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     snapshotExtras: () => ({
       tapeCursors: rollup?.tapeCursors() ?? snapshot?.tapeCursors ?? {},
       stats: data.stats.toStored(),
-      userOrderBaseline: (userOrders.baseline() ?? undefined)?.toString(),
+      userOrderBaseline: userOrders.baseline()?.toString(),
       orderKeyCheckpoints: rollup?.keyCheckpoints() ?? snapshot?.orderKeyCheckpoints ?? {},
     }),
     stop: async () => {
