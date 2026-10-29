@@ -131,7 +131,7 @@ describe("a trader's own view of its seat", () => {
       { available: dollars(20), locked: dollars(5) },
       { available: 3_000_000_000n, locked: 0n },
     ],
-    perp: [{ base: -2_000n, quote: 296_000_000n }],
+    perp: [{ marketId: 0, base: -2_000n, quote: 296_000_000n }],
     ordersMarketId: 0,
     orders: [{ side: "sell", price: 151_000n, remaining: 500n, sequence: 42n }],
   };

@@ -12,12 +12,24 @@ import type { PublicDeployment } from "../rollup/public-deployment.js";
 import type { Readiness } from "../rollup/rollup-venue.js";
 import type { Hub } from "./hub.js";
 
+export interface SeatOccupancy {
+  /** Views the gate opened that the rollup confirmed. */
+  viewsOpened: number;
+  /** The seats the exchange's ledger can hold; null until the exchange has been read. */
+  seatCapacity: number | null;
+}
+
 /** VENUE=rollup only: what the routes need of the on-chain venue. */
 export interface RollupRoutes {
   /** Opens and funds a user's account on chain. */
   fundDesk: FundRequests;
   /** Mainnet only: opens an account for an invited user, and funds nothing. */
   openDesk: OpenRequests & Partial<SignedOpenRequests>;
+  /**
+   * Mainnet only: the occupancy gauge. The gate records the views it opened and never sees one
+   * closed, so `viewsOpened` is an upper bound on the seats held. Compare it with `seatCapacity`.
+   */
+  seatOccupancy: () => SeatOccupancy;
   /** Whether the service is connected, pricing and funded. */
   readiness: () => Readiness;
   /** What a browser needs to trade on the program directly, or null until the service has connected. */

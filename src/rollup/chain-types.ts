@@ -43,6 +43,8 @@ export interface ChainExchange {
   quoteGuardOkUntilSeconds: number | null;
   /** The most seats the program opens in one UTC day, whoever asks the gate. */
   maxSeatsPerDay: number;
+  /** The trader seats the exchange's ledger can hold; null until the exchange is live on the current layout. */
+  seatCapacity: number | null;
 }
 
 export interface PublicAddresses {
@@ -129,10 +131,27 @@ export interface SeatView {
   collateral: bigint;
   /** Per token index. */
   spot: { available: bigint; locked: bigint }[];
-  /** Per market id. */
-  perp: { base: bigint; quote: bigint }[];
+  /** The seat's tagged slots: one entry per market it holds a position or orders on. Empty while the view holds no seat. */
+  perp: { marketId: number; base: bigint; quote: bigint }[];
   ordersMarketId: number;
   orders: { side: ChainSide; price: bigint; remaining: bigint; sequence: bigint }[];
+}
+
+/** Why a range liquidation ended before its last seat. */
+export type SweepStop =
+  "stalePrice" | "liquidatorMarginInsufficient" | "liquidatorSlotsFull" | "unrecognised";
+
+/** What one call of the range liquidation did. `nextSeat` is where the sweep stopped, or the end of the range. */
+export interface RangeLiquidation {
+  taken: number;
+  nextSeat: number;
+  stopped: SweepStop | null;
+}
+
+/** The seats a range liquidation looks at: `count` consecutive ones from `start`. */
+export interface SeatRange {
+  start: number;
+  count: number;
 }
 
 export type DepositTarget = "collateral" | { spotToken: number };

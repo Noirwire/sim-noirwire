@@ -8,6 +8,7 @@ import {
   EXCHANGE_PAUSED_ERROR,
   GATE_MISSING_ERROR,
   SEAT_ALREADY_OPEN_ERROR,
+  SEAT_DEPOSIT_TOO_SMALL_ERROR,
   SEAT_TABLE_FULL_ERROR,
   programErrorName,
 } from "./program-errors.js";
@@ -60,6 +61,8 @@ const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
 const OPENING_REFUSED_BECAUSE: Record<number, string> = {
   [EXCHANGE_PAUSED_ERROR]: "the exchange is paused",
   [SEAT_TABLE_FULL_ERROR]: "the exchange has no free seat left",
+  [SEAT_DEPOSIT_TOO_SMALL_ERROR]:
+    "the deposit is below what the exchange asks for the first deposit of an account",
   [GATE_MISSING_ERROR]: "the exchange does not list this gate",
   [BELOW_RENT_ERROR]: "the payment for the new account is below the rent it needs",
 };

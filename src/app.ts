@@ -106,8 +106,6 @@ export const startApp = async (
           config,
           data,
           snapshot,
-          // Seats opened by anything else (a set-up's own test traders) sit among ours.
-          usersEverOpened: () => fundLedger.grantCount + config.LIQUIDATOR_EXTRA_SEATS,
           onError: logError,
           onRecovered: logRecovered,
           onUnreachable: () => activity.unreachable(),

@@ -149,8 +149,7 @@ const envSchema = z.object({
   ROLLUP_MAKER_LEVEL_NUSD: decimalAmount("400"),
   ROLLUP_TAKER_MIN_NUSD: decimalAmount("5"),
   ROLLUP_TAKER_MAX_NUSD: decimalAmount("50"),
-  LIQUIDATOR_SEATS_PER_TICK: positiveInt(2),
-  LIQUIDATOR_EXTRA_SEATS: positiveInt(8),
+  LIQUIDATOR_SEATS_PER_TICK: positiveInt(64),
 });
 
 export type Config = z.infer<typeof envSchema>;

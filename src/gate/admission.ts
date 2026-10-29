@@ -182,6 +182,11 @@ export class Admission {
     }
   }
 
+  /** Views the rollup confirmed as opened. A view holds a seat only once it has been funded, so this bounds the seats held from above. */
+  viewsOpened(): number {
+    return this.ledger.openedCount();
+  }
+
   /** The seat of this owner that was sent and is not confirmed, whichever invite it was reserved under. */
   unconfirmedFor(owner: string): SeatRecord | undefined {
     return this.ledger.unconfirmedFor(owner);

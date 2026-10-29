@@ -15,6 +15,7 @@ export const registerStatsRoute = (app: FastifyInstance, ctx: AppContext): void 
       ...(ctx.config.VENUE === "rollup"
         ? { botOrdersOutcomeUnknown: stats.botOrdersOutcomeUnknown }
         : {}),
+      ...(ctx.seatOccupancy ? { seats: ctx.seatOccupancy() } : {}),
       updatedAtMs: stats.updatedAtMs,
     };
   });

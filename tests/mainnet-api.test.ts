@@ -20,7 +20,7 @@ afterEach(async () => {
   app = null;
 });
 
-const serve = async (over: Partial<Config> = {}) => {
+const serve = async (over: Partial<Config> = {}, context: Partial<AppContext> = {}) => {
   const config: Config = { ...loadConfig({} as NodeJS.ProcessEnv), NETWORK: "mainnet", ...over };
   const clock = new ManualClock(1_000_000);
   const venue = new MemoryVenue({ clock });
@@ -39,6 +39,7 @@ const serve = async (over: Partial<Config> = {}) => {
       idleAfterLastSocketMs: 15_000,
       onError: () => {},
     }),
+    ...context,
   };
   app = await buildServer(ctx);
   return app;
@@ -117,6 +118,20 @@ describe("the market data on mainnet", () => {
     });
 
     expect(funded.statusCode).toBe(200);
+  });
+});
+
+describe("the seat occupancy gauge", () => {
+  it("is on the stats beside the exchange's seat capacity when the gate runs, and absent when it does not", async () => {
+    const withGate = await serve(
+      {},
+      { seatOccupancy: () => ({ viewsOpened: 42, seatCapacity: 2_048 }) },
+    );
+    const stats = JSON.parse((await getFrom(withGate, "/v1/stats")).body);
+    expect(stats.seats).toEqual({ viewsOpened: 42, seatCapacity: 2_048 });
+
+    const withoutGate = await serve();
+    expect(JSON.parse((await getFrom(withoutGate, "/v1/stats")).body).seats).toBeUndefined();
   });
 });
 

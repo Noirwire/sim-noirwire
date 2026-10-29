@@ -131,7 +131,7 @@ start when a required one is missing or a key is not the one the deployment name
 | `HEDGE_SOFT_UNHEDGED_NUSD`, `HEDGE_HARD_UNHEDGED_NUSD`                   | no         | Unhedged exposure that makes the hedge lagging (100) and blind (250); soft must be below hard                                                                 |
 | `HEDGE_CONFIRM_TIMEOUT_SECONDS`, `HEDGE_MAX_LEVERAGE`                    | no         | Seconds without a venue confirmation before lagging (60); margin cap as a multiple of the hedge account's margin (3)                                          |
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`             | no         | Bot order sizes as notional                                                                                                                                   |
-| `LIQUIDATOR_SEATS_PER_TICK`, `LIQUIDATOR_EXTRA_SEATS`                    | no         | Seats the liquidator tries blind per market per tick; seats this service did not open                                                                         |
+| `LIQUIDATOR_SEATS_PER_TICK`                                              | no         | Consecutive seats the liquidator sweeps in one call per market per tick; the sweep walks the exchange's whole seat capacity                                   |
 
 ### Mainnet mode
 

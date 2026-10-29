@@ -31,6 +31,8 @@ import {
   type ChainStats,
   type KeyCheckpoint,
   type PlaceOutcome,
+  type RangeLiquidation,
+  type SeatRange,
   executed,
 } from "./chain-types.js";
 import { Session, connectionTo } from "./connections.js";
@@ -40,7 +42,6 @@ import { noteMakerQuote } from "./maker-quotes.js";
 import { OpenDesk } from "./open-desk.js";
 import {
   FIRST_TRADER_SEAT,
-  SEAT_COUNT,
   type Program,
   fillRoles,
   newOrderSecret,
@@ -53,7 +54,8 @@ import {
   publicDeployment,
 } from "./public-deployment.js";
 import { RollupMarket } from "./rollup-market.js";
-import { SeatSweep, seatOfTarget, seatTarget } from "./seat-sweep.js";
+import { sweepStopText } from "./program-errors.js";
+import { SeatSweep, seatRangeOfTarget, seatRangeTarget } from "./seat-sweep.js";
 import { type RollupSettings, deployedMarket } from "./settings.js";
 import type { TapeUpdate } from "./tape-tracker.js";
 import { COLLATERAL_TOKEN, deployedToken } from "./tokens.js";
@@ -106,8 +108,6 @@ export interface RollupVenueOptions {
   recordedThrough: Record<MarketId, number>;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
   keyCheckpoints: Record<string, KeyCheckpoint>;
-  /** How many user accounts this service's gate key has opened, ever. */
-  usersEverOpened(): number;
   handlers: RollupVenueHandlers;
 }
 
@@ -153,7 +153,8 @@ export class RollupVenue implements Venue {
   /** Null until the feed has read it. */
   private exchange: ChainExchange | null = null;
   private ordersPlaced = 0;
-  private liquidatorSeat: number | null = null;
+  /** Sweeps in a row that failed outright, across markets. */
+  private failedSweeps = 0;
 
   private constructor(
     private readonly options: RollupVenueOptions,
@@ -216,12 +217,7 @@ export class RollupVenue implements Venue {
       syncMarketId: anyMarket.chain.marketId,
       life: () => this.life,
     });
-    // Seats fill from the lowest number, so none lies beyond the accounts ever opened.
-    this.sweep = new SeatSweep(
-      FIRST_TRADER_SEAT,
-      SEAT_COUNT,
-      () => this.bots.count + options.usersEverOpened(),
-    );
+    this.sweep = new SeatSweep(FIRST_TRADER_SEAT, () => this.seatCapacity());
   }
 
   static async connect(options: RollupVenueOptions): Promise<RollupVenue> {
@@ -362,6 +358,11 @@ export class RollupVenue implements Venue {
       })),
       ownerAuth,
     );
+  }
+
+  /** The seats the exchange's ledger can hold; null until the feed has read a live exchange. */
+  seatCapacity(): number | null {
+    return this.exchange?.seatCapacity ?? null;
   }
 
   readiness(): Readiness {
@@ -567,21 +568,63 @@ export class RollupVenue implements Venue {
   /** Invariant: nothing to do on request. The program's own schedule advances funding. */
   async updateFunding(): Promise<void> {}
 
-  /** The seats the liquidator tries next, as targets `liquidate` accepts. */
+  /** The seats the liquidator tries next, as a target `liquidate` accepts; none while the exchange's seat capacity is unknown. */
   nextLiquidationTargets(count: number): TraderKey[] {
-    return this.sweep.next(count).map(seatTarget);
+    const range = this.sweep.next(count);
+    return range === null ? [] : [seatRangeTarget(range)];
   }
 
+  /** Whether the sweep of the seats in `target` took over a position. A seat of the liquidator's own is skipped by the program. */
   async liquidate(liquidator: TraderKey, target: TraderKey, market: MarketId): Promise<boolean> {
-    const seat = seatOfTarget(target);
+    const range = seatRangeOfTarget(target);
     const { chain, mark } = this.market(market);
-    if (seat === null || mark === 0n) return false;
+    if (range === null || mark === 0n) return false;
     return this.whileAwake(async () => {
       const programTrader = await this.bots.trader(liquidator);
-      this.liquidatorSeat ??= (await programTrader.view()).seat;
-      if (seat === this.liquidatorSeat) return false;
-      return programTrader.liquidate(chain.marketId, seat, mark);
+      const swept = await programTrader.liquidateRange(chain.marketId, range, mark);
+      const what = `${market} liquidation sweep`;
+      const { handlers } = this.options;
+      if (swept === null) {
+        // The seats were not looked at: the same range is tried again on the next tick.
+        this.sweep.resumeAt(range.start);
+        this.failedSweeps += 1;
+        if (this.failedSweeps === 1) {
+          handlers.onError(
+            what,
+            new Error(
+              `the sweep of seats ${range.start} to ${range.start + range.count - 1} failed and is tried again; failures in a row are counted but not repeated here`,
+            ),
+          );
+        }
+        return false;
+      }
+      if (this.failedSweeps > 0) {
+        this.failedSweeps = 0;
+        handlers.onRecovered(what);
+      }
+      this.noteSweep(market, range, swept);
+      return swept.taken > 0;
     });
+  }
+
+  /**
+   * A sweep that ended before the end of its range carries on after the seat it stopped at, so it
+   * cannot wedge there: that seat is tried again on the next lap. Only a stale price, which stops
+   * the sweep before any seat, resumes at the start. A stop is reported until a sweep of this
+   * market runs to the end of its range again; one cut short by its takeover limit is no stop.
+   */
+  private noteSweep(market: MarketId, range: SeatRange, swept: RangeLiquidation): void {
+    const what = `${market} liquidation sweep`;
+    const { handlers } = this.options;
+    if (swept.stopped === null) {
+      if (swept.nextSeat < range.start + range.count) this.sweep.resumeAt(swept.nextSeat);
+      else handlers.onRecovered(what);
+      return;
+    }
+    this.sweep.resumeAt(swept.nextSeat + (swept.stopped === "stalePrice" ? 0 : 1));
+    if (swept.stopped !== "stalePrice") {
+      handlers.onError(what, new Error(sweepStopText(swept.stopped)));
+    }
   }
 
   /** Where every open bot's order keys stand, by owner address, to save and restore from. */

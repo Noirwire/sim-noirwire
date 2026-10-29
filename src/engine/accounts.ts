@@ -20,6 +20,17 @@ export class Account {
     return entry;
   }
 
+  /** No balance of any token, free or locked, and no position. A debt is not nothing. */
+  holdsNothing(): boolean {
+    for (const { balance, locked } of this.balances.values()) {
+      if (balance !== 0n || locked !== 0n) return false;
+    }
+    for (const { size } of this.positions.values()) {
+      if (size !== 0n) return false;
+    }
+    return true;
+  }
+
   freeBalance(token: string): bigint {
     return this.balanceOf(token).balance;
   }

@@ -174,6 +174,11 @@ export class SeatLedger {
     return this.records.find((record) => record.owner === owner && record.state === "opened");
   }
 
+  /** How many views the rollup confirmed as opened, ever. The ledger never sees one closed. */
+  openedCount(): number {
+    return this.records.filter((record) => record.state === "opened").length;
+  }
+
   /**
    * Seats signed for in the UTC day of `nowMs`, not counting those under the invite `except` or
    * held by `owner`: an owner's own earlier seat is the one a new try replaces, never a second.

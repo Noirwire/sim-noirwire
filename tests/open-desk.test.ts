@@ -31,6 +31,7 @@ const EXCHANGE: ChainExchange = {
   paused: false,
   quoteGuardOkUntilSeconds: null,
   maxSeatsPerDay: 5,
+  seatCapacity: 2_048,
 };
 
 beforeAll(() => mkdirSync(DIR, { recursive: true }));

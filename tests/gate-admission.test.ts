@@ -232,6 +232,21 @@ describe("admission", () => {
     expect(reason(stranger)).toContain("not on the invite list");
   });
 
+  it("counts the views the rollup confirmed as opened, not those only reserved, also across a restart", async () => {
+    const [first, second] = [newKey(), newKey()];
+    const { admission, make } = setup(`${first}\n${second}\n`, { perDay: 3, perAskerPerDay: 3 });
+    expect(admission.viewsOpened()).toBe(0);
+
+    const opened = await admission.admit(first, undefined, "1.1.1.1", PROGRAM_MAX);
+    const reserved = await admission.admit(second, undefined, "1.1.1.1", PROGRAM_MAX);
+    expect(opened.ok && reserved.ok).toBe(true);
+    expect(admission.viewsOpened()).toBe(0);
+
+    if (opened.ok) await admission.confirm(opened.invite);
+    expect(admission.viewsOpened()).toBe(1);
+    expect(make().viewsOpened()).toBe(1);
+  });
+
   it("opens at most one seat per invite, also across a restart", async () => {
     const owner = newKey();
     const { admission, make } = setup(`${CODE} ${owner}\n`);

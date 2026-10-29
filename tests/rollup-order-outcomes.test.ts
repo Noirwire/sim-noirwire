@@ -18,6 +18,8 @@ const fakeTrader = vi.hoisted(() => ({
   /** Answers a cancel of one order, by the sequence number it was named by. */
   cancelOne: undefined as undefined | ((orderSeq: bigint) => Promise<boolean>),
   failToOpen: false,
+  /** Answers a range liquidation; null is a sweep that failed. */
+  sweep: undefined as undefined | (() => Promise<unknown>),
   /** While set, opening the trader waits for it. */
   opening: undefined as undefined | Promise<void>,
   placed: 0,
@@ -32,6 +34,7 @@ vi.mock("../src/rollup/bot-accounts.js", () => ({
       await fakeTrader.opening;
       return {
         address: "owner",
+        liquidateRange: () => fakeTrader.sweep?.(),
         cancelAll: () => fakeTrader.cancel?.(),
         cancelOrder: (_market: number, orderSeq: bigint) => fakeTrader.cancelOne?.(orderSeq),
         place: (_market: number, params: { restingExpirySeconds?: number }) => {
@@ -79,7 +82,7 @@ const order = (over: Partial<NewOrder> = {}): NewOrder => ({
   ...over,
 });
 
-const venueWith = () => {
+const venueWith = (handlerOverrides: Record<string, unknown> = {}) => {
   const market = new RollupMarket(MARKETS[0], SOL_PERP, 9);
   market.acceptPrice({ price: 150_000n, publishTimeSeconds: 1_000 });
   const options = {
@@ -95,7 +98,6 @@ const venueWith = () => {
     bots: [],
     recordedThrough: {},
     keyCheckpoints: {},
-    usersEverOpened: () => 0,
     handlers: {
       onFill: () => {},
       onPrice: () => {},
@@ -106,6 +108,7 @@ const venueWith = () => {
       onError: () => {},
       onRecovered: () => {},
       onUnreachable: () => {},
+      ...handlerOverrides,
     },
   } as unknown as RollupVenueOptions;
   const Venue = RollupVenue as unknown as new (
@@ -113,6 +116,7 @@ const venueWith = () => {
     markets: RollupMarket[],
   ) => RollupVenue;
   const venue = new Venue(options, [market]);
+  (venue as unknown as { exchange: unknown }).exchange = { seatCapacity: 1_000 };
   const secrets = () =>
     (venue as unknown as { secrets: { of(market: string): Uint8Array[] } }).secrets.of("NSOL-PERP");
   return { venue, secrets };
@@ -452,5 +456,93 @@ describe("a resting order without an expiry", () => {
 
     expect(result.status).toBe("rejected");
     expect(secrets()).toHaveLength(0);
+  });
+});
+
+describe("the liquidator's sweep of a range of seats", () => {
+  const LIQUIDATOR = "bot:liquidator";
+  const sweepOf = (taken: number, nextSeat: number, stopped: string | null) => () =>
+    Promise.resolve({ taken, nextSeat, stopped });
+
+  const setup = () => {
+    const onError = vi.fn();
+    const onRecovered = vi.fn();
+    const { venue } = venueWith({ onError, onRecovered });
+    /** Takes the next range off the sweep and runs it on the liquidator. */
+    const tick = async () => {
+      const [target] = venue.nextLiquidationTargets(10);
+      await venue.liquidate(LIQUIDATOR, target!, "NSOL-PERP");
+      return target;
+    };
+    return { venue, tick, onError, onRecovered };
+  };
+
+  it("tries the same range again after a failed sweep, and says so once however often it fails", async () => {
+    const { tick, onError } = setup();
+    fakeTrader.sweep = () => Promise.resolve(null);
+
+    const first = await tick();
+    const second = await tick();
+    const third = await tick();
+
+    expect(first).toBe("seats:2:10");
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves on and says it recovered once a sweep gets through again", async () => {
+    const { tick, onRecovered } = setup();
+    fakeTrader.sweep = () => Promise.resolve(null);
+    await tick();
+    fakeTrader.sweep = sweepOf(0, 12, null);
+
+    await tick();
+
+    expect(onRecovered).toHaveBeenCalled();
+    expect(await tick()).toBe("seats:12:10");
+  });
+
+  it.each(["liquidatorMarginInsufficient", "liquidatorSlotsFull", "unrecognised"])(
+    "passes over the seat a sweep stopped on (%s), so it cannot wedge there",
+    async (stopped) => {
+      const { tick, onError } = setup();
+      fakeTrader.sweep = sweepOf(0, 5, stopped);
+
+      await tick();
+
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(await tick()).toBe("seats:6:10");
+    },
+  );
+
+  it("starts again from the first seat after a stale price, and does not report it", async () => {
+    const { tick, onError } = setup();
+    fakeTrader.sweep = sweepOf(0, 2, "stalePrice");
+
+    await tick();
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(await tick()).toBe("seats:2:10");
+  });
+
+  it("carries on from where a sweep cut short by its takeover limit stopped, without calling it done", async () => {
+    const { tick, onRecovered, onError } = setup();
+    fakeTrader.sweep = sweepOf(4, 7, null);
+
+    await tick();
+
+    expect(onRecovered).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect(await tick()).toBe("seats:7:10");
+  });
+
+  it("calls a sweep that reached the end of its range done", async () => {
+    const { tick, onRecovered } = setup();
+    fakeTrader.sweep = sweepOf(1, 12, null);
+
+    await tick();
+
+    expect(onRecovered).toHaveBeenCalledTimes(1);
   });
 });

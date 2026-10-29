@@ -1,7 +1,7 @@
 import { Account, type Position } from "./accounts.js";
 import { type Clock, systemClock } from "./clock.js";
 import { DAY_MS, DayVolume, PriceHistory, percentChange } from "./day-window.js";
-import { MARKETS, type MarketConfig, marketById, maxLeverageAt } from "./markets.js";
+import { MARKETS, type MarketConfig, maxLeverageAt } from "./markets.js";
 import { SCALE, absBigInt, bpsOf, divScale, minBigInt, mulDivScale, signOf } from "./money.js";
 import { OrderBook, type RestingOrder } from "./order-book.js";
 import { randomTag } from "./tag.js";
@@ -18,10 +18,12 @@ import type {
   TraderState,
   Venue,
 } from "./types.js";
-import { rejectedOrder } from "./venue-orders.js";
+import { NOT_SEATED, SLOTS_FULL, rejectedOrder } from "./venue-orders.js";
 
 export const HOUSE_FEES: TraderKey = "house:fees";
 export const HOUSE_INSURANCE: TraderKey = "house:insurance";
+/** The markets one seat holds positions or resting orders on at once, as the program does. */
+export const SEAT_MARKET_SLOTS = 4;
 const COLLATERAL_TOKEN = "nUSD";
 const PRICE_HISTORY_RETENTION_MS = DAY_MS + 60 * 60 * 1000;
 const DEFAULT_INSURANCE_SEED = 10_000_000n * SCALE;
@@ -46,6 +48,8 @@ interface MarketRuntime {
 }
 
 export interface MemoryVenueOptions {
+  /** The markets the venue lists; the standard three when absent. */
+  markets?: readonly MarketConfig[];
   clock?: Clock;
   insuranceSeedBalance?: bigint;
   maxFundingRateBpsPerUpdate?: number;
@@ -124,15 +128,17 @@ export class MemoryVenue implements Venue {
   private readonly runtimes = new Map<MarketId, MarketRuntime>();
   private readonly listeners = new Set<(fill: Fill) => void>();
   private readonly maxFundingRateBpsPerUpdate: number;
+  private readonly configs: readonly MarketConfig[];
   private ordersPlaced = 0;
   private fillSequence = 0;
 
   constructor(options: MemoryVenueOptions = {}) {
     this.clock = options.clock ?? systemClock;
+    this.configs = options.markets ?? MARKETS;
     this.maxFundingRateBpsPerUpdate =
       options.maxFundingRateBpsPerUpdate ?? DEFAULT_MAX_FUNDING_RATE_BPS_PER_UPDATE;
 
-    for (const config of MARKETS) {
+    for (const config of this.configs) {
       this.runtimes.set(config.id, {
         config,
         book: new OrderBook(),
@@ -174,7 +180,7 @@ export class MemoryVenue implements Venue {
 
   async markets(): Promise<MarketInfo[]> {
     const now = this.clock.nowMs();
-    return MARKETS.map((config) => {
+    return this.configs.map((config) => {
       const { markPrice, markPriceUpdatedAtMs, priceHistory, volume, openInterest } = this.runtime(
         config.id,
       );
@@ -207,6 +213,39 @@ export class MemoryVenue implements Venue {
     this.account(trader);
   }
 
+  /**
+   * A trader holds a seat while it holds anything: the first deposit takes one and an emptied
+   * account gives it back, so it is read off the account rather than kept apart.
+   */
+  seatHeld(trader: TraderKey): boolean {
+    const account = this.accounts.get(trader);
+    return account !== undefined && !this.holdsNothing(trader, account);
+  }
+
+  private holdsNothing(trader: TraderKey, account: Account): boolean {
+    return account.holdsNothing() && this.marketsInUse(trader, account).size === 0;
+  }
+
+  /** The markets `trader` holds a position or resting orders on: each takes one of the seat's slots. */
+  private marketsInUse(trader: TraderKey, account: Account): Set<MarketId> {
+    const used = new Set<MarketId>();
+    for (const [market, position] of account.positions) {
+      if (position.size !== 0n) used.add(market);
+    }
+    for (const config of this.configs) {
+      if (this.runtime(config.id).book.openOrdersForTrader(trader).length > 0) used.add(config.id);
+    }
+    return used;
+  }
+
+  /** Whether an order on `config` needs a slot the seat does not have: a fifth market while four are in use. */
+  private lacksSlot(trader: TraderKey, account: Account, config: MarketConfig, order: NewOrder) {
+    const takesSlot = config.kind === "perp" || order.type === "limit" || order.type === "postOnly";
+    if (!takesSlot) return false;
+    const used = this.marketsInUse(trader, account);
+    return !used.has(config.id) && used.size >= SEAT_MARKET_SLOTS;
+  }
+
   async deposit(trader: TraderKey, token: string, amount: bigint): Promise<void> {
     if (amount <= 0n) throw new Error("deposit amount must be positive");
     this.account(trader).credit(token, amount);
@@ -222,12 +261,18 @@ export class MemoryVenue implements Venue {
     const tag = randomTag();
     const reject = (reason: string) => rejectedOrder(orderId, tag, order, reason);
 
-    const config = marketById(order.market);
+    const config = this.configs.find((candidate) => candidate.id === order.market);
     if (!config) return reject("unknown market");
     const account = this.accounts.get(trader);
     if (!account) return reject("trader not open");
+    if (!this.seatHeld(trader)) return reject(`${NOT_SEATED}: deposit collateral to take a seat`);
     const checked = checkedPrice(config, order);
     if (typeof checked === "string") return reject(checked);
+    if (this.lacksSlot(trader, account, config, order)) {
+      return reject(
+        `${SLOTS_FULL}: the account already holds positions or orders on ${SEAT_MARKET_SLOTS} other markets`,
+      );
+    }
 
     const incoming: Incoming = {
       orderId,
@@ -598,7 +643,7 @@ export class MemoryVenue implements Venue {
       }
     }
 
-    const openOrders: OrderView[] = MARKETS.flatMap((config) =>
+    const openOrders: OrderView[] = this.configs.flatMap((config) =>
       this.runtime(config.id)
         .book.openOrdersForTrader(trader)
         .map((resting) => ({

@@ -1,3 +1,15 @@
+import { SEAT_ERROR } from "@noirwire/orderbook";
+import type { SweepStop } from "./chain-types.js";
+
+/** `SlotsFull`: a seat holds positions or orders on four markets and an order needs a fifth. */
+export const SLOTS_FULL_ERROR = SEAT_ERROR.slotsFull;
+
+/** `NotSeated`: the view holds no seat. A first collateral deposit takes one. */
+export const NOT_SEATED_ERROR = SEAT_ERROR.notSeated;
+
+/** `SeatDepositTooSmall`: a deposit that would take a seat was spot, or below the exchange's minimum. */
+export const SEAT_DEPOSIT_TOO_SMALL_ERROR = SEAT_ERROR.seatDepositTooSmall;
+
 const OWNER_TRANSACTION_ERROR = {
   invalidProof: 6151,
   wrongNonce: 6152,
@@ -69,6 +81,7 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
   6090: "SeatBlocked",
   6091: "MakerNotListed",
   6092: "TakerNotListed",
+  [SLOTS_FULL_ERROR]: "SlotsFull",
   6100: "NotUpgradeAuthority",
   6101: "NotAdmin",
   6102: "NotNominee",
@@ -120,6 +133,14 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
   6148: "PriceSourceBound",
   6149: "PriceSourceInUse",
   6150: "CustodyCapReached",
+  [NOT_SEATED_ERROR]: "NotSeated",
+  [SEAT_DEPOSIT_TOO_SMALL_ERROR]: "SeatDepositTooSmall",
+  [SEAT_ERROR.layoutNotMigrated]: "LayoutNotMigrated",
+  [SEAT_ERROR.alreadyMigrated]: "AlreadyMigrated",
+  [SEAT_ERROR.ledgerTooLarge]: "LedgerTooLarge",
+  [SEAT_ERROR.relayoutOutOfOrder]: "RelayoutOutOfOrder",
+  [SEAT_ERROR.relayoutMismatch]: "RelayoutMismatch",
+  [SEAT_ERROR.relayoutIncomplete]: "RelayoutIncomplete",
   [OWNER_TRANSACTION_ERROR.invalidProof]: "InvalidOwnerProof",
   [OWNER_TRANSACTION_ERROR.wrongNonce]: "WrongOwnerNonce",
   [OWNER_TRANSACTION_ERROR.expiryTooFar]: "OwnerExpiryTooFar",
@@ -193,6 +214,38 @@ export const GATE_MISSING_ERROR = 6103;
 
 /** `BelowRent`: a payment is below the rent the account it creates needs. */
 export const BELOW_RENT_ERROR = 6106;
+const SEAT_REFUSAL_TEXT: Record<number, string> = {
+  [SLOTS_FULL_ERROR]:
+    "this account already holds positions or orders on four markets, and a fifth needs a free slot. Nothing changed: close a position or cancel the orders on one market first",
+  [NOT_SEATED_ERROR]:
+    "this account holds no seat right now. Nothing changed: deposit collateral to take one",
+  [SEAT_DEPOSIT_TOO_SMALL_ERROR]:
+    "the first deposit of an account must be collateral and at least what the exchange asks for a seat. Nothing changed",
+  [SEAT_ERROR.relayoutOutOfOrder]:
+    "the exchange is moving to a new seat ledger and cannot take this step right now. Nothing changed",
+  [SEAT_ERROR.relayoutMismatch]:
+    "the exchange's move to a new seat ledger found a seat it could not copy. Nothing changed: tell the operator",
+  [SEAT_ERROR.relayoutIncomplete]:
+    "the exchange's move to a new seat ledger is not finished yet. Nothing changed: try again later",
+};
+
+/** What the program refused for, in words for the person, when it is one of the seat refusals; else null. */
+export const programRefusalText = (code: number): string | null => SEAT_REFUSAL_TEXT[code] ?? null;
+
+/** Why a range liquidation ended before its last seat, in words for the operator. */
+export const sweepStopText = (stop: SweepStop): string => {
+  switch (stop) {
+    case "stalePrice":
+      return "the market's price is stale, so the sweep waits for a fresh one";
+    case "liquidatorMarginInsufficient":
+      return "the liquidator's collateral cannot carry another takeover: fund its seat";
+    case "liquidatorSlotsFull":
+      return "the liquidator's seat already holds positions or orders on four other markets and cannot take over a fifth: the sweep skips that seat";
+    case "unrecognised":
+      return "the program ended the sweep for a reason this release does not know";
+  }
+};
+
 /** The program's name for error number `code`, or a plain description when it has none here. */
 export const programErrorName = (code: number): string =>
   PROGRAM_ERROR_NAMES[code] ?? "unnamed program error";

@@ -51,10 +51,6 @@ export class BotAccounts {
 
   constructor(private readonly options: BotAccountsOptions) {}
 
-  get count(): number {
-    return this.options.bots.length;
-  }
-
   private spec(trader: TraderKey): BotSpec | undefined {
     return this.options.bots.find((bot) => bot.key === trader);
   }

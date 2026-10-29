@@ -497,5 +497,5 @@ not stay open. The hedge account's key is a separate hot key holding only the he
 
 Keep it at one replica, and never run a second copy with the same keys. Two processes
 would move the same bots' order keys under each other, the fund limits are counted in one
-process's memory, and where the liquidator runs, its sweep covers the seats this process
-opened plus `LIQUIDATOR_EXTRA_SEATS`.
+process's memory, and where the liquidator runs, its sweep walks every seat below the
+exchange's seat capacity.
