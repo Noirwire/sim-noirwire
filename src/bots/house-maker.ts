@@ -151,8 +151,12 @@ const ROUTINE_REFUSAL = /would (match|cross)/;
 /** A reduce-only order that found nothing to reduce: a user filled the position first, which is no problem. */
 const NOTHING_TO_REDUCE = /no position to reduce|ReduceOnlyWouldIncrease/;
 
+/** An order that reached the program after its own expiry, as when the rollup is slow: it never ran, so the next tick quotes again. */
+const ORDER_EXPIRED = /OrderExpired/;
+
 const isRoutineRefusal = (order: NewOrder, reason: string | undefined): boolean =>
   ROUTINE_REFUSAL.test(reason ?? "") ||
+  ORDER_EXPIRED.test(reason ?? "") ||
   (order.reduceOnly === true && NOTHING_TO_REDUCE.test(reason ?? ""));
 
 /** A post-only quote the venue refused because it would match: the maker takes that order instead of dropping it. */
