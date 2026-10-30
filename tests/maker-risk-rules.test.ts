@@ -1881,6 +1881,24 @@ describe("a house maker that stops or fails", () => {
     expect(beats).toBe(1);
   });
 
+  it("does not stop for a quote that reached the program after its own expiry, and quotes again on the next tick", async () => {
+    const { warmUp, book, tick, ledger, said } = await rig("refused-expired");
+    await warmUp();
+    book.take();
+
+    book.rejecting = "OrderExpired (6046): the program refused a NSOL-PERP quote";
+    await tick(11);
+
+    expect(book.rejectedCount).toBeGreaterThan(0);
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+
+    book.rejecting = null;
+    await tick();
+    expect(ledger.state.mode).toBe("run");
+    expect(book.orders.length).toBeGreaterThan(0);
+  });
+
   it("falls back to the soft stop when the venue refuses an order for a reason it does not know, and sends no heartbeat", async () => {
     let beats = 0;
     const { warmUp, book, tick, ledger, said } = await rig("refused-unknown", {
