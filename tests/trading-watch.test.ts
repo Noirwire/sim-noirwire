@@ -111,6 +111,64 @@ describe("the trading readiness watch", () => {
     expect(said.notices).toEqual(["trading is ready again"]);
   });
 
+  it("alerts at once for a new kind of reason mid-outage, even inside a long repeat gap", () => {
+    const { said, state, clock, watch } = watched();
+    watch.check();
+    state.ready = false;
+    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    for (let minute = 0; minute <= 400; minute += 1) {
+      watch.check();
+      clock.advance(MINUTE);
+    }
+    const before = said.alerts.length;
+
+    state.reason = "NSOL-PERP maker is held by an order of unknown outcome";
+    watch.check();
+
+    expect(said.alerts.length - before).toBe(1);
+    expect(said.alerts.at(-1)).toBe(
+      "ALERT trading is still not ready, for a new reason: NSOL-PERP maker is held by an order of unknown outcome",
+    );
+  });
+
+  it("does not add alerts when the reason flaps between kinds already seen with different numbers", () => {
+    const { said, state, clock, watch } = watched();
+    watch.check();
+    state.ready = false;
+    state.reason = "NSOL-PERP maker has had no quotes resting for 25391 s";
+    watch.check();
+    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    watch.check();
+    const before = said.alerts.length;
+
+    for (let second = 1; second <= 20; second += 1) {
+      clock.advance(1_000);
+      state.reason =
+        second % 2 === 0
+          ? `NSOL-PERP maker has had no quotes resting for ${25391 + second} s`
+          : `NSOL-PERP: the Pyth price is ${42 + second} s old`;
+      watch.check();
+    }
+
+    expect(said.alerts.length).toBe(before);
+  });
+
+  it("forgets the seen kinds when trading is ready again", () => {
+    const { said, state, watch } = watched();
+    watch.check();
+    state.ready = false;
+    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    watch.check();
+    state.ready = true;
+    watch.check();
+    state.ready = false;
+    watch.check();
+    state.reason = "NSOL-PERP: the Pyth price is 55 s old";
+    watch.check();
+
+    expect(said.alerts).toHaveLength(2);
+  });
+
   it("starts the repeats over at 10 minutes for a second outage", () => {
     const { said, state, clock, watch } = watched();
     watch.check();

@@ -56,8 +56,8 @@ export const MAKER_LIMITS = {
   referenceMemoryMs: 3_600_000,
   /** Unknown errors in a row, while the maker is at the soft stop, that make it stop quoting altogether. */
   unknownErrorsBeforeHardStop: 5,
-  /** Ladders in a row abandoned because an order provably never ran (its window passed) that send the maker to the soft stop. */
-  unrunLaddersBeforeStop: 5,
+  /** Ladders in a row abandoned because an order provably never ran (its window passed) that raise one alert; the maker keeps quoting. */
+  unrunLaddersBeforeAlert: 5,
 
   /**
    * While a requote keeps the old orders standing until the new ladder is up, the maker's resting
