@@ -94,16 +94,6 @@ export class QuotesHeld extends Error {
   }
 }
 
-/** Ladders kept failing because an order provably never ran: the cause is not passing, so the maker stops. */
-export class UnrunOrdersRepeated extends Error {
-  constructor(inARow: number, lastReason: string) {
-    super(
-      `${inARow} ladders in a row were dropped because an order never ran, the last: ${lastReason}`,
-    );
-    this.name = "UnrunOrdersRepeated";
-  }
-}
-
 /** The venue answered an order with a refusal the maker does not recognise as routine. */
 export class OrderRefused extends Error {
   constructor(market: MarketId, reason: string | undefined) {
@@ -953,12 +943,8 @@ export class HouseMaker {
       await this.abandonLadder(venue, dispatching, overlap !== null);
       this.unrunLadders += 1;
       safety?.ladderAbandoned(unrunReason, this.unrunLadders);
-      if (this.unrunLadders >= MAKER_LIMITS.unrunLaddersBeforeStop) {
-        const repeated = new UnrunOrdersRepeated(this.unrunLadders, unrunReason);
-        this.unrunLadders = 0;
-        await this.options.ledger?.update({ unrunLadders: 0 }).catch(() => {});
-        await this.stopAfter(venue, repeated).catch(() => {});
-        throw repeated;
+      if (this.unrunLadders === MAKER_LIMITS.unrunLaddersBeforeAlert) {
+        safety?.unrunLaddersRepeated(this.unrunLadders);
       }
       await this.options.ledger?.update({ unrunLadders: this.unrunLadders });
       return;

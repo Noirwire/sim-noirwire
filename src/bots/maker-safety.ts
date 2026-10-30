@@ -254,6 +254,13 @@ export class MakerSafety {
     );
   }
 
+  /** Ladders kept arriving after their expiry: said loudly once per run of them, since the maker keeps quoting by itself. */
+  unrunLaddersRepeated(inARow: number): void {
+    this.options.voice.alert(
+      `ALERT ${this.options.market} maker: ${inARow} ladders in a row arrived after their expiry, the rollup looks slow; it keeps quoting and needs no resume`,
+    );
+  }
+
   /**
    * The hedge's status, said aloud when it changes. A lagging hedge widens the
    * quotes; a blind one makes the maker pull its quotes. Both end by themselves once the venue confirms the hedge again.

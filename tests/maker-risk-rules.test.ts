@@ -3653,30 +3653,40 @@ describe("a ladder is recorded before any order of it is sent", () => {
     expect(ledger.state.mode).toBe("run");
   });
 
-  it("falls back to the soft stop, with an alert, after repeated ladders that never ran", async () => {
+  it("alerts once, without stopping, after repeated ladders that never ran, and quotes again when the venue answers", async () => {
     const { warmUp, book, tick, ledger, said } = await rig("ladder-never-ran-repeats");
     await warmUp();
     book.take();
     book.neverRunsAfter = 2;
-    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeAlert;
 
-    for (let ladder = 1; ladder < limit; ladder += 1) {
+    for (let ladder = 1; ladder <= limit + 3; ladder += 1) {
       await tick(11);
       expect(ledger.state.mode).toBe("run");
     }
-    await expect(tick(11)).rejects.toThrow(`${limit} ladders in a row`);
 
-    expect(ledger.state.mode).toBe("reduce");
     expect(said.alerts).toHaveLength(1);
-    expect(said.alerts[0]).toContain(`${limit} ladders in a row`);
-    expect(said.alerts[0]).toContain("no result before the order expired");
+    expect(said.alerts[0]).toContain(`${limit} ladders in a row arrived after their expiry`);
+    expect(said.alerts[0]).toContain("needs no resume");
+
+    book.take();
+    book.neverRunsAfter = null;
+    await tick(11);
+    expect(book.take().length).toBeGreaterThan(2);
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(1);
+
+    book.neverRunsAfter = 2;
+    for (let ladder = 1; ladder <= limit; ladder += 1) await tick(11);
+    expect(said.alerts).toHaveLength(2);
+    expect(ledger.state.mode).toBe("run");
   });
 
   it("counts only ladders in a row that never ran: a good ladder starts the count again", async () => {
     const { warmUp, book, tick, ledger, said } = await rig("ladder-never-ran-reset");
     await warmUp();
     book.take();
-    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeAlert;
 
     for (let round = 0; round < 2; round += 1) {
       book.neverRunsAfter = 2;
@@ -3695,7 +3705,7 @@ describe("a ladder is recorded before any order of it is sent", () => {
     await first.warmUp();
     first.book.take();
     first.book.neverRunsAfter = 2;
-    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeAlert;
 
     for (let ladder = 1; ladder < limit; ladder += 1) await first.tick(11);
     expect(first.ledger.state.unrunLadders).toBe(limit - 1);
@@ -3709,17 +3719,18 @@ describe("a ladder is recorded before any order of it is sent", () => {
         await maker.tick(first.venue);
       }
     };
-    await expect(keepTicking()).rejects.toThrow(`${limit} ladders in a row`);
+    await keepTicking();
 
-    expect(ledger.state.mode).toBe("reduce");
-    expect(ledger.state.unrunLadders).toBe(0);
+    expect(ledger.state.mode).toBe("run");
+    expect(first.said.alerts.filter((line) => line.includes("ladders in a row"))).toHaveLength(1);
+    expect(ledger.state.unrunLadders).toBeGreaterThanOrEqual(limit);
   });
 
   it("keeps the reset after a good ladder across a restart", async () => {
     const first = await rig("ladder-never-ran-reset-restart");
     await first.warmUp();
     first.book.take();
-    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeAlert;
 
     first.book.neverRunsAfter = 2;
     for (let ladder = 1; ladder < limit; ladder += 1) await first.tick(11);
@@ -4340,7 +4351,7 @@ describe("a house maker's requote keeps the book quoted", () => {
     const { live, step, ledger, said } = await quoting("mbb-partial-resets-unrun", {
       positionLimitNotional: dollars(1_000),
     });
-    const limit = MAKER_LIMITS.unrunLaddersBeforeStop;
+    const limit = MAKER_LIMITS.unrunLaddersBeforeAlert;
 
     for (let ladder = 1; ladder < limit; ladder += 1) {
       live.neverRunsFrom = live.placed + 3;
