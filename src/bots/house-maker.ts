@@ -94,6 +94,14 @@ export class QuotesHeld extends Error {
   }
 }
 
+/** The venue refused a quote for the state of the market or exchange: the ladder is taken off until it takes quotes again. */
+export class QuotesPulled extends Error {
+  constructor(market: MarketId, reason: string) {
+    super(`${market} quotes pulled, the venue refused one: ${reason}`);
+    this.name = "QuotesPulled";
+  }
+}
+
 /** Ladders kept failing because an order provably never ran: the cause is not passing, so the maker stops. */
 export class UnrunOrdersRepeated extends Error {
   constructor(inARow: number, lastReason: string) {
@@ -153,6 +161,14 @@ const NOTHING_TO_REDUCE = /no position to reduce|ReduceOnlyWouldIncrease/;
 
 /** An order that reached the program after its own expiry, as when the rollup is slow: it never ran, so the next tick quotes again. */
 const ORDER_EXPIRED = /OrderExpired/;
+
+/**
+ * A refusal for the state of the whole market or exchange, the same states `quotesRefusedBecause`
+ * holds the quotes for: one that lands anyway changed between that check and the order, so the
+ * maker drops the ladder and waits for the venue as it would have, rather than stopping.
+ */
+const VENUE_STATE_REFUSAL =
+  /ExchangePaused|MarketPaused|MarketReduceOnly|StalePrice|OracleDislocated|QuoteGuardTripped/;
 
 const isRoutineRefusal = (order: NewOrder, reason: string | undefined): boolean =>
   ROUTINE_REFUSAL.test(reason ?? "") ||
@@ -744,9 +760,11 @@ export class HouseMaker {
    * does an order the venue answers with a refusal, unless it is a post-only
    * order that would have crossed, or a reduce-only order with nothing left to
    * reduce: that leaves a gap in the ladder, so the maker sends no heartbeat
-   * and sends the whole ladder again on its next tick. The heartbeat is sent
-   * only after a requote of both sides: never while a loss limit, the kill
-   * switch or the venue has the maker reducing only.
+   * and sends the whole ladder again on its next tick. A refusal for the state
+   * of the market or exchange takes the ladder off and throws `QuotesPulled`
+   * without stopping, as the check before sending would have held it. The
+   * heartbeat is sent only after a requote of both sides: never while a loss
+   * limit, the kill switch or the venue has the maker reducing only.
    */
   async tick(venue: Venue): Promise<void> {
     try {
@@ -868,6 +886,7 @@ export class HouseMaker {
     let cutShort = false;
     let tooLate = false;
     let unrunReason: string | undefined;
+    let venueRefusal: string | undefined;
     let seatedAgain = false;
     try {
       ladder: for (const order of orders) {
@@ -930,6 +949,10 @@ export class HouseMaker {
             unrunReason = placed.reason || "no reason given";
             break ladder;
           }
+          if (!flattening && VENUE_STATE_REFUSAL.test(placed.reason ?? "")) {
+            venueRefusal = placed.reason;
+            break ladder;
+          }
           if (!isRoutineRefusal(current, placed.reason)) {
             throw new OrderRefused(this.options.market, placed.reason);
           }
@@ -945,6 +968,10 @@ export class HouseMaker {
       throw error;
     }
     if (heldSend) await this.noteSentOrders(sentIds);
+    if (venueRefusal !== undefined) {
+      await this.abandonLadder(venue, dispatching, false);
+      throw new QuotesPulled(this.options.market, venueRefusal);
+    }
     if (tooLate && !sawUnknown) {
       await this.abandonLadder(venue, dispatching, overlap !== null);
       return;
