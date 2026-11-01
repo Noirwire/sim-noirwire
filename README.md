@@ -1,9 +1,10 @@
 # sim-noirwire
 
-One always-on Node service that makes the NoirWire test-network order book feel alive and
-measurable. It never runs against a real-money network: the markets are real prices on
-test tokens, traded by a house market maker and a handful of noise-trading bots, with the
-numbers reported over HTTP and one websocket.
+One always-on Node service for NoirWire Dark Pool on Solana mainnet. It quotes the
+SOL-PERP book with a house market maker, opens trading accounts through the gate,
+and serves read-only market data. The public terminal trades with real USDC at
+https://terminal.noirwire.com. Test modes use test tokens and can run
+noise-trading bots and a test liquidator on a separate deployment.
 
 Full design: [docs/DESIGN.md](docs/DESIGN.md).
 
