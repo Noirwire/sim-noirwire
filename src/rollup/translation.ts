@@ -86,6 +86,21 @@ export const placeResultOf = (
   };
 };
 
+/** The seat's slot on a perpetual, if it holds one. */
+export const perpSlotOf = (
+  view: SeatView,
+  market: RollupMarket,
+): SeatView["perp"][number] | undefined =>
+  market.chain.kind === "perp"
+    ? view.perp.find((held) => held.marketId === market.chain.marketId)
+    : undefined;
+
+/** What a perpetual adds to the seat's equity at the market's mark: base times mark plus quote, nothing while flat. */
+export const slotValueOf = (view: SeatView, market: RollupMarket): bigint => {
+  const slot = perpSlotOf(view, market);
+  return slot === undefined || slot.base === 0n ? 0n : slot.base * market.mark + slot.quote;
+};
+
 /** A trader's own view of its seat, in this service's terms. */
 export const traderStateOf = (
   trader: TraderKey,
@@ -133,7 +148,7 @@ export const traderStateOf = (
       size: toSimSize(units, slot.base),
       entryPrice: toSimPrice(units, absBigInt(slot.quote) / absBigInt(slot.base)),
     };
-    equity += slot.base * market.mark + slot.quote;
+    equity += slotValueOf(view, market);
   }
   return { trader, balances, positions, openOrders, equity };
 };
