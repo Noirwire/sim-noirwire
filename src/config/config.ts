@@ -101,6 +101,28 @@ const envSchema = z.object({
   /** Margin cap: the hedge position never grows past the hedge account's margin times this. */
   HEDGE_MAX_LEVERAGE: positiveInt(3),
 
+  /** The treasury bridge that moves the maker's surplus collateral out and back. Unset, the maker never asks for a transfer. */
+  REBALANCE_URL: z.url().optional(),
+  /** The bearer token the bridge expects. Required with REBALANCE_URL; never logged. */
+  REBALANCE_TOKEN: z.string().min(1).optional(),
+  /** The bridge's token account on Solana that a transfer out is sent to. Required with REBALANCE_URL. */
+  REBALANCE_BRIDGE_ATA: z.string().min(32).max(44).optional(),
+  /** The rollup validator the shuttle back to Solana names. Required with REBALANCE_URL. */
+  REBALANCE_VALIDATOR: z.string().min(32).max(44).optional(),
+  /** Every request is a whole multiple of this many USDC. */
+  REBALANCE_STEP_USDC: decimalAmount("25"),
+  /** The most one request may ask for, in USDC. */
+  REBALANCE_MAX_REQUEST_USDC: decimalAmount("500"),
+  /** Equity over the margin requirement, in bps: below urgent a request goes out at once, below low it asks for more, above surplus it sends out. */
+  REBALANCE_URGENT_BPS: positiveInt(12_000),
+  REBALANCE_LOW_BPS: positiveInt(15_000),
+  REBALANCE_TARGET_BPS: positiveInt(22_000),
+  REBALANCE_SURPLUS_BPS: positiveInt(35_000),
+  /** The wait after a request ends before the next one may go out (an urgent one does not wait). */
+  REBALANCE_COOLDOWN_MS: positiveInt(30 * 60_000),
+  /** How often the maker looks at whether it needs a transfer. */
+  REBALANCE_CHECK_MS: positiveInt(30_000),
+
   /** The noise takers trade at all. Off, none is opened, funded or started. */
   NOISE_TAKERS_ENABLED: boolFlag("1"),
   NOISE_TAKER_TICK_MS: positiveInt(500),

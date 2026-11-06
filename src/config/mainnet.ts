@@ -34,6 +34,7 @@ const TEST_SETTINGS: TestSettings[] = [
     prefix: "NOISE_TAKER_",
   },
   { what: "the test liquidator", names: [], prefix: "LIQUIDATOR_", except: "LIQUIDATOR_ENABLED" },
+  { what: "the collateral rebalancing", names: [], prefix: "REBALANCE_" },
 ];
 
 /** What mainnet reads from a mounted file only, so it never sits in an environment variable. */
