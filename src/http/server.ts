@@ -12,6 +12,7 @@ import { registerRollupFundRoutes } from "./routes/fund-rollup.js";
 import { registerOpenRoutes } from "./routes/open-rollup.js";
 import { registerDeploymentRoute } from "./routes/deployment.js";
 import { registerHealthRoute } from "./routes/health.js";
+import { registerMakerRoutes } from "./routes/maker.js";
 import { registerMarketsRoute } from "./routes/markets.js";
 import { registerStatsRoute } from "./routes/stats.js";
 import { registerStreamRoute } from "./routes/stream.js";
@@ -84,6 +85,8 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   if (config.VENUE === "memory" && config.DEV_TRADING && !mainnet) {
     registerDevTradingRoutes(app, ctx);
   }
+
+  if (!mainnet) registerMakerRoutes(app, ctx);
 
   return app;
 };

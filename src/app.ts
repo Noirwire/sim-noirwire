@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { Activity, type Lifecycle } from "./activity/activity.js";
+import { makerReadsOf } from "./bots/maker-reads.js";
 import { type Config, isMainnet } from "./config/config.js";
 import { CandleAggregator } from "./data/candles.js";
 import { FundLedger } from "./data/fund-ledger.js";
@@ -264,6 +265,7 @@ export const startApp = async (
     problems: { onError: logError, onRecovered: logRecovered },
     fundLedger,
     ...wiring.rollupRoutes,
+    ...(isMainnet(config) ? {} : { makerReads: makerReadsOf(wiring.botVenue, wiring.botMarkets) }),
     activity,
     startUp: config.VENUE === "rollup" ? startUp : undefined,
     trading: () => bots?.trading() ?? { ready: false, reason: "the bots are not open yet" },

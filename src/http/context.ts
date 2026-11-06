@@ -1,4 +1,5 @@
 import type { Activity } from "../activity/activity.js";
+import type { MakerReads } from "../bots/maker-reads.js";
 import type { Config } from "../config/config.js";
 import type { CandleAggregator } from "../data/candles.js";
 import type { FundLedger } from "../data/fund-ledger.js";
@@ -58,6 +59,8 @@ export interface AppContext extends Partial<RollupRoutes> {
   startUp?: Pick<StartUp, "ready" | "problem">;
   /** Whether the makers are quoting under a working hedge; absent until the bots are open. */
   trading?: () => { ready: boolean; reason?: string };
+  /** What the maker routes read; they are registered off mainnet only. */
+  makerReads?: MakerReads;
   /** Trading readiness while asleep: not ready only for a hedge position left open with no maker to manage it. */
   tradingWhileAsleep?: () => { ready: boolean; reason?: string };
 }
