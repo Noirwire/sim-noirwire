@@ -270,6 +270,29 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
 };
 
 /**
+ * The orders with every price inside `edgeBps` of the venue's own `mark`, which
+ * is what the venue's band is measured from. A bid is brought down to the
+ * ceiling and an ask up to the floor, each on the tick, so the clamp rounds
+ * inward and a quote never lands outside the band however far the reference
+ * price has drifted from the mark.
+ */
+export const keepInsideBand = (
+  orders: NewOrder[],
+  band: { mark: bigint; edgeBps: number; tickSize: bigint },
+): NewOrder[] => {
+  const { mark, edgeBps, tickSize } = band;
+  const edge = bpsOf(mark, edgeBps);
+  const ceiling = roundDownToStep(mark + edge, tickSize);
+  const floor = roundUpToStep(mark - edge, tickSize);
+  return orders.map((order) => {
+    if (order.price === undefined) return order;
+    const price =
+      order.side === "buy" ? minBigInt(order.price, ceiling) : maxBigInt(order.price, floor);
+    return price === order.price ? order : { ...order, price };
+  });
+};
+
+/**
  * The one order that works `position` down to flat: reduce-only, for the whole
  * position, at a price `giveBps` through `centre` and no further. It crosses
  * whatever rests inside that price, and the program drops what it did not fill,
@@ -1281,6 +1304,20 @@ export class HouseMaker {
    * (a resting order cannot be made to shrink a position, so the quotes are pulled), or both sides.
    */
   private ordersFor(plan: Quoting, market: MarketInfo, position: bigint): NewOrder[] {
+    const orders = this.ordersAround(plan, market, position);
+    const { safety } = this.options;
+    if (!safety || market.bandBps === undefined || market.markPrice === null) return orders;
+    return keepInsideBand(orders, {
+      mark: market.markPrice,
+      edgeBps: Math.max(
+        market.bandBps - MAKER_LIMITS.bandHeadroomBps,
+        MAKER_LIMITS.minHalfSpreadBps,
+      ),
+      tickSize: market.tickSize,
+    });
+  }
+
+  private ordersAround(plan: Quoting, market: MarketInfo, position: bigint): NewOrder[] {
     const { safety } = this.options;
     if (plan.flatten) {
       return flattenOrders(this.options, {
