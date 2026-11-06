@@ -79,6 +79,12 @@ export interface Ladder {
    * strong skew can carry the reducing side through the price it centres on.
    */
   minEdgeBps?: number;
+  /**
+   * The most any quote may sit away from `mark`, skew, level steps and widening
+   * included, so none lands outside the venue's price band. A quote past it
+   * is brought back to it.
+   */
+  maxEdgeBps?: number;
 }
 
 type LadderShape = Pick<
@@ -193,7 +199,7 @@ const fitUnderCap = (positionCap: bigint | undefined, reach: bigint, size: bigin
  * one that fits under that cap.
  */
 export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => {
-  const { mark, tickSize, position, positionLimit, positionCap, minEdgeBps } = ladder;
+  const { mark, tickSize, position, positionLimit, positionCap, minEdgeBps, maxEdgeBps } = ladder;
   const boundedPosition =
     positionLimit > 0n ? maxBigInt(-positionLimit, minBigInt(position, positionLimit)) : 0n;
   const skewMilliBps =
@@ -206,9 +212,17 @@ export const ladderOrders = (shape: LadderShape, ladder: Ladder): NewOrder[] => 
     minEdgeBps === undefined
       ? null
       : (mark * BigInt(minEdgeBps) + BPS_PER_WHOLE - 1n) / BPS_PER_WHOLE;
+  // Rounded down, so the farthest quote never reaches a unit past the edge.
+  const maxEdge = maxEdgeBps === undefined ? null : (mark * BigInt(maxEdgeBps)) / BPS_PER_WHOLE;
   const withEdge = (side: NewOrder["side"], price: bigint): bigint => {
-    if (minEdge === null) return price;
-    return side === "buy" ? minBigInt(price, mark - minEdge) : maxBigInt(price, mark + minEdge);
+    const near =
+      minEdge === null
+        ? price
+        : side === "buy"
+          ? minBigInt(price, mark - minEdge)
+          : maxBigInt(price, mark + minEdge);
+    if (maxEdge === null) return near;
+    return side === "buy" ? maxBigInt(near, mark - maxEdge) : minBigInt(near, mark + maxEdge);
   };
   const quote = (side: NewOrder["side"], price: bigint, size: bigint): NewOrder => {
     const edged = withEdge(side, price);
@@ -600,7 +614,9 @@ export class HouseMaker {
     const limit = divScale(this.options.positionLimitNotional, plan.centre);
     const equity = maxBigInt(seat.equity, 0n);
     const affordable = divScale(
-      (equity * BigInt(market.maxLeverage) * BigInt(MAKER_LIMITS.overlapMarginShareBps)) /
+      (equity *
+        BigInt(Math.min(market.maxLeverage, MAKER_LIMITS.overlapMaxLeverage)) *
+        BigInt(MAKER_LIMITS.overlapMarginShareBps)) /
         BPS_PER_WHOLE,
       market.markPrice ?? plan.centre,
     );
@@ -1288,6 +1304,10 @@ export class HouseMaker {
         positionLimit: divScale(this.options.positionLimitNotional, plan.centre),
         positionCap: market.positionCap,
         minEdgeBps: safety ? MAKER_LIMITS.minHalfSpreadBps : undefined,
+        maxEdgeBps:
+          safety && market.bandBps !== undefined
+            ? Math.max(market.bandBps - MAKER_LIMITS.bandHeadroomBps, MAKER_LIMITS.minHalfSpreadBps)
+            : undefined,
       },
     );
   }

@@ -148,6 +148,7 @@ export class RollupMarket {
       tickSize: toSimPrice(units, chain.tick),
       lotSize: toSimSize(units, 1n),
       maxLeverage: isPerp ? maxLeverageAt(chain.initialMarginBps) : 0,
+      ...(isPerp ? { bandBps: chain.bandBps } : {}),
       markPrice,
       markPriceUpdatedAtMs: markPrice ? this.publishTimeSeconds * MS_PER_SECOND : null,
       change24h: markPrice

@@ -67,6 +67,10 @@ export const MAKER_LIMITS = {
    */
   overlapMaxOpenOrders: 16,
   overlapMarginShareBps: 8_000,
+  /** The leverage that share is counted at, however much more the market allows. */
+  overlapMaxLeverage: 5,
+  /** A quote stays this far inside the venue's price band, which the reference price and the mark may differ within. */
+  bandHeadroomBps: 5,
 
   /** The least time between two status lines that say what the maker holds. */
   statusEveryMs: 300_000,

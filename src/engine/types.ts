@@ -12,6 +12,8 @@ export interface MarketInfo {
   tickSize: bigint;
   lotSize: bigint;
   maxLeverage: number;
+  /** Where the venue has one: how far from the mark, in bps, it accepts an order's price. */
+  bandBps?: number;
   markPrice: bigint | null;
   markPriceUpdatedAtMs: number | null;
   /** True while a venue is still bringing its mark from a set-up price to the real one. */
