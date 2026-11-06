@@ -129,6 +129,25 @@ it the maker replaces its order keys at the next start (which works).
    sends it. At start the service logs each maker's owner key, and while its quotes are
    refused it logs `MakerNotListed (6091)` with that key.
 
+### A BTC market beside SOL
+
+When the deployment description lists a `BTC-PERP` market, this service follows it as
+`NBTC-PERP` and runs a second maker for it, quoting around the chain's mark and checked
+against Pyth's BTC/USD and the BTC pairs of Coinbase, Kraken and OKX (one reference price
+per asset, shared by every maker of it). A description without it is unaffected.
+
+- The BTC maker is the second bot, so `BOT_TRADER_SEEDS` holds two seeds: the SOL maker's
+  first, then a new one. The SOL maker keeps its seed and its seat. The new seed is a seat
+  of its own: take the two operator steps above for the owner key the log names for
+  `NBTC-PERP`.
+- Off mainnet the service answers two read-only routes for an outside hedger, which show
+  numbers and never a key or seed: `GET /v1/maker/position?market=NBTC-PERP` gives
+  `{"market","size","observedAt"}` with the maker's signed position in base units (long
+  positive), and `GET /v1/maker/equity` gives `{"equityUsdc6","observedAt"}`, the makers'
+  equity in USDC atoms added together, or one maker's with `?market=`. Both answer 503
+  with a reason while the service is still connecting, 404 for a market with no maker, and
+  neither exists on mainnet.
+
 ### What the maker does when the market will not take its quotes
 
 The maker reads the market's status, its oracle health and position cap, and the
