@@ -45,6 +45,26 @@ const marketNamed = (id: string): MarketConfig => {
   return found;
 };
 
+const contextOf = (over: Partial<Config>, extra: Partial<AppContext> = {}): AppContext => {
+  const clock = new ManualClock(1_000_000);
+  return {
+    config: { ...loadConfig({} as NodeJS.ProcessEnv), ...over },
+    venue: new MemoryVenue({ clock }),
+    tape: new TapeStore(),
+    candles: new CandleAggregator(),
+    stats: new StatsTracker(),
+    fundLedger: new FundLedger({ perIpLimit: 20, perIpWindowMs: 60_000, clock }),
+    hub: new Hub(),
+    activity: new Activity({
+      lifecycle: { wake: async () => {}, sleep: async () => {} },
+      idleAfterMs: 60_000,
+      idleAfterLastSocketMs: 15_000,
+      onError: () => {},
+    }),
+    ...extra,
+  };
+};
+
 afterEach(() => {
   rmSync(ROOT, { recursive: true, force: true });
 });
@@ -249,27 +269,14 @@ describe("the maker routes", () => {
     traderState: Venue["traderState"],
     withReads = true,
   ) => {
-    const config: Config = { ...loadConfig({} as NodeJS.ProcessEnv), ...over };
-    const clock = new ManualClock(1_000_000);
-    const ctx: AppContext = {
-      config,
-      venue: new MemoryVenue({ clock }),
-      tape: new TapeStore(),
-      candles: new CandleAggregator(),
-      stats: new StatsTracker(),
-      fundLedger: new FundLedger({ perIpLimit: 20, perIpWindowMs: 60_000, clock }),
-      hub: new Hub(),
-      activity: new Activity({
-        lifecycle: { wake: async () => {}, sleep: async () => {} },
-        idleAfterMs: 60_000,
-        idleAfterLastSocketMs: 15_000,
-        onError: () => {},
-      }),
-      ...(withReads
-        ? { makerReads: makerReadsOf({ traderState }, [marketNamed(SOL), marketNamed(BTC)]) }
-        : {}),
-    };
-    app = await buildServer(ctx);
+    app = await buildServer(
+      contextOf(
+        over,
+        withReads
+          ? { makerReads: makerReadsOf({ traderState }, [marketNamed(SOL), marketNamed(BTC)]) }
+          : {},
+      ),
+    );
     return app;
   };
 
@@ -382,23 +389,7 @@ describe("the public tape", () => {
   });
 
   it("accepts NBTC-PERP, and still refuses a market that does not exist", async () => {
-    const clock = new ManualClock(1_000_000);
-    const ctx: AppContext = {
-      config: { ...loadConfig({} as NodeJS.ProcessEnv), NETWORK: "devnet" },
-      venue: new MemoryVenue({ clock }),
-      tape: new TapeStore(),
-      candles: new CandleAggregator(),
-      stats: new StatsTracker(),
-      fundLedger: new FundLedger({ perIpLimit: 20, perIpWindowMs: 60_000, clock }),
-      hub: new Hub(),
-      activity: new Activity({
-        lifecycle: { wake: async () => {}, sleep: async () => {} },
-        idleAfterMs: 60_000,
-        idleAfterLastSocketMs: 15_000,
-        onError: () => {},
-      }),
-    };
-    app = await buildServer(ctx);
+    app = await buildServer(contextOf({ NETWORK: "devnet" }));
 
     const btc = await app.inject({ method: "GET", url: `/v1/tape?market=${BTC}` });
     const sol = await app.inject({ method: "GET", url: `/v1/tape?market=${SOL}` });

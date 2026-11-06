@@ -4,7 +4,7 @@ import { makerTraderKey } from "./bot-traders.js";
 
 /** Raised for a market that has no house maker here. */
 export class NoMakerFor extends Error {
-  constructor(readonly market: string) {
+  constructor(market: string) {
     super(`there is no house maker for ${market}`);
     this.name = "NoMakerFor";
   }
