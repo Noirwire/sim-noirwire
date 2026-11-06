@@ -4,6 +4,7 @@ import { marginOfNotional, marginReadingOf } from "../src/rebalance/free-collate
 import type { ChainMarket, SeatView } from "../src/rollup/chain-types.js";
 import { RollupMarket } from "../src/rollup/rollup-market.js";
 import { traderStateOf } from "../src/rollup/translation.js";
+import { USDC } from "./helpers.js";
 
 const SOL_PERP: ChainMarket = {
   marketId: 0,
@@ -28,8 +29,6 @@ const marketAt = (price: bigint | null): RollupMarket => {
   if (price !== null) market.acceptPrice({ price, publishTimeSeconds: 1_000 });
   return market;
 };
-
-const USDC = 1_000_000n;
 
 const seat = (over: Partial<SeatView>): SeatView => ({
   seat: 3,

@@ -1,11 +1,11 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ManualClock } from "../src/engine/clock.js";
 import { RequestSender, requestIdOf } from "../src/rebalance/request-sender.js";
+import { scratchRoot } from "./helpers.js";
 
-const ROOT = join("data-test", `rebalance-sender-${Date.now()}`);
-afterAll(() => rm(ROOT, { recursive: true, force: true }));
+const ROOT = scratchRoot("rebalance-sender");
 
 interface Call {
   method: string;

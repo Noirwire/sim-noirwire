@@ -1,12 +1,13 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ManualClock } from "../src/engine/clock.js";
 import { FlowFence } from "../src/rebalance/flow-adjust.js";
-import { OutFlow, type OutPorts, StepRefused } from "../src/rebalance/out-flow.js";
+import { StepRefused } from "../src/rebalance/flow-journal.js";
+import { OutFlow, type OutPorts } from "../src/rebalance/out-flow.js";
+import { scratchRoot } from "./helpers.js";
 
-const ROOT = join("data-test", `rebalance-out-${Date.now()}`);
-afterAll(() => rm(ROOT, { recursive: true, force: true }));
+const ROOT = scratchRoot("rebalance-out");
 
 type Step = "withdraw" | "shuttle" | "transfer";
 const AMOUNT = 50_000_000n;

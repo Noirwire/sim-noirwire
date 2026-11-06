@@ -1,15 +1,12 @@
-import { mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { mkdir } from "node:fs/promises";
+import { describe, expect, it } from "vitest";
 import { MakerRisk } from "../src/bots/maker-risk.js";
 import { MakerLedger, makerStatePath } from "../src/bots/maker-state.js";
 import { ManualClock } from "../src/engine/clock.js";
 import { FlowFence, applyFlow, shiftedLimits } from "../src/rebalance/flow-adjust.js";
+import { USDC, scratchRoot } from "./helpers.js";
 
-const ROOT = join("data-test", `rebalance-adjust-${Date.now()}`);
-afterAll(() => rm(ROOT, { recursive: true, force: true }));
-
-const USDC = 1_000_000n;
+const ROOT = scratchRoot("rebalance-adjust");
 const voice = () => {
   const alerts: string[] = [];
   return { alerts, voice: { alert: (m: string) => void alerts.push(m), notice: () => {} } };

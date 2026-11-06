@@ -6,7 +6,7 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import { associatedTokenAddress } from "@noirwire/orderbook";
-import { StepRefused } from "../rebalance/out-flow.js";
+import { StepRefused } from "../rebalance/flow-journal.js";
 import type { RebalanceChain, SeatReading } from "../rebalance/rebalancer.js";
 import { Session, connectionTo } from "./connections.js";
 import { type CustodyTokenRef, type Program, signedInConnection } from "./program.js";

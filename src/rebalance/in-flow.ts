@@ -1,9 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { isMissing, writeAtomically } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
-import { waitFor } from "../scheduling/backoff.js";
-import { StepRefused } from "./out-flow.js";
+import { FlowJournal, type FlowTiming, StepRefused } from "./flow-journal.js";
 
 /** What the maker does to bring a bridge delivery from its wallet into its seat. Balances are in quote atoms. */
 export interface InPorts {
@@ -39,22 +36,15 @@ export type InRecord = z.infer<typeof recordSchema>;
 
 export type InAdvance = { kind: "done" } | { kind: "waiting"; phase: InRecord["phase"] };
 
-export interface InFlowOptions {
+type Step = InAdvance | "progress";
+
+export interface InFlowOptions extends FlowTiming {
   path: string;
   ports: InPorts;
   clock: Clock;
   /** Counts the deposited amount in the loss limits. Called again after a crash until it succeeds; it must count once. */
   onDeposited(requestId: string, amount: bigint): Promise<void>;
-  /** A step with no sign of landing is sent again only after this long. */
-  resendAfterMs?: number;
-  landWaitMs?: number;
-  pollMs?: number;
-  sleep?(ms: number): Promise<void>;
 }
-
-const DEFAULT_RESEND_AFTER_MS = 5 * 60_000;
-const DEFAULT_LAND_WAIT_MS = 30_000;
-const DEFAULT_POLL_MS = 2_000;
 
 /**
  * The maker's side of a transfer in: the bridge has put USDC on the maker's own account on Solana,
@@ -63,40 +53,22 @@ const DEFAULT_POLL_MS = 2_000;
  * when they have not moved for `resendAfterMs`.
  */
 export class InFlow {
-  constructor(private readonly options: InFlowOptions) {}
+  private readonly journal: FlowJournal<InRecord>;
 
-  async current(): Promise<InRecord | null> {
-    try {
-      const text = await readFile(this.options.path, "utf8");
-      return z.union([recordSchema, z.null()]).parse(JSON.parse(text));
-    } catch (error) {
-      if (isMissing(error)) return null;
-      throw new Error(`the rebalance journal ${this.options.path} cannot be read`, {
-        cause: error,
-      });
-    }
+  constructor(private readonly options: InFlowOptions) {
+    this.journal = new FlowJournal(options.path, recordSchema, options.clock, options);
   }
 
-  private async save(record: InRecord | null): Promise<void> {
-    await writeAtomically(this.options.path, JSON.stringify(record));
+  current(): Promise<InRecord | null> {
+    return this.journal.current();
   }
 
-  async begin(requestId: string, amount: bigint): Promise<void> {
-    const existing = await this.current();
-    if (existing) {
-      if (existing.requestId === requestId) return;
-      throw new Error(`the rebalance journal still holds unfinished request ${existing.requestId}`);
-    }
-    await this.save({
-      requestId,
-      amount: amount.toString(),
-      phase: "accepted",
-      armedAtMs: this.options.clock.nowMs(),
-    });
+  begin(requestId: string, amount: bigint): Promise<void> {
+    return this.journal.begin(requestId, amount);
   }
 
   async finish(): Promise<void> {
-    await this.save(null);
+    await this.journal.save(null);
   }
 
   async advance(): Promise<InAdvance> {
@@ -108,57 +80,75 @@ export class InFlow {
     }
   }
 
-  private async step(record: InRecord): Promise<InAdvance | "progress"> {
-    const { ports, clock } = this.options;
-    const amount = BigInt(record.amount);
-    const now = clock.nowMs();
-    const resendAfterMs = this.options.resendAfterMs ?? DEFAULT_RESEND_AFTER_MS;
-    const stale = now - record.armedAtMs >= resendAfterMs;
-    const waiting = (): InAdvance => ({ kind: "waiting", phase: record.phase });
-
+  private step(record: InRecord): Promise<Step> | Step {
     switch (record.phase) {
-      case "accepted": {
-        const solanaBefore = (await ports.solanaBalance()).toString();
-        await this.save({ ...record, phase: "shuttle-armed", armedAtMs: now, solanaBefore });
-        return this.send(record, "accepted", () => ports.shuttleToRollup(amount));
-      }
-      case "shuttle-armed": {
-        const before = BigInt(record.solanaBefore ?? "0");
-        if (await this.landed(async () => (await ports.solanaBalance()) <= before - amount)) {
-          await this.save({ ...record, phase: "in-rollup" });
-          return "progress";
-        }
-        if (!stale) return waiting();
-        return this.send(record, record.phase, () => ports.shuttleToRollup(amount), true);
-      }
-      case "in-rollup": {
-        const held = await ports.rollupBalance();
-        if (held < amount) return waiting();
-        await this.save({
-          ...record,
-          phase: "deposit-armed",
-          armedAtMs: now,
-          rollupBefore: held.toString(),
-        });
-        return this.send(record, "in-rollup", () => ports.depositToBook(amount));
-      }
-      case "deposit-armed": {
-        const before = BigInt(record.rollupBefore ?? "0");
-        if (await this.landed(async () => (await ports.rollupBalance()) <= before - amount)) {
-          await this.save({ ...record, phase: "deposited" });
-          return "progress";
-        }
-        if (!stale) return waiting();
-        return this.send(record, record.phase, () => ports.depositToBook(amount), true);
-      }
-      case "deposited": {
-        await this.options.onDeposited(record.requestId, amount);
-        await this.save({ ...record, phase: "equity-applied" });
-        return "progress";
-      }
+      case "accepted":
+        return this.accepted(record);
+      case "shuttle-armed":
+        return this.shuttleArmed(record);
+      case "in-rollup":
+        return this.inRollup(record);
+      case "deposit-armed":
+        return this.depositArmed(record);
+      case "deposited":
+        return this.deposited(record);
       case "equity-applied":
         return { kind: "done" };
     }
+  }
+
+  private async accepted(record: InRecord): Promise<Step> {
+    const { ports, clock } = this.options;
+    const amount = BigInt(record.amount);
+    const now = clock.nowMs();
+    const solanaBefore = (await ports.solanaBalance()).toString();
+    await this.journal.save({ ...record, phase: "shuttle-armed", armedAtMs: now, solanaBefore });
+    return this.send(record, "accepted", () => ports.shuttleToRollup(amount));
+  }
+
+  private shuttleArmed(record: InRecord): Promise<Step> {
+    const { ports } = this.options;
+    const amount = BigInt(record.amount);
+    const before = BigInt(record.solanaBefore ?? "0");
+    return this.journal.armed(
+      record,
+      async () => (await ports.solanaBalance()) <= before - amount,
+      "in-rollup",
+      () => this.send(record, record.phase, () => ports.shuttleToRollup(amount), true),
+    );
+  }
+
+  private async inRollup(record: InRecord): Promise<Step> {
+    const { ports, clock } = this.options;
+    const amount = BigInt(record.amount);
+    const now = clock.nowMs();
+    const held = await ports.rollupBalance();
+    if (held < amount) return { kind: "waiting", phase: record.phase };
+    await this.journal.save({
+      ...record,
+      phase: "deposit-armed",
+      armedAtMs: now,
+      rollupBefore: held.toString(),
+    });
+    return this.send(record, "in-rollup", () => ports.depositToBook(amount));
+  }
+
+  private depositArmed(record: InRecord): Promise<Step> {
+    const { ports } = this.options;
+    const amount = BigInt(record.amount);
+    const before = BigInt(record.rollupBefore ?? "0");
+    return this.journal.armed(
+      record,
+      async () => (await ports.rollupBalance()) <= before - amount,
+      "deposited",
+      () => this.send(record, record.phase, () => ports.depositToBook(amount), true),
+    );
+  }
+
+  private async deposited(record: InRecord): Promise<Step> {
+    await this.options.onDeposited(record.requestId, BigInt(record.amount));
+    await this.journal.save({ ...record, phase: "equity-applied" });
+    return "progress";
   }
 
   /** Sends one step whose armed record is saved. A step that provably did not run goes back to `undo`. */
@@ -167,28 +157,17 @@ export class InFlow {
     undo: InRecord["phase"],
     action: () => Promise<string>,
     rearm = false,
-  ): Promise<InAdvance | "progress"> {
-    if (rearm) await this.save({ ...record, armedAtMs: this.options.clock.nowMs() });
+  ): Promise<Step> {
+    if (rearm) await this.journal.rearm(record);
     try {
       await action();
     } catch (error) {
       if (error instanceof StepRefused && !rearm) {
-        await this.save({ ...record, phase: undo });
+        await this.journal.save({ ...record, phase: undo });
         return { kind: "waiting", phase: undo };
       }
       return { kind: "waiting", phase: record.phase };
     }
     return "progress";
-  }
-
-  private async landed(check: () => Promise<boolean>): Promise<boolean> {
-    const { landWaitMs = DEFAULT_LAND_WAIT_MS, pollMs = DEFAULT_POLL_MS } = this.options;
-    const sleep = this.options.sleep ?? waitFor;
-    const deadline = this.options.clock.nowMs() + landWaitMs;
-    for (;;) {
-      if (await check().catch(() => false)) return true;
-      if (this.options.clock.nowMs() >= deadline) return false;
-      await sleep(pollMs);
-    }
   }
 }

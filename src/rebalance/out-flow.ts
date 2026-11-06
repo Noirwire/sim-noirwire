@@ -1,17 +1,7 @@
-import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { isMissing, writeAtomically } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
-import { waitFor } from "../scheduling/backoff.js";
 import type { FlowFence } from "./flow-adjust.js";
-
-/** A step that provably did not run, so sending it again is safe. */
-export class StepRefused extends Error {
-  constructor(what: string) {
-    super(what);
-    this.name = "StepRefused";
-  }
-}
+import { FlowJournal, type FlowTiming, StepRefused } from "./flow-journal.js";
 
 /** What the maker does for a transfer out, one at a time. Balances are in quote atoms. */
 export interface OutPorts {
@@ -58,7 +48,9 @@ export type Advance =
   | { kind: "waiting"; phase: OutRecord["phase"] }
   | { kind: "failed"; reason: string };
 
-export interface OutFlowOptions {
+type Step = Advance | "progress";
+
+export interface OutFlowOptions extends FlowTiming {
   path: string;
   ports: OutPorts;
   fence: FlowFence;
@@ -67,17 +59,7 @@ export interface OutFlowOptions {
   mayWithdraw(amount: bigint): Promise<boolean>;
   /** Takes the withdrawn amount off the loss limits. Called again after a crash until it succeeds; it must count once. */
   onBookWithdrawn(requestId: string, amount: bigint): Promise<void>;
-  /** A step with no sign of landing is sent again only after this long: past any blockhash a first try could land under. */
-  resendAfterMs?: number;
-  /** How long a step is watched for its balance to move before the flow reports waiting. */
-  landWaitMs?: number;
-  pollMs?: number;
-  sleep?(ms: number): Promise<void>;
 }
-
-const DEFAULT_RESEND_AFTER_MS = 5 * 60_000;
-const DEFAULT_LAND_WAIT_MS = 30_000;
-const DEFAULT_POLL_MS = 2_000;
 
 /**
  * The maker's side of a transfer out: withdraw from the book, shuttle to Solana, send to the bridge.
@@ -86,22 +68,14 @@ const DEFAULT_POLL_MS = 2_000;
  * moved for `resendAfterMs`.
  */
 export class OutFlow {
-  constructor(private readonly options: OutFlowOptions) {}
+  private readonly journal: FlowJournal<OutRecord>;
 
-  async current(): Promise<OutRecord | null> {
-    try {
-      const text = await readFile(this.options.path, "utf8");
-      return z.union([recordSchema, z.null()]).parse(JSON.parse(text));
-    } catch (error) {
-      if (isMissing(error)) return null;
-      throw new Error(`the rebalance journal ${this.options.path} cannot be read`, {
-        cause: error,
-      });
-    }
+  constructor(private readonly options: OutFlowOptions) {
+    this.journal = new FlowJournal(options.path, recordSchema, options.clock, options);
   }
 
-  private async save(record: OutRecord | null): Promise<void> {
-    await writeAtomically(this.options.path, JSON.stringify(record));
+  current(): Promise<OutRecord | null> {
+    return this.journal.current();
   }
 
   /** Raises the fence again after a restart that finds a withdrawal the loss limits may not know of. */
@@ -111,24 +85,14 @@ export class OutFlow {
   }
 
   /** Starts the journal of an accepted request. A second request is refused while one is unfinished. */
-  async begin(requestId: string, amount: bigint): Promise<void> {
-    const existing = await this.current();
-    if (existing) {
-      if (existing.requestId === requestId) return;
-      throw new Error(`the rebalance journal still holds unfinished request ${existing.requestId}`);
-    }
-    await this.save({
-      requestId,
-      amount: amount.toString(),
-      phase: "accepted",
-      armedAtMs: this.options.clock.nowMs(),
-    });
+  begin(requestId: string, amount: bigint): Promise<void> {
+    return this.journal.begin(requestId, amount);
   }
 
   /** Clears the journal once the request is closed. */
   async finish(): Promise<void> {
     this.options.fence.lower();
-    await this.save(null);
+    await this.journal.save(null);
   }
 
   /** Runs the flow as far as it can go now. */
@@ -141,81 +105,110 @@ export class OutFlow {
     }
   }
 
-  private async step(record: OutRecord): Promise<Advance | "progress"> {
-    const { ports, fence, clock } = this.options;
-    const amount = BigInt(record.amount);
-    const now = clock.nowMs();
-    const resendAfterMs = this.options.resendAfterMs ?? DEFAULT_RESEND_AFTER_MS;
-    const stale = now - record.armedAtMs >= resendAfterMs;
-    const waiting = (): Advance => ({ kind: "waiting", phase: record.phase });
-
+  private step(record: OutRecord): Promise<Step> | Step {
     switch (record.phase) {
-      case "accepted": {
-        if (!(await this.options.mayWithdraw(amount))) {
-          return { kind: "failed", reason: "the maker may not withdraw now" };
-        }
-        fence.raise();
-        try {
-          const rollupBefore = (await ports.rollupBalance()).toString();
-          await this.save({ ...record, phase: "withdraw-armed", armedAtMs: now, rollupBefore });
-        } catch (error) {
-          fence.lower();
-          throw error;
-        }
-        return this.send("withdraw-armed", () => ports.withdrawFromBook(amount), "withdraw");
-      }
-      case "withdraw-armed": {
-        const before = BigInt(record.rollupBefore ?? "0");
-        if (await this.landed(async () => (await ports.rollupBalance()) >= before + amount)) {
-          await this.save({ ...record, phase: "book-withdrawn" });
-          return "progress";
-        }
-        if (!stale) return waiting();
-        return this.send(record.phase, () => ports.withdrawFromBook(amount), "withdraw", record);
-      }
-      case "book-withdrawn": {
-        await this.options.onBookWithdrawn(record.requestId, amount);
-        await this.save({ ...record, phase: "equity-applied" });
-        fence.lower();
-        return "progress";
-      }
-      case "equity-applied": {
-        const solanaBefore = (await ports.solanaBalance()).toString();
-        await this.save({ ...record, phase: "shuttle-armed", armedAtMs: now, solanaBefore });
-        return this.send("shuttle-armed", () => ports.shuttleToSolana(amount), "shuttle");
-      }
-      case "shuttle-armed": {
-        const before = BigInt(record.solanaBefore ?? "0");
-        if (await this.landed(async () => (await ports.solanaBalance()) >= before + amount)) {
-          await this.save({ ...record, phase: "on-solana" });
-          return "progress";
-        }
-        if (!stale) return waiting();
-        return this.send(record.phase, () => ports.shuttleToSolana(amount), "shuttle", record);
-      }
-      case "on-solana": {
-        const held = await ports.solanaBalance();
-        if (held < amount) return waiting();
-        await this.save({
-          ...record,
-          phase: "transfer-armed",
-          armedAtMs: now,
-          solanaBefore: held.toString(),
-        });
-        return this.send("transfer-armed", () => ports.transferToBridge(amount), "transfer");
-      }
-      case "transfer-armed": {
-        const before = BigInt(record.solanaBefore ?? "0");
-        if (await this.landed(async () => (await ports.solanaBalance()) <= before - amount)) {
-          await this.save({ ...record, phase: "sent-to-bridge" });
-          return "progress";
-        }
-        if (!stale) return waiting();
-        return this.send(record.phase, () => ports.transferToBridge(amount), "transfer", record);
-      }
+      case "accepted":
+        return this.accepted(record);
+      case "withdraw-armed":
+        return this.withdrawArmed(record);
+      case "book-withdrawn":
+        return this.bookWithdrawn(record);
+      case "equity-applied":
+        return this.equityApplied(record);
+      case "shuttle-armed":
+        return this.shuttleArmed(record);
+      case "on-solana":
+        return this.onSolana(record);
+      case "transfer-armed":
+        return this.transferArmed(record);
       case "sent-to-bridge":
         return { kind: "done", signature: record.signature };
     }
+  }
+
+  private async accepted(record: OutRecord): Promise<Step> {
+    const { ports, fence, clock } = this.options;
+    const amount = BigInt(record.amount);
+    const now = clock.nowMs();
+    if (!(await this.options.mayWithdraw(amount))) {
+      return { kind: "failed", reason: "the maker may not withdraw now" };
+    }
+    fence.raise();
+    try {
+      const rollupBefore = (await ports.rollupBalance()).toString();
+      await this.journal.save({ ...record, phase: "withdraw-armed", armedAtMs: now, rollupBefore });
+    } catch (error) {
+      fence.lower();
+      throw error;
+    }
+    return this.send("withdraw-armed", () => ports.withdrawFromBook(amount), "withdraw");
+  }
+
+  private withdrawArmed(record: OutRecord): Promise<Step> {
+    const { ports } = this.options;
+    const amount = BigInt(record.amount);
+    const before = BigInt(record.rollupBefore ?? "0");
+    return this.journal.armed(
+      record,
+      async () => (await ports.rollupBalance()) >= before + amount,
+      "book-withdrawn",
+      () => this.send(record.phase, () => ports.withdrawFromBook(amount), "withdraw", record),
+    );
+  }
+
+  private async bookWithdrawn(record: OutRecord): Promise<Step> {
+    await this.options.onBookWithdrawn(record.requestId, BigInt(record.amount));
+    await this.journal.save({ ...record, phase: "equity-applied" });
+    this.options.fence.lower();
+    return "progress";
+  }
+
+  private async equityApplied(record: OutRecord): Promise<Step> {
+    const { ports, clock } = this.options;
+    const amount = BigInt(record.amount);
+    const now = clock.nowMs();
+    const solanaBefore = (await ports.solanaBalance()).toString();
+    await this.journal.save({ ...record, phase: "shuttle-armed", armedAtMs: now, solanaBefore });
+    return this.send("shuttle-armed", () => ports.shuttleToSolana(amount), "shuttle");
+  }
+
+  private shuttleArmed(record: OutRecord): Promise<Step> {
+    const { ports } = this.options;
+    const amount = BigInt(record.amount);
+    const before = BigInt(record.solanaBefore ?? "0");
+    return this.journal.armed(
+      record,
+      async () => (await ports.solanaBalance()) >= before + amount,
+      "on-solana",
+      () => this.send(record.phase, () => ports.shuttleToSolana(amount), "shuttle", record),
+    );
+  }
+
+  private async onSolana(record: OutRecord): Promise<Step> {
+    const { ports, clock } = this.options;
+    const amount = BigInt(record.amount);
+    const now = clock.nowMs();
+    const held = await ports.solanaBalance();
+    if (held < amount) return { kind: "waiting", phase: record.phase };
+    await this.journal.save({
+      ...record,
+      phase: "transfer-armed",
+      armedAtMs: now,
+      solanaBefore: held.toString(),
+    });
+    return this.send("transfer-armed", () => ports.transferToBridge(amount), "transfer");
+  }
+
+  private transferArmed(record: OutRecord): Promise<Step> {
+    const { ports } = this.options;
+    const amount = BigInt(record.amount);
+    const before = BigInt(record.solanaBefore ?? "0");
+    return this.journal.armed(
+      record,
+      async () => (await ports.solanaBalance()) <= before - amount,
+      "sent-to-bridge",
+      () => this.send(record.phase, () => ports.transferToBridge(amount), "transfer", record),
+    );
   }
 
   /**
@@ -227,10 +220,8 @@ export class OutFlow {
     action: () => Promise<string>,
     what: "withdraw" | "shuttle" | "transfer",
     rearm?: OutRecord,
-  ): Promise<Advance | "progress"> {
-    if (rearm) {
-      await this.save({ ...rearm, armedAtMs: this.options.clock.nowMs() });
-    }
+  ): Promise<Step> {
+    if (rearm) await this.journal.rearm(rearm);
     let signature: string;
     try {
       signature = await action();
@@ -243,19 +234,8 @@ export class OutFlow {
     }
     if (what === "transfer") {
       const record = await this.current();
-      if (record) await this.save({ ...record, signature });
+      if (record) await this.journal.save({ ...record, signature });
     }
     return "progress";
-  }
-
-  private async landed(check: () => Promise<boolean>): Promise<boolean> {
-    const { landWaitMs = DEFAULT_LAND_WAIT_MS, pollMs = DEFAULT_POLL_MS } = this.options;
-    const sleep = this.options.sleep ?? waitFor;
-    const deadline = this.options.clock.nowMs() + landWaitMs;
-    for (;;) {
-      if (await check().catch(() => false)) return true;
-      if (this.options.clock.nowMs() >= deadline) return false;
-      await sleep(pollMs);
-    }
   }
 }

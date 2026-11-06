@@ -5,8 +5,8 @@ import {
   planRebalance,
   ratioBps,
 } from "../src/rebalance/planner.js";
+import { USDC } from "./helpers.js";
 
-const USDC = 1_000_000n;
 const R = 1_000n * USDC;
 const settings: PlannerSettings = {
   bands: DEFAULT_BANDS,

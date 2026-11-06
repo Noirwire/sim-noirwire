@@ -1,6 +1,6 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { MakerLedger, makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { ManualClock } from "../src/engine/clock.js";
@@ -9,10 +9,9 @@ import { DEFAULT_BANDS } from "../src/rebalance/planner.js";
 import { Rebalancer, type RebalanceChain } from "../src/rebalance/rebalancer.js";
 import { RequestSender } from "../src/rebalance/request-sender.js";
 import { rebalanceSettings } from "../src/rebalance/settings.js";
+import { USDC, scratchRoot } from "./helpers.js";
 
-const ROOT = join("data-test", `rebalance-wiring-${Date.now()}`);
-afterAll(() => rm(ROOT, { recursive: true, force: true }));
-const USDC = 1_000_000n;
+const ROOT = scratchRoot("rebalance-wiring");
 const BRIDGE = "A".repeat(44);
 
 describe("rebalancing is off unless REBALANCE_URL is set", () => {
