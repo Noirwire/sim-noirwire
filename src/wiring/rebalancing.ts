@@ -49,6 +49,7 @@ export const openRebalancer = async (
     sender,
     chain: wiring.rebalanceChain(market, settings, ladderNotional),
     journalPath: join(config.DATA_DIR, `rebalance-out-${market.id}.json`),
+    inJournalPath: join(config.DATA_DIR, `rebalance-in-${market.id}.json`),
     ledger,
     fence,
     clock: systemClock,

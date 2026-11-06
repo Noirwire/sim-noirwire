@@ -118,6 +118,30 @@ export const rebalanceChain = (options: RebalanceChainOptions): RebalanceChain =
       });
       return sendOnSolana(solana, owner, instructions);
     },
+    shuttleToRollup: async (amount) => {
+      const { delegateSpl } = await import("@magicblock-labs/ephemeral-rollups-sdk");
+      const instructions = await delegateSpl(owner.publicKey, mint, amount, {
+        validator: new PublicKey(options.validator),
+        payer: owner.publicKey,
+        initIfMissing: true,
+        initVaultIfMissing: true,
+        initAtasIfMissing: true,
+      });
+      return sendOnSolana(solana, owner, instructions);
+    },
+    depositToBook: (amount) =>
+      rollup
+        .use((connection) =>
+          program.deposit(
+            connection,
+            owner,
+            token,
+            owner.publicKey.toBase58(),
+            "collateral",
+            amount,
+          ),
+        )
+        .catch(refusedOrFailed),
     transferToBridge: (amount) =>
       sendOnSolana(solana, owner, [
         transferChecked(ownerAccount, mint, bridgeAccount, owner.publicKey, amount, token.decimals),

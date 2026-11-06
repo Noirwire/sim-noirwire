@@ -3,6 +3,7 @@ import type { MakerLedger } from "../bots/maker-state.js";
 import type { Clock } from "../engine/clock.js";
 import { type FlowFence, applyFlow } from "./flow-adjust.js";
 import type { MarginReading } from "./free-collateral.js";
+import { InFlow, type InPorts } from "./in-flow.js";
 import { OutFlow, type OutFlowOptions, type OutPorts } from "./out-flow.js";
 import { planRebalance } from "./planner.js";
 import type { RequestSender, SenderEvent } from "./request-sender.js";
@@ -13,6 +14,8 @@ const BPS = 10_000n;
 const IN_GIVE_UP_MS = 6 * 3_600_000;
 /** The bridge's words for a transfer in that has reached the seat, and for one that never will. */
 const CREDITED_STATES = new Set(["credited", "book-credited"]);
+/** The bridge's word for a transfer in that has reached the maker's own account, not yet its seat. */
+const WALLET_CREDITED = "wallet-credited";
 const DEAD_STATES = new Set(["failed", "expired", "cancelled", "refused", "rejected"]);
 
 /** The seat as the planner needs it. `requirement` is the larger of the margin now and that of the full ladder. */
@@ -20,7 +23,7 @@ export interface SeatReading extends MarginReading {
   requirement: bigint;
 }
 
-export interface RebalanceChain extends OutPorts {
+export interface RebalanceChain extends OutPorts, InPorts {
   read(): Promise<SeatReading | null>;
 }
 
@@ -30,6 +33,8 @@ export interface RebalancerOptions {
   chain: RebalanceChain;
   /** Where the transfer out is journaled. */
   journalPath: string;
+  /** Where the deposit of a transfer in is journaled. */
+  inJournalPath: string;
   flowTimings?: Pick<OutFlowOptions, "resendAfterMs" | "landWaitMs" | "pollMs" | "sleep">;
   ledger: MakerLedger;
   fence: FlowFence;
@@ -45,9 +50,20 @@ export interface RebalancerOptions {
  */
 export class Rebalancer {
   private readonly flow: OutFlow;
+  private readonly inFlow: InFlow;
 
   constructor(private readonly options: RebalancerOptions) {
-    const { chain, fence, clock, ledger, journalPath, flowTimings } = options;
+    const { chain, fence, clock, ledger, journalPath, inJournalPath, flowTimings } = options;
+    this.inFlow = new InFlow({
+      path: inJournalPath,
+      ports: chain,
+      clock,
+      onDeposited: async (requestId, amount) => {
+        const seat = await chain.read();
+        await applyFlow(ledger, requestId, amount, seat?.equity ?? 0n);
+      },
+      ...flowTimings,
+    });
     this.flow = new OutFlow({
       path: journalPath,
       ports: chain,
@@ -75,6 +91,14 @@ export class Rebalancer {
       else if (left) {
         this.options.voice.alert(
           `ALERT ${this.options.market} maker: a transfer out is journaled with no open request, so it asks for nothing until an operator looks`,
+        );
+        return;
+      }
+      const inLeft = await this.inFlow.current();
+      if (inLeft?.phase === "equity-applied") await this.inFlow.finish();
+      else if (inLeft) {
+        this.options.voice.alert(
+          `ALERT ${this.options.market} maker: a transfer in is journaled with no open request, so it asks for nothing until an operator looks`,
         );
         return;
       }
@@ -164,6 +188,16 @@ export class Rebalancer {
   private async awaitIn(requestId: string, amount: bigint, requestedAtMs: number): Promise<void> {
     const { sender, ledger, chain, clock, voice, market } = this.options;
     const known = await sender.status(requestId).catch(() => undefined);
+    const journaled = (await this.inFlow.current())?.requestId === requestId;
+    if (journaled || known?.state === WALLET_CREDITED) {
+      await this.inFlow.begin(requestId, amount);
+      const result = await this.inFlow.advance();
+      if (result.kind === "waiting") return;
+      await sender.close();
+      await this.inFlow.finish();
+      voice.notice(`${market} maker: a transfer in was deposited into the seat`);
+      return;
+    }
     if (known && CREDITED_STATES.has(known.state)) {
       const seat = await chain.read();
       await applyFlow(ledger, requestId, amount, seat?.equity ?? 0n);

@@ -95,7 +95,24 @@ describe("the rebalancer end to end", () => {
     });
     const balances = { rollup: 0n, solana: 0n, bridge: 0n };
     const equity = reading.equity ?? 3_000n * USDC;
+    const inbound = { deposits: 0, shuttles: 0, failDeposit: false, dropAfterSend: false };
     const chain: RebalanceChain = {
+      shuttleToRollup: async (a) => (
+        inbound.shuttles++,
+        (balances.solana -= a),
+        (balances.rollup += a),
+        "i"
+      ),
+      depositToBook: async (a) => {
+        if (inbound.failDeposit) throw new Error("rollup unreachable");
+        inbound.deposits++;
+        balances.rollup -= a;
+        if (inbound.dropAfterSend) {
+          inbound.dropAfterSend = false;
+          throw new Error("connection lost after landing");
+        }
+        return "d";
+      },
       read: async () => ({
         collateral: reading.collateral ?? equity,
         equity,
@@ -118,19 +135,25 @@ describe("the rebalancer end to end", () => {
       }),
     );
     if (!settings) throw new Error("settings");
-    const rebalancer = new Rebalancer({
-      settings,
-      sender,
-      chain,
-      journalPath: join(ROOT, `${name}-out.json`),
-      flowTimings: { landWaitMs: 0 },
-      ledger,
-      fence: new FlowFence(),
-      clock,
-      voice: { alert: () => {}, notice: () => {} },
-      market: name,
-    });
+    const make = () =>
+      new Rebalancer({
+        settings,
+        sender,
+        chain,
+        journalPath: join(ROOT, `${name}-out.json`),
+        inJournalPath: join(ROOT, `${name}-in.json`),
+        flowTimings: { landWaitMs: 0 },
+        ledger,
+        fence: new FlowFence(),
+        clock,
+        voice: { alert: () => {}, notice: () => {} },
+        market: name,
+      });
+    const rebalancer = make();
     return {
+      make,
+      clock,
+      inbound,
       rebalancer,
       ledger,
       balances,
@@ -164,6 +187,59 @@ describe("the rebalancer end to end", () => {
     await h.rebalancer.tick();
     expect(h.sender.open).toBeNull();
     expect(h.ledger.state.lastFlowId).toBeDefined();
+  });
+
+  const walletCredited = async (name: string) => {
+    const h = await build(name, { equity: 1_000n * USDC });
+    await h.rebalancer.tick();
+    await h.rebalancer.tick();
+    h.balances.solana = BigInt(h.sender.open?.amount ?? "0");
+    h.setStatus("wallet-credited");
+    return h;
+  };
+
+  it("deposits a wallet-credited transfer into the seat once and counts it once", async () => {
+    const h = await walletCredited("wallet");
+    const amount = h.balances.solana;
+    await h.rebalancer.tick();
+    expect(h.inbound.deposits).toBe(1);
+    expect(h.balances.rollup).toBe(0n);
+    expect(h.sender.open).toBeNull();
+    expect(h.ledger.state.dayStartEquity).toBe(3_000n * USDC);
+    expect(h.ledger.state.lastFlowId).toBeDefined();
+    await h.rebalancer.tick();
+    expect(h.inbound.deposits).toBe(1);
+    expect(amount).toBeGreaterThan(0n);
+  });
+
+  it("does not deposit again after a crash following the send", async () => {
+    const h = await walletCredited("crash");
+    h.inbound.dropAfterSend = true;
+    await h.rebalancer.tick();
+    expect(h.inbound.deposits).toBe(1);
+    expect(h.sender.open).not.toBeNull();
+
+    await h.make().tick();
+    expect(h.inbound.deposits).toBe(1);
+    expect(h.sender.open).toBeNull();
+    expect(h.ledger.state.lastFlowId).toBeDefined();
+  });
+
+  it("retries a failed deposit without counting the flow twice", async () => {
+    const h = await walletCredited("retry");
+    const before = h.ledger.state.lastFlowId;
+    h.inbound.failDeposit = true;
+    await h.rebalancer.tick();
+    expect(h.inbound.deposits).toBe(0);
+    expect(h.ledger.state.lastFlowId).toBe(before);
+    expect(h.sender.open).not.toBeNull();
+
+    h.inbound.failDeposit = false;
+    h.clock.advance(6 * 60_000);
+    await h.make().tick();
+    expect(h.inbound.deposits).toBe(1);
+    expect(h.sender.open).toBeNull();
+    expect(h.ledger.state.lastFlowId).not.toBe(before);
   });
 
   it("asks for nothing inside the dead zone", async () => {
