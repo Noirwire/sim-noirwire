@@ -48,7 +48,7 @@ interface MarketRuntime {
 }
 
 export interface MemoryVenueOptions {
-  /** The markets the venue lists; the standard three when absent. */
+  /** The markets the venue lists; every standard market when absent. */
   markets?: readonly MarketConfig[];
   clock?: Clock;
   insuranceSeedBalance?: bigint;

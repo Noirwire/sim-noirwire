@@ -163,9 +163,12 @@ export const loadDeployment = (
 
 /**
  * The symbols a deployment may give a market of this service: a test
- * network's own, and the mainnet profile's SOL perpetual.
+ * network's own, and the mainnet profile's SOL and BTC perpetuals.
  */
-const CHAIN_SYMBOLS_OF: Record<string, string[]> = { "NSOL-PERP": ["NSOL-PERP", "SOL-PERP"] };
+const CHAIN_SYMBOLS_OF: Record<string, string[]> = {
+  "NSOL-PERP": ["NSOL-PERP", "SOL-PERP"],
+  "NBTC-PERP": ["NBTC-PERP", "BTC-PERP"],
+};
 
 const findDeployedMarket = (
   deployment: Deployment,

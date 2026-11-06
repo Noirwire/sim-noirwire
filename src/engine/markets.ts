@@ -54,6 +54,19 @@ export const MARKETS: readonly MarketConfig[] = [
     takerFeeBps: 5,
     maxStalePriceMs: 30_000,
   },
+  {
+    id: "NBTC-PERP",
+    kind: "perp",
+    base: "BTC",
+    quote: "nUSD",
+    tickSize: 1_000_000n,
+    lotSize: 100n,
+    initialMarginBps: 1_000,
+    maintenanceMarginBps: 500,
+    liquidationPenaltyBps: 100,
+    takerFeeBps: 5,
+    maxStalePriceMs: 30_000,
+  },
 ];
 
 export const MARKET_IDS = MARKETS.map((market) => market.id) as [MarketId, ...MarketId[]];

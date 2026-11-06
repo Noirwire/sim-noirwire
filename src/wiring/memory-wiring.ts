@@ -2,6 +2,7 @@ import { withBotTracking } from "../bots/instrumented-venue.js";
 import type { Config } from "../config/config.js";
 import { MARKETS } from "../engine/markets.js";
 import { MemoryVenue } from "../engine/memory-venue.js";
+import { isPricedByMints } from "../prices/mints.js";
 import { type PublicData, type VenueWiring, recordAndBroadcastFill } from "./venue-wiring.js";
 
 const MAKER_LEVEL_LOTS = 5n;
@@ -10,7 +11,9 @@ const TAKER_MAX_LOTS = 20n;
 
 /** Nothing here leaves the process, so there is nothing to rest: it is always awake. */
 export const memoryWiring = (config: Config, data: PublicData): VenueWiring => {
+  const markets = MARKETS.filter(({ id }) => isPricedByMints(id));
   const venue = new MemoryVenue({
+    markets,
     insuranceSeedBalance: config.INSURANCE_SEED_NUSD,
     maxFundingRateBpsPerUpdate: config.MAX_FUNDING_RATE_BPS_PER_UPDATE,
   });
@@ -19,7 +22,7 @@ export const memoryWiring = (config: Config, data: PublicData): VenueWiring => {
     venue,
     botVenue: withBotTracking(venue, data.stats),
     rollupRoutes: {},
-    botMarkets: MARKETS,
+    botMarkets: markets,
     prepare: async () => {},
     resume: async () => {},
     rest: async () => {},
