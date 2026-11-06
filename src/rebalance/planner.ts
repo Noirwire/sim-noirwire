@@ -25,6 +25,8 @@ export interface PlannerSettings {
   stepAtoms: bigint;
   /** The most one request may ask for, in quote atoms. */
   maxRequestAtoms: bigint;
+  /** The band math never sees a requirement below this, in quote atoms. */
+  minRequirementAtoms: bigint;
 }
 
 export type Direction = "out" | "in";
@@ -56,21 +58,22 @@ export const planRebalance = (
   settings: PlannerSettings,
 ): RebalancePlan | null => {
   if (requirement <= 0n) return null;
-  const { bands, stepAtoms, maxRequestAtoms } = settings;
+  const { bands, stepAtoms, maxRequestAtoms, minRequirementAtoms } = settings;
   const cap = roundDown(maxRequestAtoms, stepAtoms);
   const { equity, collateral, withdrawable } = reading;
-  const target = (BigInt(bands.targetBps) * requirement) / BPS;
-  if (equity * BPS < BigInt(bands.lowBps) * requirement) {
+  const bandBase = requirement > minRequirementAtoms ? requirement : minRequirementAtoms;
+  const target = (BigInt(bands.targetBps) * bandBase) / BPS;
+  if (equity * BPS < BigInt(bands.lowBps) * bandBase) {
     const wanted = roundUp(target - equity, stepAtoms);
     const amount = wanted > cap ? cap : wanted;
     if (amount < stepAtoms) return null;
     return {
       direction: "in",
       amount,
-      urgent: equity * BPS < BigInt(bands.urgentBps) * requirement,
+      urgent: equity * BPS < BigInt(bands.urgentBps) * bandBase,
     };
   }
-  if (equity * BPS > BigInt(bands.surplusBps) * requirement) {
+  if (equity * BPS > BigInt(bands.surplusBps) * bandBase) {
     const keepCollateral = (requirement * COLLATERAL_KEPT_TENTHS + 9n) / 10n;
     const limits = [equity - target, collateral - keepCollateral, withdrawable];
     const spare = limits.reduce((least, limit) => (limit < least ? limit : least));

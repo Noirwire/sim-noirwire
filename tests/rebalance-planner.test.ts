@@ -12,6 +12,7 @@ const settings: PlannerSettings = {
   bands: DEFAULT_BANDS,
   stepAtoms: 25n * USDC,
   maxRequestAtoms: 500n * USDC,
+  minRequirementAtoms: 0n,
 };
 
 /** A seat with this equity (as bps of R), all of it collateral. */
@@ -84,6 +85,37 @@ describe("the rebalance planner", () => {
 
   it("offers nothing when less than a step is spare", () => {
     expect(planRebalance({ ...at(40_000n), withdrawable: 24n * USDC }, R, settings)).toBeNull();
+  });
+
+  it("ignores small PnL swings when the requirement is tiny", () => {
+    const floored = { ...settings, minRequirementAtoms: 1_000n * USDC };
+    const tiny = 5n * USDC;
+    for (const equity of [2_199n * USDC, 2_200n * USDC, 2_201n * USDC]) {
+      const reading = { collateral: equity, equity, initialMargin: 0n, withdrawable: equity };
+      expect(planRebalance(reading, tiny, floored)).toBeNull();
+    }
+    expect(planRebalance(at(22_000n), tiny, settings)).not.toBeNull();
+  });
+
+  it("behaves as before when the requirement is above the floor", () => {
+    const floored = { ...settings, minRequirementAtoms: 1_000n * USDC };
+    const big = 4_000n * USDC;
+    for (const bps of [5_000n, 11_999n, 14_999n, 22_000n, 35_001n, 90_000n]) {
+      const equity = (bps * big) / 10_000n;
+      const reading = { collateral: equity, equity, initialMargin: 0n, withdrawable: equity };
+      expect(planRebalance(reading, big, floored)).toEqual(planRebalance(reading, big, settings));
+    }
+  });
+
+  it("keeps the real requirement for the collateral guard", () => {
+    const floored = { ...settings, minRequirementAtoms: 1_000n * USDC };
+    const reading = {
+      collateral: 6n * USDC,
+      equity: 4_000n * USDC,
+      initialMargin: 0n,
+      withdrawable: 4_000n * USDC,
+    };
+    expect(planRebalance(reading, 5n * USDC, floored)).toBeNull();
   });
 
   it("does nothing without a requirement", () => {

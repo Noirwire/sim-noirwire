@@ -113,6 +113,8 @@ const envSchema = z.object({
   REBALANCE_STEP_USDC: decimalAmount("25"),
   /** The most one request may ask for, in USDC. */
   REBALANCE_MAX_REQUEST_USDC: decimalAmount("500"),
+  /** The band math treats the margin requirement as at least this many USDC. */
+  REBALANCE_MIN_REQUIREMENT_USDC: decimalAmount("100"),
   /** Equity over the margin requirement, in bps: below urgent a request goes out at once, below low it asks for more, above surplus it sends out. */
   REBALANCE_URGENT_BPS: positiveInt(12_000),
   REBALANCE_LOW_BPS: positiveInt(15_000),

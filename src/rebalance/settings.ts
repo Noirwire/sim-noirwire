@@ -53,6 +53,7 @@ export const rebalanceSettings = (config: Config): RebalanceSettings | null => {
       bands,
       stepAtoms: config.REBALANCE_STEP_USDC,
       maxRequestAtoms: config.REBALANCE_MAX_REQUEST_USDC,
+      minRequirementAtoms: config.REBALANCE_MIN_REQUIREMENT_USDC,
     },
     cooldownMs: config.REBALANCE_COOLDOWN_MS,
     checkMs: config.REBALANCE_CHECK_MS,

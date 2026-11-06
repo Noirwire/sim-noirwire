@@ -485,6 +485,7 @@ start with any `REBALANCE_*` variable set.
   above `REBALANCE_SURPLUS_BPS` it offers the excess out. Amounts are whole multiples of
   `REBALANCE_STEP_USDC` and at most `REBALANCE_MAX_REQUEST_USDC`. Only collateral can leave, never
   unrealized profit, and equity must stay at initial margin.
+- **Requirement floor.** `REBALANCE_MIN_REQUIREMENT_USDC` (default 100) is the least requirement the bands are measured against, so a tiny requirement at high leverage does not trigger back-and-forth requests.
 - **What it sends.** `POST $REBALANCE_URL/v1/rebalance/requests` with
   `Authorization: Bearer $REBALANCE_TOKEN` and the body
   `{requestId, direction, amount, requestedAt, validUntil, seq}`. Never a position, equity, ratio
