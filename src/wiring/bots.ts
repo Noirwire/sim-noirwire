@@ -19,9 +19,10 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
 import { PublicKey } from "@solana/web3.js";
 import {
+  REFERENCE_MARKETS,
   ReferencePrice,
   type ReadPythAccount,
-  SOL_USD_FEED_ID,
+  type ReferenceMarket,
   referenceSources,
 } from "../prices/reference-price.js";
 import { connectionTo } from "../rollup/connections.js";
@@ -35,8 +36,6 @@ const MAKER_QUOTE_PER_POSITION_LIMIT = 4n;
 const SPOT_MAKER_BASE_PER_TAKER_BASE = 10n;
 /** The funding updater decides by its own clock whether an update is due; this is how often it looks. */
 const FUNDING_CHECK_AT_MOST_EVERY_MS = 5_000;
-/** The market whose price the reference sources give. */
-const REFERENCE_BASE_TOKEN = "SOL";
 /** A read of the venue's markets, or of the keeper's heartbeat file, that takes longer than this counts as failed. */
 const MARKETS_READ_DEADLINE_MS = 10_000;
 const MARKET_NOT_READ_YET = "the market has not been read yet";
@@ -123,20 +122,25 @@ const hedgeController = (
   });
 };
 
-/** The risk rules for one maker. They know the SOL price only, so they cover SOL perpetuals only. */
+/** The reference price of a perpetual whose base asset this service has one for. */
+export const referenceMarketOf = (market: MarketConfig): ReferenceMarket | undefined =>
+  market.kind === "perp" ? REFERENCE_MARKETS[market.base] : undefined;
+
+/** The risk rules for one maker. They need a reference price, which this service has for the perpetuals of `REFERENCE_MARKETS` only. */
 const makerSafety = (
   market: MarketConfig,
   ledger: MakerLedger,
-  reference: ReferencePrice,
+  reference: ReferencePrice | undefined,
   control: MakerControl,
   problems: BotProblems,
   keeper: KeeperHeartbeat,
   hedge?: HedgeGate,
 ): MakerSafety => {
-  if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
+  if (!reference) {
     throw new Error(
       `HOUSE_MAKER_RISK_RULES cannot cover ${market.id}: the risk rules need a reference price, ` +
-        "and this service has one for SOL perpetuals only. Leave the market out of the deployment.",
+        `and this service has one for ${Object.keys(REFERENCE_MARKETS).join(" and ")} perpetuals only. ` +
+        "Leave the market out of the deployment.",
     );
   }
   const voice = makerVoice(problems);
@@ -239,9 +243,9 @@ export interface OpenedBots {
  * separate from opening so that the loops can be stopped and started again
  * without opening anything twice. Opening is safe to repeat after a failure.
  */
-/** Reads Pyth's SOL/USD price account over the service's own Solana RPC address. */
-const pythAccountReader = (solanaRpcUrl: string | undefined): ReadPythAccount => {
-  const account = new PublicKey(pythPriceAccountOf(SOL_USD_FEED_ID));
+/** Reads the Pyth price account of `feedId` over the service's own Solana RPC address. */
+const pythAccountReader = (solanaRpcUrl: string | undefined, feedId: string): ReadPythAccount => {
+  const account = new PublicKey(pythPriceAccountOf(feedId));
   const connection = solanaRpcUrl ? connectionTo(solanaRpcUrl) : null;
   return async () => {
     if (!connection)
@@ -268,9 +272,26 @@ export const openBots = async (
       "the hedge couples to the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
     );
   }
-  const reference = rules
-    ? new ReferencePrice(referenceSources(pythAccountReader(config.SOLANA_RPC_URL)), systemClock)
-    : null;
+  const references = new Map<ReferenceMarket, ReferencePrice>();
+  /** One reference price per asset, shared by every maker of it so its sources are called once. */
+  const referenceFor = (market: MarketConfig): ReferencePrice | undefined => {
+    const asset = rules ? referenceMarketOf(market) : undefined;
+    if (!asset) return undefined;
+    let reference = references.get(asset);
+    if (!reference) {
+      reference = new ReferencePrice(
+        referenceSources(
+          pythAccountReader(config.SOLANA_RPC_URL, asset.feedId),
+          undefined,
+          undefined,
+          asset,
+        ),
+        systemClock,
+      );
+      references.set(asset, reference);
+    }
+    return reference;
+  };
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)
@@ -306,6 +327,7 @@ export const openBots = async (
         null,
       );
     }
+    const reference = referenceFor(market);
     const hedge =
       config.HEDGE_ENABLED && reference && ledger
         ? hedgeController(config, market, ledger, reference, botVenue, hedgeVenue, problems)
@@ -313,7 +335,7 @@ export const openBots = async (
     if (ledger) ledgers.push({ market: market.id, ledger });
     if (hedge) hedges.push({ market: market.id, controller: hedge });
     const safety =
-      reference && ledger
+      rules && ledger
         ? makerSafety(market, ledger, reference, control, problems, keeper, hedge)
         : undefined;
     const maker = houseMaker(config, market, sizes, { safety, ledger, afterRequote });

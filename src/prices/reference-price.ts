@@ -43,6 +43,36 @@ export class SourceRefused extends Error {}
 
 /** The SOL/USD feed id of Pyth, as hex. The price account must carry this id. */
 export const SOL_USD_FEED_ID = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+/** The BTC/USD feed id of Pyth, as hex. */
+export const BTC_USD_FEED_ID = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+
+/** Where one asset's reference price comes from: its Pyth feed and its pair on each exchange. */
+export interface ReferenceMarket {
+  feedId: string;
+  coinbasePair: string;
+  krakenPair: string;
+  okxPair: string;
+}
+
+export const SOL_REFERENCE: ReferenceMarket = {
+  feedId: SOL_USD_FEED_ID,
+  coinbasePair: "SOL-USD",
+  krakenPair: "SOLUSD",
+  okxPair: "SOL-USDC",
+};
+
+export const BTC_REFERENCE: ReferenceMarket = {
+  feedId: BTC_USD_FEED_ID,
+  coinbasePair: "BTC-USD",
+  krakenPair: "XBTUSD",
+  okxPair: "BTC-USDC",
+};
+
+/** The assets this service has a reference price for, by the base token of the market. */
+export const REFERENCE_MARKETS: Readonly<Record<string, ReferenceMarket>> = {
+  SOL: SOL_REFERENCE,
+  BTC: BTC_REFERENCE,
+};
 const MS_PER_SECOND = 1_000;
 /**
  * How often each source is called, however often the price is asked for. The
@@ -66,8 +96,11 @@ const PYTH_AUTHORITY_END = 8 + 32;
 const PYTH_FULL_TAG = 1;
 const PYTH_MESSAGE_LEN = 32 + 8 + 8 + 4 + 8;
 
-/** The oracle reading in a Pyth price account, or the reason it is not to be believed. */
-export const readPythAccount = (data: Uint8Array): PriceReading => {
+/** The oracle reading in a Pyth price account of the feed `feedId` (SOL/USD unless given), or the reason it is not to be believed. */
+export const readPythAccount = (
+  data: Uint8Array,
+  feedId: string = SOL_USD_FEED_ID,
+): PriceReading => {
   const refused = (why: string): SourceRefused =>
     new SourceRefused(`the Pyth price account ${why}`);
   if (data.length <= PYTH_AUTHORITY_END) throw refused("is too short to read");
@@ -77,7 +110,11 @@ export const readPythAccount = (data: Uint8Array): PriceReading => {
   if (data.length < start + PYTH_MESSAGE_LEN) throw refused("is too short to read");
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const feed = Buffer.from(data.subarray(start, start + 32)).toString("hex");
-  if (feed !== SOL_USD_FEED_ID) throw refused("is not the SOL/USD feed");
+  if (feed !== feedId) {
+    throw refused(
+      feedId === SOL_USD_FEED_ID ? "is not the SOL/USD feed" : `is not the feed ${feedId}`,
+    );
+  }
   const price = view.getBigInt64(start + 32, true);
   const expo = view.getInt32(start + 32 + 8 + 8, true);
   const publishTime = view.getBigInt64(start + 32 + 8 + 8 + 4, true);
@@ -139,6 +176,7 @@ export const referenceSources = (
   readAccount: ReadPythAccount,
   getJson: FetchJson = fetchJson,
   nowMs: () => number = Date.now,
+  market: ReferenceMarket = SOL_REFERENCE,
 ): ReferenceSource[] => [
   {
     name: "Pyth",
@@ -147,7 +185,7 @@ export const referenceSources = (
     read: async () => {
       const data = await readAccount();
       if (!data) throw new SourceRefused("the Pyth price account does not exist");
-      return readPythAccount(data);
+      return readPythAccount(data, market.feedId);
     },
   },
   {
@@ -156,7 +194,7 @@ export const referenceSources = (
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = coinbaseBody.parse(
-        await getJson("https://api.exchange.coinbase.com/products/SOL-USD/ticker"),
+        await getJson(`https://api.exchange.coinbase.com/products/${market.coinbasePair}/ticker`),
       );
       const price = midpoint(body.bid, body.ask);
       return { source: "Coinbase", exchange: true, price, atMs: nowMs() };
@@ -168,7 +206,7 @@ export const referenceSources = (
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = krakenBody.parse(
-        await getJson("https://api.kraken.com/0/public/Ticker?pair=SOLUSD"),
+        await getJson(`https://api.kraken.com/0/public/Ticker?pair=${market.krakenPair}`),
       );
       if (body.error.length > 0) throw new Error(body.error.join(", "));
       const ticker = krakenTicker.safeParse(Object.values(body.result)[0]);
@@ -183,7 +221,7 @@ export const referenceSources = (
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = okxBody.parse(
-        await getJson("https://www.okx.com/api/v5/market/ticker?instId=SOL-USDC"),
+        await getJson(`https://www.okx.com/api/v5/market/ticker?instId=${market.okxPair}`),
       );
       return {
         source: "OKX",
