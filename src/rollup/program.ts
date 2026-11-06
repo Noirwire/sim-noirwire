@@ -482,6 +482,37 @@ export class Program {
     return sendDepositAndConfirm(connection, transaction);
   }
 
+  /** The account that holds `owner`'s balance of `mint` in the rollup. */
+  ownerTokenAccount(owner: PublicKey, token: CustodyTokenRef): PublicKey {
+    return associatedTokenAddress(owner, custodyTokenOf(token).mint);
+  }
+
+  /**
+   * Withdraws `amount` of the owner's seat collateral into the owner's own token balance in the
+   * rollup. Only the owner can sign it. `riskMarkets` are the markets the seat holds something on.
+   */
+  async withdrawCollateral(
+    connection: Connection,
+    owner: Keypair,
+    token: CustodyTokenRef,
+    amount: bigint,
+    riskMarkets: number[],
+  ): Promise<string> {
+    const latest = await connection.getLatestBlockhash("confirmed");
+    const transaction = new Transaction({ feePayer: owner.publicKey, ...latest }).add(
+      this.instructions.withdraw(
+        owner.publicKey,
+        this.ownerTokenAccount(owner.publicKey, token),
+        custodyTokenOf(token),
+        { collateral: true },
+        amount,
+        riskMarkets,
+      ),
+    );
+    transaction.sign(owner);
+    return sendDepositAndConfirm(connection, transaction);
+  }
+
   private depositInstruction(
     faucet: PublicKey,
     token: CustodyTokenRef,
