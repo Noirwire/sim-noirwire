@@ -75,6 +75,7 @@ export class MakerRisk {
     private readonly clock: Clock,
     private readonly market: string,
     private readonly voice: MakerVoice,
+    private readonly fence?: { readonly active: boolean },
   ) {}
 
   get mode(): MakerMode {
@@ -134,6 +135,7 @@ export class MakerRisk {
    * so the turn of the day does not forgive the loss that started it.
    */
   async check(equity: bigint, position: bigint, blind = false): Promise<void> {
+    if (this.fence?.active) return;
     const nowMs = this.clock.nowMs();
     const today = utcDay(nowMs);
     const before = this.ledger.state;

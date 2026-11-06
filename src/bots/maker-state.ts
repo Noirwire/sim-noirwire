@@ -58,6 +58,8 @@ export interface MakerState {
   hold: UnresolvedHold | null;
   /** Ladders in a row dropped because their orders never ran, kept so a restart does not start the count over. */
   unrunLadders: number;
+  /** The newest collateral transfer already counted in the loss limits' equity, so a restart never counts it twice. */
+  lastFlowId?: string;
 }
 
 const amount = z
@@ -78,6 +80,7 @@ const fileSchema = z.object({
   hold: holdSchema.nullable().default(null),
   /** A missing or invalid count reads as none: it never blocks a start. */
   unrunLadders: z.number().int().min(0).catch(0),
+  lastFlowId: z.string().optional(),
   /** Whether the saved stop was asked for. A file from before the field counts a saved stop as asked for. */
   hardStop: z.boolean().optional(),
 });
