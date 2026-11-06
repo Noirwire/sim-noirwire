@@ -6,6 +6,8 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Fill, MarketId, TraderKey, Venue } from "../engine/types.js";
 import type { RollupRoutes } from "../http/context.js";
 import type { Hub } from "../http/hub.js";
+import type { RebalanceChain } from "../rebalance/rebalancer.js";
+import type { RebalanceSettings } from "../rebalance/settings.js";
 
 export interface PublicData {
   tape: TapeStore;
@@ -41,6 +43,15 @@ export interface VenueWiring {
   rest(): Promise<void>;
   botSizes(market: MarketConfig): Promise<BotSizes>;
   liquidationTargets(): TraderKey[];
+  /**
+   * The maker's chain side of a collateral transfer out, for a venue that has a real book to
+   * withdraw from. Absent otherwise.
+   */
+  rebalanceChain?(
+    market: MarketConfig,
+    settings: RebalanceSettings,
+    ladderNotional: bigint,
+  ): RebalanceChain;
   /** Runs once every maker is open and funded, before the first bot tick. */
   afterMakersOpen(): Promise<void>;
   /**

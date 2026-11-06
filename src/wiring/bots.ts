@@ -27,7 +27,11 @@ import {
 } from "../prices/reference-price.js";
 import { connectionTo } from "../rollup/connections.js";
 import { pythPriceAccountOf } from "../rollup/program.js";
+import { FlowFence } from "../rebalance/flow-adjust.js";
+import type { Rebalancer } from "../rebalance/rebalancer.js";
+import { rebalanceSettings } from "../rebalance/settings.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
+import { openRebalancer } from "./rebalancing.js";
 import { KeeperHeartbeat } from "./keeper-heartbeat.js";
 import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
@@ -135,6 +139,7 @@ const makerSafety = (
   problems: BotProblems,
   keeper: KeeperHeartbeat,
   hedge?: HedgeGate,
+  fence?: FlowFence,
 ): MakerSafety => {
   if (!reference) {
     throw new Error(
@@ -146,7 +151,7 @@ const makerSafety = (
   const voice = makerVoice(problems);
   return new MakerSafety({
     reference,
-    risk: new MakerRisk(ledger, systemClock, market.id, voice),
+    risk: new MakerRisk(ledger, systemClock, market.id, voice, fence),
     control,
     clock: systemClock,
     voice,
@@ -266,6 +271,8 @@ export const openBots = async (
   const takers: NoiseTaker[] = [];
   const hedges: { market: string; controller: HedgeController }[] = [];
   const ledgers: { market: string; ledger: MakerLedger }[] = [];
+  const rebalancers: { market: string; rebalancer: Rebalancer }[] = [];
+  const rebalance = rebalanceSettings(config);
   const rules = config.HOUSE_MAKER_RISK_RULES;
   if (config.HEDGE_ENABLED && !rules) {
     throw new HedgeNotAvailable(
@@ -334,10 +341,25 @@ export const openBots = async (
         : undefined;
     if (ledger) ledgers.push({ market: market.id, ledger });
     if (hedge) hedges.push({ market: market.id, controller: hedge });
+    const fence = rebalance && ledger && market.kind === "perp" ? new FlowFence() : undefined;
     const safety =
       rules && ledger
-        ? makerSafety(market, ledger, reference, control, problems, keeper, hedge)
+        ? makerSafety(market, ledger, reference, control, problems, keeper, hedge, fence)
         : undefined;
+    if (rebalance && ledger && fence) {
+      rebalancers.push({
+        market: market.id,
+        rebalancer: await openRebalancer(
+          config,
+          rebalance,
+          wiring,
+          market,
+          ledger,
+          fence,
+          makerVoice(problems),
+        ),
+      });
+    }
     const maker = houseMaker(config, market, sizes, { safety, ledger, afterRequote });
     await maker.ensureOpen(botVenue);
     makers.push(maker);
@@ -406,6 +428,9 @@ export const openBots = async (
       ),
       ...hedges.map(({ market, controller }) =>
         loop(`${market} hedge tick`, config.HOUSE_MAKER_TICK_MS, () => controller.tick()),
+      ),
+      ...rebalancers.map(({ market, rebalancer }) =>
+        loop(`${market} rebalance`, rebalance?.checkMs ?? 30_000, () => rebalancer.tick()),
       ),
       ...takers.map((taker, at) =>
         loop(`${botMarkets[at].id} taker tick`, config.NOISE_TAKER_TICK_MS, () =>

@@ -39,6 +39,8 @@ import { Session, connectionTo } from "./connections.js";
 import { FundDesk } from "./fund-desk.js";
 import { Generation } from "./generation.js";
 import { noteMakerQuote } from "./maker-quotes.js";
+import { marginOfNotional, marginReadingOf } from "../rebalance/free-collateral.js";
+import type { SeatReading } from "../rebalance/rebalancer.js";
 import { OpenDesk } from "./open-desk.js";
 import {
   FIRST_TRADER_SEAT,
@@ -563,6 +565,33 @@ export class RollupVenue implements Venue {
     const view = await this.whileAwake(async () => (await this.bots.trader(trader)).view());
     const { tokens } = this.options.settings.deployment;
     return traderStateOf(trader, view, this.followed.values(), tokens);
+  }
+
+  /**
+   * The trader's seat as the margin rules count it, with the requirement the rebalancing bands are
+   * measured against: the larger of its initial margin now and that of a full ladder of
+   * `ladderNotional` on `market`. Null while a market it holds something on has no mark.
+   */
+  async rebalanceReading(
+    trader: TraderKey,
+    market: MarketId,
+    ladderNotional: bigint,
+  ): Promise<SeatReading | null> {
+    const view = await this.whileAwake(async () => (await this.bots.trader(trader)).view());
+    const reading = marginReadingOf(view, this.followed.values());
+    if (!reading) return null;
+    const ladder = marginOfNotional(ladderNotional, this.market(market).chain.initialMarginBps);
+    return {
+      ...reading,
+      requirement: reading.initialMargin > ladder ? reading.initialMargin : ladder,
+    };
+  }
+
+  /** The chain ids of the perpetuals, which a withdrawal's margin check looks at. */
+  perpMarketIds(): number[] {
+    return [...this.followed.values()]
+      .filter(({ chain }) => chain.kind === "perp")
+      .map(({ chain }) => chain.marketId);
   }
 
   /** Invariant: nothing to do on request. The program's own schedule advances funding. */

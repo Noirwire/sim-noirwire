@@ -472,6 +472,36 @@ interface, supplied separately and kept out of this repository.
   shrinks. At the hard stop it trades nothing and logs an `ALERT` that the hedge position is
   left as it is and is unmanaged: close it by hand on the venue if it should not stay open.
 
+### Collateral rebalancing
+
+The maker's positions are private, so the maker itself says when it holds more collateral than it
+needs or too little. It is **off unless `REBALANCE_URL` is set**; with it unset nothing here runs
+and the maker behaves exactly as before. It needs `VENUE=rollup`, and `NETWORK=mainnet` refuses to
+start with any `REBALANCE_*` variable set.
+
+- **What it watches.** Equity over the larger of the initial margin now (resting orders included)
+  and the margin of its full ladder, in bps. Below `REBALANCE_LOW_BPS` it asks for collateral in,
+  up to `REBALANCE_TARGET_BPS`; below `REBALANCE_URGENT_BPS` it does not wait out the cooldown;
+  above `REBALANCE_SURPLUS_BPS` it offers the excess out. Amounts are whole multiples of
+  `REBALANCE_STEP_USDC` and at most `REBALANCE_MAX_REQUEST_USDC`. Only collateral can leave, never
+  unrealized profit, and equity must stay at initial margin.
+- **What it sends.** `POST $REBALANCE_URL/v1/rebalance/requests` with
+  `Authorization: Bearer $REBALANCE_TOKEN` and the body
+  `{requestId, direction, amount, requestedAt, validUntil, seq}`. Never a position, equity, ratio
+  or fill. The counter and the open request are saved with a sync before sending, so a restart
+  resends the same request under the same id. One request is open at a time. `202` accepts, `409`
+  and `422` end the request and the maker backs off.
+- **Transfer out.** When the bridge accepts, the maker withdraws from the book with its owner key,
+  carries the amount back to Solana, and sends exactly that amount to `REBALANCE_BRIDGE_ATA`. Each
+  step is saved before it is sent; after a restart a step is judged by the balances it moves and
+  is sent again only after five minutes without a sign of landing. It then posts
+  `/v1/rebalance/requests/{id}/funded` with the transaction signature.
+- **Transfer in.** The bridge deposits for the maker. The maker polls
+  `GET /v1/rebalance/requests/{id}` and counts the amount once the answer's `state` is `credited`.
+- **Loss limits.** A transfer moves equity without a gain or loss, so the day-start and peak
+  equity are shifted by each completed amount, once per request, and the loss check waits while a
+  withdrawal is landing.
+
 ### Awake and asleep
 
 A hosted rollup endpoint rate-limits a client that never stops asking, so with

@@ -20,6 +20,8 @@ import type { FundRequests } from "../rollup/fund-desk.js";
 import { requireMainnetDeployment } from "../rollup/mainnet-deployment.js";
 import type { OpenDesk, OpenRequest } from "../rollup/open-desk.js";
 import { Program } from "../rollup/program.js";
+import { rebalanceChain } from "../rollup/rebalance-chain.js";
+import { COLLATERAL_TOKEN, deployedToken } from "../rollup/tokens.js";
 import { type Readiness, RollupVenue } from "../rollup/rollup-venue.js";
 import { deployedMarkets, loadDeployment, loadRollupSettings } from "../rollup/settings.js";
 import { UserOrderCount } from "./user-order-count.js";
@@ -328,6 +330,28 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     },
     botSizes,
     liquidationTargets: () => connected().nextLiquidationTargets(config.LIQUIDATOR_SEATS_PER_TICK),
+    rebalanceChain: (market, rebalance, ladderNotional) => {
+      const at = markets.findIndex(({ id }) => id === market.id);
+      const owner = settings.botOwners[at];
+      const token = deployedToken(settings.deployment, COLLATERAL_TOKEN);
+      if (at < 0 || !owner || !token) {
+        throw new Error(
+          `there is no seat owner or collateral token to rebalance ${market.id} with`,
+        );
+      }
+      return rebalanceChain({
+        program: new Program(settings.deployment.programId),
+        rollupRpcUrl: settings.rollupRpcUrl,
+        solanaRpcUrl: settings.solanaRpcUrl,
+        owner,
+        token,
+        bridgeAta: rebalance.bridgeAta,
+        validator: rebalance.validator,
+        readSeat: () =>
+          connected().rebalanceReading(makerTraderKey(market.id), market.id, ladderNotional),
+        riskMarkets: () => connected().perpMarketIds(),
+      });
+    },
     afterMakersOpen: openTheOtherBots,
     needsFundingUpdater: false,
     snapshotExtras: () => ({
