@@ -7,6 +7,7 @@ import { FundLedger } from "../src/data/fund-ledger.js";
 import { StatsTracker } from "../src/data/stats.js";
 import { TapeStore } from "../src/data/tape-store.js";
 import { ManualClock } from "../src/engine/clock.js";
+import { MARKETS } from "../src/engine/markets.js";
 import { MemoryVenue } from "../src/engine/memory-venue.js";
 import type { AppContext } from "../src/http/context.js";
 import { Hub } from "../src/http/hub.js";
@@ -67,11 +68,9 @@ describe("the market data on mainnet", () => {
     expect(markets.simulated).toBe(false);
     expect(tape.simulated).toBe(false);
     expect(candles.simulated).toBe(false);
-    expect(markets.markets.map((market: { quote: string }) => market.quote)).toEqual([
-      "USDC",
-      "USDC",
-      "USDC",
-    ]);
+    expect(markets.markets.map((market: { quote: string }) => market.quote)).toEqual(
+      MARKETS.map(() => "USDC"),
+    );
   });
 
   it("stays labelled simulated, with the test dollar, off mainnet", async () => {

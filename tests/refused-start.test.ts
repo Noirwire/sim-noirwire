@@ -13,7 +13,8 @@ import type { PriceSource } from "../src/prices/price-source.js";
 const NGINX_403 =
   "<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>";
 
-const BOT_COUNT = 10;
+/** A maker per market, then the takers and the liquidator. */
+const BOT_COUNT = MARKETS.length + 7;
 const DATA_DIR = join("data-test", `refused-${Date.now()}`);
 
 /** A price source that never fetches anything. */
