@@ -17,6 +17,11 @@ export const MAKER_LIMITS = {
   maxSourceAgeMs: 10_000,
   /** The oracle price, pushed on chain every few seconds, gets longer: it is 3 to 12 s old when read. */
   maxOracleAgeMs: 30_000,
+  /**
+   * The same limit off mainnet. Pyth's sponsored devnet account is pushed only every five minutes
+   * or so, and the exchange's test markets accept a mark up to seven minutes old.
+   */
+  testOracleAgeMs: 420_000,
   /** Sources further apart than this (highest to lowest, against the median) pull the quotes. */
   maxSourceDisagreementBps: 30,
   /** Large exchanges that must answer, besides the oracle. */

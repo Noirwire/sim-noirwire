@@ -531,7 +531,7 @@ class World {
     if (this.feed.mode === "hang") {
       await new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 3_000));
     }
-    const age = this.feed.mode === "stale" ? 60_000 : 1_000;
+    const age = this.feed.mode === "stale" ? 600_000 : 1_000;
     if (host === SOLANA_HOST) {
       const { id } = JSON.parse(String(init?.body)) as { id: string };
       const answer = { ...pythAccountAnswer(this.feed.price, Date.now() - age), id };

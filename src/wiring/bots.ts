@@ -5,6 +5,7 @@ import { HedgeController, type HedgeGate } from "../hedge/hedge-controller.js";
 import type { HedgeVenue } from "../hedge/hedge-venue.js";
 import { UnknownOrderStore, hedgeOrderPath } from "../hedge/unknown-order-store.js";
 import { healthPing } from "../bots/health-ping.js";
+import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import { HouseMaker } from "../bots/house-maker.js";
 import { Liquidator } from "../bots/liquidator.js";
 import { MakerControl, controlPath } from "../bots/maker-control.js";
@@ -294,6 +295,8 @@ export const openBots = async (
           asset,
         ),
         systemClock,
+        undefined,
+        isMainnet(config) ? MAKER_LIMITS.maxOracleAgeMs : MAKER_LIMITS.testOracleAgeMs,
       );
       references.set(asset, reference);
     }

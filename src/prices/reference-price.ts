@@ -255,6 +255,7 @@ export const referenceOf = (
   silent: string[],
   nowMs: number,
   refusals: string[] = [],
+  maxOracleAgeMs: number = MAKER_LIMITS.maxOracleAgeMs,
 ): Reference => {
   const exchanges = readings.filter((reading) => reading.exchange).length;
   const ageMs = (reading: PriceReading): number => Math.abs(nowMs - reading.atMs);
@@ -275,7 +276,7 @@ export const referenceOf = (
   const seconds = (reading: PriceReading): number =>
     Math.round((nowMs - reading.atMs) / MS_PER_SECOND);
   const staleOracle = readings.find(
-    (reading) => !reading.exchange && ageMs(reading) > MAKER_LIMITS.maxOracleAgeMs,
+    (reading) => !reading.exchange && ageMs(reading) > maxOracleAgeMs,
   );
   if (staleOracle) {
     return {
@@ -337,6 +338,7 @@ export class ReferencePrice {
     private readonly sources: ReferenceSource[],
     private readonly clock: Clock,
     private readonly monotonicMs: () => number = () => performance.now(),
+    private readonly maxOracleAgeMs: number = MAKER_LIMITS.maxOracleAgeMs,
   ) {}
 
   private readSource(source: ReferenceSource): Promise<PriceReading> {
@@ -360,6 +362,6 @@ export class ReferencePrice {
       else if (answer.reason instanceof SourceRefused) refusals.push(answer.reason.message);
       else silent.push(this.sources[at].name);
     });
-    return referenceOf(readings, silent, this.clock.nowMs(), refusals);
+    return referenceOf(readings, silent, this.clock.nowMs(), refusals, this.maxOracleAgeMs);
   }
 }

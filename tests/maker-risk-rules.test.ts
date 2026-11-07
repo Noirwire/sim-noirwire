@@ -445,6 +445,25 @@ describe("the reference price", () => {
       await expect(read).rejects.toThrow("the Pyth price account does not exist");
     });
 
+    it("may be up to seven minutes old off mainnet, where Pyth's devnet account is pushed every few minutes", () => {
+      const exchanges = [reading("Coinbase", 150, now), reading("Kraken", 150, now)];
+      const oracleAged = (seconds: number) =>
+        referenceOf(
+          [...exchanges, reading("Pyth", 150, now - seconds * 1_000, false)],
+          [],
+          now,
+          [],
+          MAKER_LIMITS.testOracleAgeMs,
+        );
+
+      expect(oracleAged(300).ok).toBe(true);
+      expect(oracleAged(420).ok).toBe(true);
+      expect(oracleAged(421)).toEqual({ ok: false, reason: "the Pyth price is 421 s old" });
+      expect(
+        referenceOf([...exchanges, reading("Pyth", 150, now - 300_000, false)], [], now).ok,
+      ).toBe(false);
+    });
+
     it("may be 29 s old, but not 31 s, while exchanges stay at 10 s", () => {
       const exchanges = [reading("Coinbase", 150, now), reading("Kraken", 150, now)];
       const oracleAged = (seconds: number) =>
