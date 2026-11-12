@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CandleSnapshotEntry } from "./candles.js";
+import type { StoredStats } from "./stats.js";
 
 export interface SnapshotData {
   savedAtMs: number;
@@ -10,6 +11,10 @@ export interface SnapshotData {
   fundedAddresses: string[];
   /** Per market, the last on-chain fill sequence already recorded into the candles. */
   tapeCursors?: Record<string, number>;
+  /** The public counters, saved with the tape cursors they are consistent with. */
+  stats?: StoredStats;
+  /** The chain's order count that is not users' (as a decimal string): what the user order count is measured from. */
+  userOrderBaseline?: string;
   /** Per bot owner address, where its one-time order keys stand. No secret: indices only. */
   orderKeyCheckpoints?: Record<string, { indices: number[]; nextIndex: number }>;
 }
