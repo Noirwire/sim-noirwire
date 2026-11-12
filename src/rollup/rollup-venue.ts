@@ -80,6 +80,8 @@ const NO_TAG = 0n;
 export interface RollupFill {
   fill: Fill;
   origin: FillOrigin;
+  /** Which sides of the fill were this service's own bots. */
+  botSides: { maker: boolean; taker: boolean };
   /** Already recorded by an earlier run of this service, or part of a warm-up: history, not news. */
   replayed: boolean;
 }
@@ -327,8 +329,13 @@ export class RollupVenue implements Venue {
     const alreadyRecorded =
       Number(chainFill.sequence) <= (this.options.recordedThrough[marketId] ?? NOTHING_READ);
     const fill = market.acceptFill(chainFill);
-    const origin = originOf(fillRoles(chainFill, this.secrets.of(marketId)));
-    this.options.handlers.onFill({ fill, origin, replayed: alreadyRecorded });
+    const botSides = fillRoles(chainFill, this.secrets.of(marketId));
+    this.options.handlers.onFill({
+      fill,
+      origin: originOf(botSides),
+      botSides,
+      replayed: alreadyRecorded,
+    });
     if (!alreadyRecorded) for (const listener of this.listeners) listener(fill);
   }
 

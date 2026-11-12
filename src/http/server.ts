@@ -13,6 +13,7 @@ import { registerOpenRoutes } from "./routes/open-rollup.js";
 import { registerDeploymentRoute } from "./routes/deployment.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerMarketsRoute } from "./routes/markets.js";
+import { registerQuestRoutes } from "./routes/quests.js";
 import { registerStatsRoute } from "./routes/stats.js";
 import { registerStreamRoute } from "./routes/stream.js";
 import { registerTapeRoute } from "./routes/tape.js";
@@ -71,6 +72,7 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
   registerTapeRoute(app, ctx);
   registerCandlesRoute(app, ctx);
   registerStatsRoute(app, ctx);
+  if (ctx.quests) registerQuestRoutes(app, ctx.quests);
   if (mainnet) {
     if (ctx.openDesk) registerOpenRoutes(app, ctx, ctx.openDesk);
   } else if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
