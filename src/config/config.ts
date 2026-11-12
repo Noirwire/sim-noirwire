@@ -35,6 +35,23 @@ const commaSeparated = (defaultValue: string) =>
         .filter(Boolean),
     );
 
+const questNumber = () =>
+  z.string().regex(/^\d*$/, "must be the quest's number on quests.magicblock.app").optional();
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** A URL a bearer key may be sent to: https, or http only on this machine. */
+const keyBearingUrl = (defaultValue: string) =>
+  z
+    .url()
+    .default(defaultValue)
+    .refine((text) => {
+      const url = new URL(text);
+      return (
+        url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname))
+      );
+    }, "must be https, or http on this machine");
+
 /** Every variable this service reads, with its default. `.env.example` documents each one. */
 const envSchema = z.object({
   PORT: positiveInt(4100),
@@ -119,6 +136,13 @@ const envSchema = z.object({
   LIQUIDATOR_INTERVAL_MS: positiveInt(60_000),
   LIQUIDATOR_STARTING_NUSD: decimalAmount("1000000"),
 
+  /** MagicBlock quest points run only when this key and the three quest ids are all set. */
+  MAGICBLOCK_QUESTS_API_KEY: z.string().optional(),
+  MAGICBLOCK_QUESTS_URL: keyBearingUrl("https://quests.magicblock.app/api/validators/push"),
+  QUEST_GET_STARTED_ID: questNumber(),
+  QUEST_THREE_DAYS_ID: questNumber(),
+  QUEST_STREAK_ID: questNumber(),
+
   STATS_LATENCY_WINDOW: positiveInt(500),
 
   // VENUE=rollup. `rollup/settings.ts` says which are required and checks them together.
@@ -153,6 +177,26 @@ const envSchema = z.object({
 });
 
 export type Config = z.infer<typeof envSchema>;
+
+export interface QuestSettings {
+  apiKey: string;
+  url: string;
+  questIds: { getStarted: string; threeDays: string; streak: string };
+}
+
+/** The quest settings, or null unless the key and all three quest ids are set. */
+export const questSettings = (config: Config): QuestSettings | null => {
+  const apiKey = config.MAGICBLOCK_QUESTS_API_KEY;
+  const getStarted = config.QUEST_GET_STARTED_ID;
+  const threeDays = config.QUEST_THREE_DAYS_ID;
+  const streak = config.QUEST_STREAK_ID;
+  if (!apiKey || !getStarted || !threeDays || !streak) return null;
+  return {
+    apiKey,
+    url: config.MAGICBLOCK_QUESTS_URL,
+    questIds: { getStarted, threeDays, streak },
+  };
+};
 
 export const isMainnet = (config: Pick<Config, "NETWORK">): boolean => config.NETWORK === "mainnet";
 
