@@ -15,11 +15,12 @@ export interface TapeUpdate {
  * holds. A reading older than one already taken is ignored.
  */
 export class TapeTracker {
-  private lastSequence = 0n;
+  private lastSequence = -1n;
 
   take(tape: ChainTape): TapeUpdate {
+    const nothingNew = tape.fills.length === 0 || tape.lastSequence <= this.lastSequence;
     // A plain read and a notification race: the older picture can arrive last.
-    if (tape.lastSequence <= this.lastSequence) return { fills: [], lost: 0n };
+    if (nothingNew) return { fills: [], lost: 0n };
     const fills = tape.fills
       .filter((fill) => fill.sequence > this.lastSequence)
       .sort((a, b) => (a.sequence < b.sequence ? -1 : 1));

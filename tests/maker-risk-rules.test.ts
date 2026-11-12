@@ -1881,6 +1881,24 @@ describe("a house maker that stops or fails", () => {
     expect(beats).toBe(1);
   });
 
+  it("does not stop for a quote that reached the program after its own expiry, and quotes again on the next tick", async () => {
+    const { warmUp, book, tick, ledger, said } = await rig("refused-expired");
+    await warmUp();
+    book.take();
+
+    book.rejecting = "OrderExpired (6046): the program refused a NSOL-PERP quote";
+    await tick(11);
+
+    expect(book.rejectedCount).toBeGreaterThan(0);
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+
+    book.rejecting = null;
+    await tick();
+    expect(ledger.state.mode).toBe("run");
+    expect(book.orders.length).toBeGreaterThan(0);
+  });
+
   it("falls back to the soft stop when the venue refuses an order for a reason it does not know, and sends no heartbeat", async () => {
     let beats = 0;
     const { warmUp, book, tick, ledger, said } = await rig("refused-unknown", {
@@ -3761,6 +3779,62 @@ describe("a ladder is recorded before any order of it is sent", () => {
     }
   });
 
+  it("pulls its quotes without stopping when the venue refuses one for the market's state, and quotes again once it passes", async () => {
+    for (const reason of [
+      "QuoteGuardTripped (6081)",
+      "StalePrice (6038)",
+      "MarketPaused (6031)",
+      "ExchangePaused (6030)",
+      "MarketReduceOnly (6032)",
+      "OracleDislocated (6077)",
+    ]) {
+      let beats = 0;
+      const { warmUp, book, tick, ledger, said, dir } = await rig(
+        `venue-state-${reason.slice(0, 6)}`,
+        { afterRequote: () => (beats += 1) },
+      );
+      await warmUp();
+      book.take();
+      const beatsBefore = beats;
+      const cancelsBefore = book.cancels;
+
+      book.rejecting = reason;
+      await expect(tick(11)).rejects.toThrow("quotes pulled");
+
+      expect(ledger.state.mode).toBe("run");
+      expect(said.alerts).toHaveLength(0);
+      expect(book.orders).toHaveLength(0);
+      expect(book.cancels).toBeGreaterThan(cancelsBefore);
+      expect(beats).toBe(beatsBefore);
+      expect(await holdOnDisk(dir)).toBeNull();
+
+      book.rejecting = null;
+      await tick(11);
+      expect(ledger.state.mode).toBe("run");
+      expect(book.take().length).toBeGreaterThan(2);
+      expect(beats).toBe(beatsBefore + 1);
+    }
+  });
+
+  it("takes off what a ladder already placed when the USDC guard trips part way through it", async () => {
+    const { warmUp, book, tick, ledger, said } = await rig("venue-state-mid-ladder");
+    await warmUp();
+    book.take();
+    let placed = 0;
+    book.beforePlacing = async () => {
+      placed += 1;
+      if (placed === 3) book.rejecting = "QuoteGuardTripped (6081)";
+    };
+    const cancelsBefore = book.cancels;
+
+    await expect(tick(11)).rejects.toThrow("quotes pulled");
+
+    expect(book.orders).toHaveLength(2);
+    expect(book.cancels).toBeGreaterThan(cancelsBefore + 1);
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+  });
+
   it("keeps the record of a slow ladder while an order call of it is unsettled", async () => {
     const { warmUp, book, tick, ledger, dir } = await rig("ladder-too-late-unsettled");
     await warmUp();
@@ -4040,6 +4114,8 @@ describe("a house maker's requote keeps the book quoted", () => {
     refusing: NewOrder["side"] | null = null;
     /** From this many placements on, the venue answers that the order never ran. */
     neverRunsFrom: number | null = null;
+    /** From this many placements on, the venue refuses the order with this reason. */
+    refusesFrom: { placed: number; reason: string } | null = null;
     refusedBecause: string | null = null;
     takesReduceOnly = false;
     beforePlacing: (() => Promise<void>) | null = null;
@@ -4091,6 +4167,9 @@ describe("a house maker's requote keeps the book quoted", () => {
       }
       if (this.neverRunsFrom !== null && this.placed >= this.neverRunsFrom) {
         return this.rejected(order, "no result before the order expired", { didNotRun: true });
+      }
+      if (this.refusesFrom !== null && this.placed >= this.refusesFrom.placed) {
+        return this.rejected(order, this.refusesFrom.reason);
       }
       if (order.reduceOnly === true) {
         return {
@@ -4316,6 +4395,27 @@ describe("a house maker's requote keeps the book quoted", () => {
     expect(live.resting).toHaveLength(6);
     expect(live.calls.filter((call) => call === "place")).toHaveLength(6);
     expect(live.calls.filter((call) => call === "cancelOrder")).toHaveLength(8);
+  });
+
+  it("takes every order off, old and new, when the USDC guard trips part way through an overlapped swap", async () => {
+    const { live, step, dir, ledger, said } = await quoting("mbb-guard-tripped", {
+      positionLimitNotional: dollars(1_000),
+    });
+    live.refusesFrom = { placed: 3, reason: "QuoteGuardTripped (6081)" };
+
+    await expect(step(11)).rejects.toThrow("quotes pulled");
+
+    expect(live.calls).toContain("cancelAll");
+    expect(live.resting).toHaveLength(0);
+    expect(await holdOnDisk(dir)).toBeNull();
+    expect(ledger.state.mode).toBe("run");
+    expect(said.alerts).toHaveLength(0);
+
+    live.refusesFrom = null;
+    await step(1);
+
+    expect(live.resting).toHaveLength(6);
+    expect(ledger.state.mode).toBe("run");
   });
 
   it("starts the count of ladders that never ran again when a ladder with an order missing still rests", async () => {

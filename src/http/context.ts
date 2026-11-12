@@ -5,6 +5,7 @@ import type { FundLedger } from "../data/fund-ledger.js";
 import type { StatsTracker } from "../data/stats.js";
 import type { TapeStore } from "../data/tape-store.js";
 import type { Venue } from "../engine/types.js";
+import type { QuestService } from "../quests/quest-service.js";
 import type { StartUp } from "../scheduling/start-up.js";
 import type { FundRequests } from "../rollup/fund-desk.js";
 import type { OpenRequests, SignedOpenRequests } from "../rollup/open-desk.js";
@@ -30,6 +31,8 @@ export interface RollupRoutes {
    * closed, so `viewsOpened` is an upper bound on the seats held. Compare it with `seatCapacity`.
    */
   seatOccupancy: () => SeatOccupancy;
+  /** Present only when the MagicBlock quest settings are all set. */
+  quests: QuestService;
   /** Whether the service is connected, pricing and funded. */
   readiness: () => Readiness;
   /** What a browser needs to trade on the program directly, or null until the service has connected. */

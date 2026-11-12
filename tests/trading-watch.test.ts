@@ -90,6 +90,49 @@ describe("the trading readiness watch", () => {
     expect(said.alerts[2]).toContain("12 min");
   });
 
+  it("doubles the wait between repeats up to 4 hours, so an 11-hour hold gives 8 alerts and one notice when it clears", () => {
+    const { said, state, clock, watch } = watched();
+    watch.check();
+    state.ready = false;
+    state.reason = "NSOL-PERP maker is only reducing its position";
+    const alertedAt: number[] = [];
+    for (let minute = 0; minute <= 660; minute += 1) {
+      const before = said.alerts.length;
+      watch.check();
+      if (said.alerts.length > before) alertedAt.push(minute);
+      clock.advance(MINUTE);
+    }
+
+    expect(alertedAt).toEqual([0, 2, 12, 32, 72, 152, 312, 552]);
+    expect(said.notices).toEqual([]);
+
+    state.ready = true;
+    watch.check();
+    expect(said.notices).toEqual(["trading is ready again"]);
+  });
+
+  it("starts the repeats over at 10 minutes for a second outage", () => {
+    const { said, state, clock, watch } = watched();
+    watch.check();
+    state.ready = false;
+    for (let minute = 0; minute <= 33; minute += 1) {
+      watch.check();
+      clock.advance(MINUTE);
+    }
+    state.ready = true;
+    watch.check();
+    const before = said.alerts.length;
+
+    state.ready = false;
+    for (let minute = 0; minute <= 12; minute += 1) {
+      watch.check();
+      clock.advance(MINUTE);
+    }
+
+    expect(said.alerts.length - before).toBe(3);
+    expect(said.alerts.at(-1)).toContain("12 min");
+  });
+
   describe("after a wake", () => {
     it("stays quiet through the blind settle window, then watches normally", () => {
       const { said, state, clock, make } = watched(false);

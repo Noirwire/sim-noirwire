@@ -17,6 +17,7 @@ const domainStaysFrameworkFree = {
     "src/data/**/*.ts",
     "src/config/**/*.ts",
     "src/rollup/**/*.ts",
+    "src/quests/**/*.ts",
   ],
   rules: {
     "no-restricted-imports": [

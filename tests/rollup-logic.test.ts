@@ -99,6 +99,17 @@ describe("following the tape by sequence number", () => {
     expect(sequences(tracker.take(tapeOf(1, 2, 3, 4)).fills)).toEqual([4]);
   });
 
+  it("reads a new market's first fill, numbered 0, after any number of reads of its empty tape", () => {
+    const tracker = new TapeTracker();
+    expect(tracker.take(tapeOf())).toEqual({ fills: [], lost: 0n });
+    expect(tracker.take(tapeOf())).toEqual({ fills: [], lost: 0n });
+    const first = tracker.take(tapeOf(0));
+    expect(sequences(first.fills)).toEqual([0]);
+    expect(first.lost).toBe(0n);
+    expect(tracker.take(tapeOf(0)).fills).toEqual([]);
+    expect(sequences(tracker.take(tapeOf(0, 1)).fills)).toEqual([1]);
+  });
+
   it("backfills what a dropped connection skipped from what the tape still holds", () => {
     const tracker = new TapeTracker();
     tracker.take(tapeOf(1, 2, 3, 4, 5));
