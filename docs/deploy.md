@@ -379,9 +379,12 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
     deadline, did not execute. The maker drops the rest of that ladder, cancels what it
     placed (under a make-before-break requote, see below, it leaves what stands, old
     orders included, for the next tick to replace), says so in one `dropped a ladder` line
-    (at most once a minute) and quotes again on the next tick. Only five such ladders in a row (a good ladder in between starts the
-    count again) send it to the soft stop, with an `ALERT` that gives the count and the last
-    reason. If you see that alert, check the rollup's and the RPC's health before resuming.
+    (at most once a minute) and quotes again on the next tick. Five such ladders in a row (a
+    good ladder in between starts the count again) raise one `ALERT` that says the rollup
+    looks slow, but the maker keeps quoting and needs no resume. The same goes for a quote
+    the program refuses with `OrderExpired (6046)`: it arrived after its own expiry and never
+    ran, so it is left out and the next tick quotes again. If you see the alert, check the
+    rollup's and the RPC's health.
 - **A requote places before it cancels.** So the book is never bare while it requotes, the
   maker places the new ladder first and then cancels the old orders one by one (each its
   own transaction). Before placing it cancels the old orders the new ladder would match
