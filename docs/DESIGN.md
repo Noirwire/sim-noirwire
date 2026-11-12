@@ -126,8 +126,8 @@ Quests, with a quest week running from Friday 08:00 UTC and the day and week bot
 fill's own time:
 
 - Get started, once ever: the wallet holds an opened seat (mainnet only, where the seat record is
-  kept) and one order's credited fills total at least 45 dollars. The quest text says 50, so an
-  order sized at 50 that fills a little under after fees or a price move still counts.
+  kept) and one order's credited fills total at least 9 dollars. The quest text says 10, so an
+  order sized at 10 that fills a little under after fees or a price move still counts.
 - Trade on 3 days, once per quest week: at least 10 dollars credited on each of three UTC days.
 - 4 weeks in a row, once per run: Trade on 3 days in four consecutive quest weeks. After it is
   pushed the run starts again from zero; a missed week resets it.
