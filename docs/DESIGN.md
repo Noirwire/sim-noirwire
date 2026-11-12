@@ -69,11 +69,83 @@ Prices and sizes cross this boundary as integers (`bigint`), never floats.
 | `POST /fund` `{ address }` | `VENUE=memory` only. `{ amount, reference }`; one grant per address, rate limited per IP |
 | `POST /fund/prepare` `{ owner, orderKeys[4] }` | `VENUE=rollup` only. `{ transaction, expiresAtMs, amount }`: the unsigned transaction that opens the account and deposits the grant |
 | `POST /fund/submit` `{ owner, transaction }` | `VENUE=rollup` only. `{ amount, reference }` once the transaction executed; `reference` is its signature |
+| `POST /quests/challenge`, `/quests/device`, `/quests/device/revoke`, `/quests/orders` | `VENUE=rollup` with the quest settings only (see "Quest points"). Never wake the service |
 | `WS /stream` | `price`, `fill`, `candle`, `stats` messages; a client subscribes per market |
 
 Every volume, trader and latency figure in a response carries `network: "devnet"` and
 `simulated: true` where bots produced it. Bot volume and user volume are counted
 separately and never merged into one number.
+
+## Quest points
+
+Who traded is private: a fill on the public tape carries only a receipt for each side, made from
+a secret the trader's browser drew for that order. Quest points need the service to know which
+fills are a wallet's, so a person switches that on, once per device, and the browser then hands
+the service each order's secret. The routes exist only with `VENUE=rollup` and when
+`MAGICBLOCK_QUESTS_API_KEY`, `QUEST_GET_STARTED_ID`, `QUEST_THREE_DAYS_ID` and `QUEST_STREAK_ID`
+are all set. None of them wakes the service, each has its own per-address rate limit and a body
+limit of 8 KB, and a claim that does not hold gets one answer (401, "the request is not valid")
+whatever the reason. No route says whether a wallet has progress, and there is no progress route.
+
+- `POST /quests/challenge` `{ wallet }` answers `{ challenge, expiresAtMs }`: a code valid for five
+  minutes, used once, held in memory. Any valid wallet gets one. At 10,000 open codes the
+  oldest is dropped.
+- `POST /quests/device` `{ wallet, deviceKey, until, challenge, signature }` switches a device
+  (an ed25519 key the browser made, base58) on until `until`, at most 30 days ahead. The wallet
+  signs this text, lines joined with a line feed:
+
+  ```
+  Earn MagicBlock quest points on this device. While on, NoirWire records which of your trades count toward quests.
+  Wallet: <wallet>
+  Device key: <deviceKey>
+  Until: <until>
+  Code: <challenge>
+  ```
+
+  A wallet keeps at most five devices; a sixth replaces the oldest.
+
+- `POST /quests/orders` `{ deviceKey, signedAt, orders: [{ market, secret }], signature }` hands
+  over one to 20 order secrets (32 hex characters, with the market's id). The device key signs
+  `NoirWire quest orders`, the device key, `signedAt` (Unix ms, within five minutes of the
+  service's clock), then one `<market> <secret>` line per order, joined with line feeds. It
+  answers `{ accepted }`. Sending a secret again changes nothing. A wallet may hand over 500
+  secrets a UTC day, and on mainnet only once it holds an opened seat. A market keeps at most
+  20,000 secrets; past that, new ones are refused and a warning is logged.
+- `POST /quests/device/revoke` `{ deviceKey, signedAt, signature }` switches a device off. The
+  device key signs `NoirWire quest device off`, the device key and `signedAt`, joined with line
+  feeds. The answer is the same whether or not the device was on.
+
+A fill counts for a wallet only when one of its secrets made one side's receipt, and the other
+side was one of the service's own bots: two people trading with each other earn nothing. A secret
+handed over up to 60 seconds after its fill printed still counts, so the service keeps the last
+five minutes of fills in memory. Each fill is credited to a wallet once, also when the service
+reads it again after a restart. A credit holds the wallet, market, fill sequence, UTC day, quest
+week, the value in USDC atoms and the sha256 of the order's secret, never the secret.
+
+Quests, with a quest week running from Friday 08:00 UTC and the day and week both taken from the
+fill's own time:
+
+- Get started, once ever: the wallet holds an opened seat (mainnet only, where the seat record is
+  kept) and one order's credited fills total at least 50 dollars.
+- Trade on 3 days, once per quest week: at least 10 dollars credited on each of three UTC days.
+- 4 weeks in a row, once per run: Trade on 3 days in four consecutive quest weeks. After it is
+  pushed the run starts again from zero; a missed week resets it.
+
+Completions wait in an outbox on disk and go to MagicBlock one at a time, each with a timestamp
+greater than the last. A 401 stops pushing until the service restarts. A refusal such as "quest
+not started" is retried hourly (Get started for up to 30 days, the weekly quests until a week
+after their quest week ends); a timeout, network error or 5xx is retried with backoff until
+MagicBlock answers.
+
+Everything is kept in JSON files under `DATA_DIR/quests/`, readable by the service alone and
+written by renaming a finished file into place; a file that exists and cannot be read stops the
+start. Order secrets are kept 30 days (an order with no expiry can rest until its owner cancels
+it, so 30 days is the cap) plus the 60 second grace; a device until its end; credited fills 35
+days, enough for a four week run; the record of completed quests for as long as the service runs.
+Challenges are never written to disk.
+
+The bots' order secrets are held in memory, so a fill against a bot order that rested across a
+restart is not credited, until the bot quotes again.
 
 ## Honesty rules
 

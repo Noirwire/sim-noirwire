@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { liquidatorTraderKey, makerTraderKey, takerTraderKey } from "../bots/bot-traders.js";
-import { type Config, isMainnet } from "../config/config.js";
+import { type Config, isMainnet, questSettings } from "../config/config.js";
 import type { SnapshotData } from "../data/snapshot.js";
 import { systemClock } from "../engine/clock.js";
 import { MARKETS, type MarketConfig } from "../engine/markets.js";
@@ -11,6 +11,7 @@ import { STILL_STARTING, VenueNotReady } from "../engine/venue-not-ready.js";
 import { Admission } from "../gate/admission.js";
 import { InviteList, OpenInvitations } from "../gate/invite-list.js";
 import { SeatLedger } from "../gate/seat-ledger.js";
+import { QuestService } from "../quests/quest-service.js";
 import { hideAddresses } from "../logging/first-line.js";
 import { type PublicDeployment, browserUrlsFor } from "../rollup/public-deployment.js";
 import type { BotSpec } from "../rollup/bot-accounts.js";
@@ -62,13 +63,45 @@ const inviteList = (config: Config, onError: RollupWiringOptions["onError"]): In
 };
 
 /** The mainnet gate's rules: its invite list, the record of the seats it signed for, and the day's limits. */
-const gateAdmission = (config: Config, onError: RollupWiringOptions["onError"]): Admission => {
+const gateAdmission = (
+  config: Config,
+  seatLedger: SeatLedger,
+  onError: RollupWiringOptions["onError"],
+): Admission => {
   return new Admission(
     config.GATE_OPEN ? new OpenInvitations() : inviteList(config, onError),
-    new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock),
+    seatLedger,
     { perDay: config.GATE_SEATS_PER_DAY, perAskerPerDay: config.GATE_SEATS_PER_IP_PER_DAY },
     systemClock,
   );
+};
+
+const QUESTS_FOLDER = "quests";
+
+/** The quest service, or null unless the quest settings are all set. Throws when a quest file cannot be read. */
+const questServiceFor = (
+  config: Config,
+  markets: readonly MarketConfig[],
+  seatLedger: SeatLedger | null,
+  onError: RollupWiringOptions["onError"],
+): QuestService | null => {
+  const settings = questSettings(config);
+  if (!settings) return null;
+  if (!seatLedger) {
+    onError(
+      "quests: this service keeps no seat record, so the Get started quest is never completed here",
+      null,
+    );
+  }
+  return new QuestService({
+    folder: join(config.DATA_DIR, QUESTS_FOLDER),
+    clock: systemClock,
+    markets: markets.map((market) => market.id),
+    questIds: settings.questIds,
+    seatOpened: seatLedger ? (wallet) => seatLedger.openedFor(wallet) !== undefined : null,
+    push: { url: settings.url, apiKey: settings.apiKey, fetch },
+    onError,
+  });
 };
 
 /**
@@ -137,6 +170,11 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const countingSinceMs = Date.now();
   const userOrders = new UserOrderCount();
 
+  const seatLedger = mainnet
+    ? new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock)
+    : null;
+  const quests = questServiceFor(config, markets, seatLedger, onError);
+
   let rollup: RollupVenue | null = null;
   let networkChecked = false;
 
@@ -154,7 +192,8 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       recordedThrough: snapshot?.tapeCursors ?? {},
       keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
       handlers: {
-        onFill: ({ fill, origin, replayed }) => {
+        onFill: ({ fill, origin, botSides, replayed }) => {
+          quests?.acceptFill(fill, botSides);
           if (replayed) {
             data.tape.record(fill);
             return;
@@ -235,7 +274,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     for (const { key } of roles) data.stats.recordTrader(key);
   };
 
-  const admission = mainnet ? gateAdmission(config, onError) : null;
+  const admission = seatLedger ? gateAdmission(config, seatLedger, onError) : null;
   let openDesk: OpenDesk | null = null;
   const theOpenDesk = (): OpenDesk => {
     if (!admission) throw new Error("only mainnet opens accounts through an invite list");
@@ -270,6 +309,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     botVenue,
     botMarkets: markets,
     rollupRoutes: {
+      ...(quests ? { quests } : {}),
       // Mainnet hands out no funds. It opens accounts for the invited, and nobody else.
       ...(mainnet
         ? {
@@ -315,6 +355,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
         networkChecked = true;
       }
       rollup ??= await connect();
+      quests?.start();
       await rollup.follow();
       sweepSeatsWhileAwake();
     },
@@ -335,6 +376,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       orderKeyCheckpoints: rollup?.keyCheckpoints() ?? snapshot?.orderKeyCheckpoints ?? {},
     }),
     stop: async () => {
+      await quests?.stop();
       openDesk?.stopSweeping();
       await rollup?.stop();
     },

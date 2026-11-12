@@ -1,6 +1,6 @@
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
-import { base58Of } from "../src/rollup/base58.js";
+import { base58Of, bytesOfBase58 } from "../src/rollup/base58.js";
 
 describe("base58 of a signature", () => {
   it("agrees with web3.js on 32 bytes, including leading zeros", () => {
@@ -12,6 +12,12 @@ describe("base58 of a signature", () => {
     for (const key of keys) {
       expect(base58Of(key.toBytes())).toBe(key.toBase58());
     }
+  });
+
+  it("reads a text back into the same bytes, leading zeros included, and refuses a foreign character", () => {
+    const bytes = Uint8Array.from({ length: 32 }, (_, at) => (at < 3 ? 0 : at * 5));
+    expect(bytesOfBase58(base58Of(bytes))).toEqual(bytes);
+    expect(bytesOfBase58("0OIl")).toBeNull();
   });
 
   it("writes 64 bytes the way a signature is written, and back into the same bytes", () => {
