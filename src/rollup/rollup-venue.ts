@@ -53,7 +53,7 @@ import {
   type PublicDeployment,
   publicDeployment,
 } from "./public-deployment.js";
-import { RollupMarket } from "./rollup-market.js";
+import { NOTHING_READ, RollupMarket } from "./rollup-market.js";
 import { sweepStopText } from "./program-errors.js";
 import { SeatSweep, seatRangeOfTarget, seatRangeTarget } from "./seat-sweep.js";
 import { type RollupSettings, deployedMarket } from "./settings.js";
@@ -311,7 +311,7 @@ export class RollupVenue implements Venue {
 
   private acceptTape(marketId: number, update: TapeUpdate, readAtMs: number): void {
     const market = this.marketOnChain(marketId);
-    const firstReading = market.tapeCursor === 0;
+    const firstReading = market.tapeCursor === NOTHING_READ;
     if (update.lost > 0n && !firstReading) {
       this.options.handlers.onError(
         `${market.config.id}: ${update.lost} fills left the tape before they were read`,
@@ -325,7 +325,7 @@ export class RollupVenue implements Venue {
   private acceptFill(market: RollupMarket, chainFill: ChainFill): void {
     const marketId = market.config.id;
     const alreadyRecorded =
-      Number(chainFill.sequence) <= (this.options.recordedThrough[marketId] ?? 0);
+      Number(chainFill.sequence) <= (this.options.recordedThrough[marketId] ?? NOTHING_READ);
     const fill = market.acceptFill(chainFill);
     const origin = originOf(fillRoles(chainFill, this.secrets.of(marketId)));
     this.options.handlers.onFill({ fill, origin, replayed: alreadyRecorded });

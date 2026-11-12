@@ -6,13 +6,15 @@ import { type MarketUnits, marketUnits, toSimPrice, toSimSize } from "./units.js
 
 const MS_PER_SECOND = 1_000;
 
+export const NOTHING_READ = -1;
+
 const tagOf = (receipt: Uint8Array): bigint => Buffer.from(receipt).readBigUInt64BE(0);
 
 /** One market as the chain shows it. Its mark is the chain's own: this service never sets it. */
 export class RollupMarket {
   readonly units: MarketUnits;
-  /** The last fill sequence read from the tape. */
-  tapeCursor = 0;
+  /** The last fill sequence read from the tape, NOTHING_READ before the first. The program numbers fills from 0. */
+  tapeCursor = NOTHING_READ;
   private chainPrice: ChainPrice | null = null;
   private readonly volume = new DayVolume();
   private readonly priceHistory = new PriceHistory(DAY_MS);
