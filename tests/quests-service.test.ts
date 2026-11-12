@@ -26,7 +26,8 @@ describe("matching fills to secrets", () => {
     const person = newPerson();
     await trade(r, service, person, FIFTY, r.clock.nowMs());
     await service.idle();
-    expect(r.push.pushesOf("q-start").map((call) => call.user)).toEqual([person.wallet.key]);
+    expect(r.push.pushesOf("101").map((call) => call.user)).toEqual([person.wallet.key]);
+    expect(r.push.calls[0]?.quest).toBe(101);
   });
 
   it("credits the maker side as well as the taker side", async () => {
@@ -39,7 +40,7 @@ describe("matching fills to secrets", () => {
     const { fill, botSides } = againstBot(secret, FIFTY, r.clock.nowMs(), "maker");
     service.acceptFill(fill, botSides);
     await service.idle();
-    expect(r.push.pushesOf("q-start")).toHaveLength(1);
+    expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
   it("never matches a stranger's secret", async () => {
@@ -98,7 +99,7 @@ describe("matching fills to secrets", () => {
       r.clock.advance(afterMs);
       await handOver(service, r.clock, person, [secret]);
       await service.idle();
-      expect(r.push.pushesOf("q-start").length > 0).toBe(counts);
+      expect(r.push.pushesOf("101").length > 0).toBe(counts);
     }
   });
 
@@ -123,7 +124,7 @@ describe("matching fills to secrets", () => {
 
     after.acceptFill(second.fill, second.botSides);
     await after.idle();
-    expect(r.push.pushesOf("q-start")).toHaveLength(1);
+    expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 });
 
@@ -140,7 +141,7 @@ describe("the Get started quest", () => {
     r.seatOpen.value = true;
     await trade(r, service, person, FIFTY, r.clock.nowMs());
     await service.idle();
-    expect(r.push.pushesOf("q-start")).toHaveLength(1);
+    expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
   it("needs one order to total 50 dollars, here across two partial fills, and not two orders", async () => {
@@ -164,7 +165,7 @@ describe("the Get started quest", () => {
     expect(r.push.calls).toHaveLength(0);
     service.acceptFill(b.fill, b.botSides);
     await service.idle();
-    expect(r.push.pushesOf("q-start")).toHaveLength(1);
+    expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
   it("stops just short of 50 dollars and completes at exactly 50, once ever", async () => {
@@ -179,7 +180,7 @@ describe("the Get started quest", () => {
       service.acceptFill(fill, botSides);
       await service.idle();
     }
-    expect(r.push.pushesOf("q-start")).toHaveLength(1);
+    expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 });
 
@@ -196,7 +197,7 @@ describe("quest weeks and trading days", () => {
     const person = newPerson();
     for (const day of [1, 2, 3]) await trade(r, service, person, 10, weekStart(0) + day * DAY_MS);
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(1);
+    expect(r.push.pushesOf("102")).toHaveLength(1);
   });
 
   it("does not count a day under 10 dollars, and sums a day's fills", async () => {
@@ -207,10 +208,10 @@ describe("quest weeks and trading days", () => {
     await trade(r, service, person, 10, weekStart(0) + 2 * DAY_MS);
     await trade(r, service, person, 9.99, weekStart(0) + 3 * DAY_MS);
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(0);
+    expect(r.push.pushesOf("102")).toHaveLength(0);
     await trade(r, service, person, 0.01, weekStart(0) + 3 * DAY_MS + HOUR_MS);
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(1);
+    expect(r.push.pushesOf("102")).toHaveLength(1);
   });
 
   it("splits days at midnight UTC", async () => {
@@ -224,10 +225,10 @@ describe("quest weeks and trading days", () => {
     await trade(r, service, person, 6, midnight + 3 * DAY_MS - 1);
     await trade(r, service, person, 6, midnight + 3 * DAY_MS);
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(0);
+    expect(r.push.pushesOf("102")).toHaveLength(0);
     await trade(r, service, person, 4, midnight + 3 * DAY_MS + HOUR_MS);
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(1);
+    expect(r.push.pushesOf("102")).toHaveLength(1);
   });
 
   it("does not carry days across the Friday 08:00 UTC boundary", async () => {
@@ -238,14 +239,14 @@ describe("quest weeks and trading days", () => {
     await trade(r, service, person, 10, weekStart(1) - DAY_MS);
     await trade(r, service, person, 10, weekStart(1));
     await service.idle();
-    expect(r.push.pushesOf("q-days")).toHaveLength(0);
+    expect(r.push.pushesOf("102")).toHaveLength(0);
 
     const other = newPerson();
     await trade(r, service, other, 10, weekStart(2) - 2 * DAY_MS);
     await trade(r, service, other, 10, weekStart(2) - DAY_MS);
     await trade(r, service, other, 10, weekStart(2) - 1);
     await service.idle();
-    expect(r.push.pushesOf("q-days").map((call) => call.user)).toEqual([other.wallet.key]);
+    expect(r.push.pushesOf("102").map((call) => call.user)).toEqual([other.wallet.key]);
   });
 });
 
@@ -267,13 +268,13 @@ describe("four weeks in a row", () => {
     const service = r.open();
     const person = newPerson();
     for (const week of [0, 1, 2]) await tradeThreeDays(r, service, person, week);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(0);
+    expect(r.push.pushesOf("103")).toHaveLength(0);
     await tradeThreeDays(r, service, person, 3);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(1);
+    expect(r.push.pushesOf("103")).toHaveLength(1);
     for (const week of [4, 5, 6]) await tradeThreeDays(r, service, person, week);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(1);
+    expect(r.push.pushesOf("103")).toHaveLength(1);
     await tradeThreeDays(r, service, person, 7);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(2);
+    expect(r.push.pushesOf("103")).toHaveLength(2);
   });
 
   it("breaks the run on a missed week", async () => {
@@ -281,9 +282,9 @@ describe("four weeks in a row", () => {
     const service = r.open();
     const person = newPerson();
     for (const week of [0, 1, 3, 4, 5]) await tradeThreeDays(r, service, person, week);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(0);
+    expect(r.push.pushesOf("103")).toHaveLength(0);
     await tradeThreeDays(r, service, person, 6);
-    expect(r.push.pushesOf("q-streak")).toHaveLength(1);
+    expect(r.push.pushesOf("103")).toHaveLength(1);
   });
 });
 
@@ -354,7 +355,7 @@ describe("the push outbox", () => {
     await trade(r, service, person, FIFTY, weekStart(0) + 3 * DAY_MS);
     await service.idle();
     const stamps = r.push.calls.map((call) => call.timestamp);
-    expect(r.push.calls.map((call) => call.quest).sort()).toEqual(["q-days", "q-start"]);
+    expect(r.push.calls.map((call) => call.quest).sort((a, b) => a - b)).toEqual([101, 102]);
     expect(stamps[1]).toBeGreaterThan(stamps[0]);
   });
 
@@ -371,7 +372,7 @@ describe("the push outbox", () => {
     const after = r.open();
     after.recheck();
     await after.idle();
-    expect(r.push.pushesOf("q-start").map((call) => call.user)).toEqual([person.wallet.key]);
+    expect(r.push.pushesOf("101").map((call) => call.user)).toEqual([person.wallet.key]);
   });
 });
 

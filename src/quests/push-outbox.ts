@@ -169,7 +169,7 @@ export class PushOutbox {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          payload: { quest: entry.questId, user: entry.wallet, timestamp },
+          payload: { quest: Number(entry.questId), user: entry.wallet, timestamp },
         }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });

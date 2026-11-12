@@ -40,7 +40,7 @@ const BIG_LOTS = 100n;
 const LATE_WAIT_MS = 65_000;
 const DAY_MS = 86_400_000;
 const API_KEY = "test-quests-key";
-const QUEST_IDS = { getStarted: "quest-start", threeDays: "quest-days", streak: "quest-streak" };
+const QUEST_IDS = { getStarted: "201", threeDays: "202", streak: "203" };
 const GENERIC_ERROR = "the request is not valid";
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 
@@ -499,7 +499,7 @@ describe("quest points on the real program (local network)", () => {
     expect(pushed!.method).toBe("POST");
     expect(pushed!.authorization).toBe(`Bearer ${API_KEY}`);
     expect(pushed!.body).toMatchObject({
-      payload: { quest: QUEST_IDS.threeDays, user: users.c.wallet.key },
+      payload: { quest: Number(QUEST_IDS.threeDays), user: users.c.wallet.key },
     });
     const { payload } = pushed!.body as { payload: { timestamp: number } };
     expect(Math.abs(Date.now() - payload.timestamp)).toBeLessThan(120_000);
