@@ -258,9 +258,9 @@ describe("when the quest routes exist", () => {
 
     const ids: Record<string, string> = {
       MAGICBLOCK_QUESTS_API_KEY: "key",
-      QUEST_GET_STARTED_ID: "a",
-      QUEST_THREE_DAYS_ID: "b",
-      QUEST_STREAK_ID: "c",
+      QUEST_GET_STARTED_ID: "1",
+      QUEST_THREE_DAYS_ID: "2",
+      QUEST_STREAK_ID: "3",
     };
     const settingsFor = (env: Record<string, string>) =>
       questSettings(loadConfig(env as NodeJS.ProcessEnv));

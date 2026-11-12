@@ -13,7 +13,7 @@ import { deviceConsentText, questOrdersText } from "../src/quests/signed-text.js
 import { base58Of } from "../src/rollup/base58.js";
 
 export const MARKET = "NSOL-PERP";
-export const QUEST_IDS = { getStarted: "q-start", threeDays: "q-days", streak: "q-streak" };
+export const QUEST_IDS = { getStarted: "101", threeDays: "102", streak: "103" };
 /** The start of a quest week: a Friday, 08:00 UTC. */
 export const WEEK_START_MS = Date.UTC(2026, 10, 13, 8);
 export const HOUR_MS = 3_600_000;
@@ -35,7 +35,7 @@ export const newSigner = (): Signer => {
 export const tempFolder = (): string => mkdtempSync(join(tmpdir(), "quests-"));
 
 export interface PushCall {
-  quest: string;
+  quest: number;
   user: string;
   timestamp: number;
 }
@@ -54,7 +54,7 @@ export const fakePush = () => {
     answerWith: (next: number) => {
       status = next;
     },
-    pushesOf: (quest: string) => calls.filter((call) => call.quest === quest),
+    pushesOf: (quest: string) => calls.filter((call) => call.quest === Number(quest)),
   };
 };
 

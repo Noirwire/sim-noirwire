@@ -35,6 +35,9 @@ const commaSeparated = (defaultValue: string) =>
         .filter(Boolean),
     );
 
+const questNumber = () =>
+  z.string().regex(/^\d*$/, "must be the quest's number on quests.magicblock.app").optional();
+
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
 /** A URL a bearer key may be sent to: https, or http only on this machine. */
@@ -136,9 +139,9 @@ const envSchema = z.object({
   /** MagicBlock quest points run only when this key and the three quest ids are all set. */
   MAGICBLOCK_QUESTS_API_KEY: z.string().optional(),
   MAGICBLOCK_QUESTS_URL: keyBearingUrl("https://quests.magicblock.app/api/validators/push"),
-  QUEST_GET_STARTED_ID: z.string().optional(),
-  QUEST_THREE_DAYS_ID: z.string().optional(),
-  QUEST_STREAK_ID: z.string().optional(),
+  QUEST_GET_STARTED_ID: questNumber(),
+  QUEST_THREE_DAYS_ID: questNumber(),
+  QUEST_STREAK_ID: questNumber(),
 
   STATS_LATENCY_WINDOW: positiveInt(500),
 
