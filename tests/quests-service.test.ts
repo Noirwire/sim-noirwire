@@ -144,7 +144,7 @@ describe("the Get started quest", () => {
     expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
-  it("needs one order to total 50 dollars, here across two partial fills, and not two orders", async () => {
+  it("needs one order to total 45 dollars, here across two partial fills, and not two orders", async () => {
     const r = rig();
     const service = r.open();
     const person = newPerson();
@@ -168,14 +168,14 @@ describe("the Get started quest", () => {
     expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
-  it("stops just short of 50 dollars and completes at exactly 50, once ever", async () => {
+  it("stops just short of 45 dollars and completes at exactly 45, once ever", async () => {
     const r = rig();
     const service = r.open();
     const person = newPerson();
     const secret = newSecret();
     await switchOn(service, r.clock, person);
     await handOver(service, r.clock, person, [secret]);
-    for (const dollars of [49.99, 0.01, 10]) {
+    for (const dollars of [44.99, 0.01, 10]) {
       const { fill, botSides } = againstBot(secret, dollars, r.clock.nowMs());
       service.acceptFill(fill, botSides);
       await service.idle();
