@@ -3,7 +3,7 @@ import type { Clock } from "../engine/clock.js";
 import { base58Of } from "./base58.js";
 import { type Admission, RECORD_NOT_WRITTEN } from "../gate/admission.js";
 import type { Session } from "./connections.js";
-import { refusalOf } from "./fund-desk.js";
+import { type Refusal, parseOwnerAndKeys, refusalOf } from "./fund-desk.js";
 import type { ChainExchange } from "./chain-types.js";
 import type { OwnerMessageForm, Program } from "./program.js";
 import { ACCOUNT_EXISTS_ERROR, SEAT_ALREADY_OPEN_ERROR, ownerRefusalOf } from "./program-errors.js";
@@ -23,8 +23,6 @@ const SIGNATURE_BYTES = 64;
 const SWEEP_EVERY_MS = 60_000;
 /** A reserved seat with no signed transaction this old is not a prepare in progress. */
 const UNSENT_GRACE_MS = 30_000;
-
-type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
 
 export type OpenPrepared =
   { ok: true; transaction: string; expiresAtMs: number } | Refusal<400 | 403 | 409 | 429 | 503>;
@@ -124,15 +122,32 @@ interface PreparedRequest {
   sending: boolean;
 }
 
-const publicKeyOf = (value: string): PublicKey | null => {
-  try {
-    return new PublicKey(value);
-  } catch {
-    return null;
-  }
+/** Tells the log what became of an opening that threw, and answers: the refusal when the rollup refused, else that the account may be open. */
+const answerFailedOpening = <Answer extends { reason: string }>(
+  log: (line: string) => void,
+  owner: string,
+  openedBefore: boolean,
+  refused: boolean,
+  refusal: Answer,
+): Answer | Refusal<502> => {
+  log(
+    `gate: ${owner} account ${
+      openedBefore
+        ? "was opened by an earlier try, now recorded"
+        : refused
+          ? "refused, its seat stays reserved until it can no longer land"
+          : "may or may not be open"
+    }: ${refusal.reason}`,
+  );
+  return refused
+    ? refusal
+    : {
+        ok: false,
+        status: 502,
+        reason:
+          "the rollup did not confirm in time. The account may have been opened: check before you try again",
+      };
 };
-
-const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
 
 /** The gate signed this transaction at prepare: its signature must be on it still, and every signature on it must verify. */
 const hasValidGateSignature = (transaction: Transaction, gate: PublicKey): boolean =>
@@ -214,32 +229,14 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
     return this.options.exchange()?.maxSeatsPerDay ?? null;
   }
 
-  /** The request's keys as keys, or the refusal for keys that are not, or not all different. */
-  private keysOf(request: OpenRequest): { ownerKey: PublicKey; keys: PublicKey[] } | Refusal<400> {
-    const { owner, orderKeys } = request;
-    const ownerKey = publicKeyOf(owner);
-    const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
-    if (!ownerKey || keys.length !== orderKeys.length) {
-      return { ok: false, status: 400, reason: "not a public key" };
-    }
-    if (new Set([owner, ...orderKeys]).size !== orderKeys.length + 1) {
-      return {
-        ok: false,
-        status: 400,
-        reason: "the order keys must differ from each other and from the owner",
-      };
-    }
-    return { ownerKey, keys };
-  }
-
   async prepare(request: OpenRequest): Promise<OpenPrepared> {
-    const parsed = this.keysOf(request);
+    const parsed = parseOwnerAndKeys(request.owner, request.orderKeys);
     if ("ok" in parsed) return parsed;
     return this.locked(() => this.prepareLocked(request, parsed.ownerKey, parsed.keys));
   }
 
   async prepareMessage(request: OpenRequest): Promise<MessagePrepared> {
-    const parsed = this.keysOf(request);
+    const parsed = parseOwnerAndKeys(request.owner, request.orderKeys);
     if ("ok" in parsed) return parsed;
     return this.locked(() => this.prepareMessageLocked(request));
   }
@@ -631,24 +628,13 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
         }
       }
       if (openedBefore) await this.settle(() => admission.confirm(request.reservation));
-      const refusal = refusalOf(error);
-      log(
-        `gate: ${owner} account ${
-          openedBefore
-            ? "was opened by an earlier try, now recorded"
-            : programRefused || doorRefused
-              ? "refused, its seat stays reserved until it can no longer land"
-              : "may or may not be open"
-        }: ${refusal.reason}`,
+      return answerFailedOpening(
+        log,
+        owner,
+        openedBefore,
+        programRefused || doorRefused,
+        refusalOf(error),
       );
-      return programRefused || doorRefused
-        ? refusal
-        : {
-            ok: false,
-            status: 502,
-            reason:
-              "the rollup did not confirm in time. The account may have been opened: check before you try again",
-          };
     }
   }
 
@@ -740,23 +726,7 @@ export class OpenDesk implements OpenRequests, SignedOpenRequests, SeatSweeping 
         await this.settle(() => this.options.admission.confirm(reserved.reservation));
       const owners = programRefused ? ownerRefusalOf(error.code) : null;
       const refusal = owners ? { ok: false as const, ...owners } : refusalOf(error);
-      log(
-        `gate: ${owner} account ${
-          openedBefore
-            ? "was opened by an earlier try, now recorded"
-            : programRefused || doorRefused
-              ? "refused, its seat stays reserved until it can no longer land"
-              : "may or may not be open"
-        }: ${refusal.reason}`,
-      );
-      return programRefused || doorRefused
-        ? refusal
-        : {
-            ok: false,
-            status: 502,
-            reason:
-              "the rollup did not confirm in time. The account may have been opened: check before you try again",
-          };
+      return answerFailedOpening(log, owner, openedBefore, programRefused || doorRefused, refusal);
     }
   }
 
