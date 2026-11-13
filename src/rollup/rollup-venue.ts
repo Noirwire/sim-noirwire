@@ -42,6 +42,7 @@ import { noteMakerQuote } from "./maker-quotes.js";
 import { OpenDesk } from "./open-desk.js";
 import {
   FIRST_TRADER_SEAT,
+  type KeyReset,
   type Program,
   fillRoles,
   newOrderSecret,
@@ -110,6 +111,8 @@ export interface RollupVenueOptions {
   recordedThrough: Record<MarketId, number>;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
   keyCheckpoints: Record<string, KeyCheckpoint>;
+  /** What a bot does with order keys that no checkpoint accounts for. Absent: replace them, as ever. */
+  keyReset?: KeyReset;
   handlers: RollupVenueHandlers;
 }
 
@@ -137,8 +140,8 @@ export class RollupVenue implements Venue {
   private readonly sweep: SeatSweep;
   /** Null on a deployment without a faucet. */
   private readonly faucet: Session | null;
-  /** The gate key's connection. */
-  private readonly gateSession: Session;
+  /** The gate key's connection; null in a process that holds no gate key. */
+  private readonly gateSession: Session | null;
   /** Every key's connection, opened again after a rest. */
   private readonly sessions: Session[] = [];
   private stopped = false;
@@ -178,9 +181,11 @@ export class RollupVenue implements Venue {
         ? signedInSession(settings.rollupRpcUrl, faucetKey, () => this.life)
         : Session.of(connectionTo(settings.depositRpcUrl));
 
-    const gate = signedInSession(settings.rollupRpcUrl, settings.gate, () => this.life);
+    const gate = settings.gate
+      ? signedInSession(settings.rollupRpcUrl, settings.gate, () => this.life)
+      : null;
     this.gateSession = gate;
-    this.sessions.push(gate);
+    if (gate) this.sessions.push(gate);
     if (this.faucet) this.sessions.push(this.faucet);
 
     // What the feed fails at is what the rollup's reachability is judged by.
@@ -216,6 +221,7 @@ export class RollupVenue implements Venue {
       gate,
       faucet: this.faucet,
       keyCheckpoints: options.keyCheckpoints,
+      keyReset: options.keyReset,
       syncMarketId: anyMarket.chain.marketId,
       life: () => this.life,
     });
@@ -643,6 +649,7 @@ export class RollupVenue implements Venue {
   fundDesk(amount: bigint, clock: Clock): FundDesk | null {
     const { settings, program, handlers } = this.options;
     if (!this.faucet || !settings.faucet) return null;
+    if (!settings.gate) throw new Error("this process holds no gate key, so it opens no accounts");
     const collateral = deployedToken(settings.deployment, COLLATERAL_TOKEN);
     if (!collateral) throw new Error(`the deployment has no ${COLLATERAL_TOKEN} token`);
     return new FundDesk({
@@ -660,6 +667,9 @@ export class RollupVenue implements Venue {
   /** The desk that opens accounts for invited users and funds none of them. */
   openDesk(admission: Admission, log: (line: string) => void, clock: Clock): OpenDesk {
     const { settings, program, handlers } = this.options;
+    if (!settings.gate || !this.gateSession) {
+      throw new Error("this process holds no gate key, so it opens no accounts");
+    }
     return new OpenDesk({
       program,
       session: this.gateSession,

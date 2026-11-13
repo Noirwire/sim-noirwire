@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { Keypair } from "@solana/web3.js";
 import { z } from "zod";
 import type { Config } from "../config/config.js";
+import { type SimRole, holdsGateKey, holdsMakerSeeds } from "../config/role.js";
 import type { MarketConfig } from "../engine/markets.js";
 
 const address = z.string().min(32).max(44);
@@ -41,8 +42,7 @@ const deploymentSchema = z.object({
 export type Deployment = z.infer<typeof deploymentSchema>;
 
 const URLS = ["SOLANA_RPC_URL", "ROLLUP_RPC_URL", "ROLLUP_WS_URL"] as const;
-const ROLE_KEYS = ["GATE_SECRET_KEY", "FAUCET_SECRET_KEY"] as const;
-type RoleKey = (typeof ROLE_KEYS)[number];
+type RoleKey = "GATE_SECRET_KEY" | "FAUCET_SECRET_KEY";
 
 export type RollupEnv = Pick<
   Config,
@@ -67,7 +67,8 @@ export interface RollupSettings {
    */
   depositRpcUrl: string;
   deployment: Deployment;
-  gate: Keypair;
+  /** Null in a process that does not hold the gate key (the maker and the market data API). */
+  gate: Keypair | null;
   /** Null on a deployment without a faucet: this service then deposits nothing. */
   faucet: Keypair | null;
   botOwners: Keypair[];
@@ -208,13 +209,21 @@ export const loadRollupSettings = (
   env: RollupEnv,
   deployment: Deployment,
   botCount: number,
+  role: SimRole = "combined",
 ): RollupSettings => {
   const [solanaRpcUrl, rollupRpcUrl, rollupWsUrl] = URLS.map((name) => env[name] ?? "");
-  const botSeeds = botSeedsText(env);
-  const neededKeys = deployment.faucet ? ROLE_KEYS : (["GATE_SECRET_KEY"] as const);
+  // A role reads only the credentials it needs: the others are never loaded, even if they are in the environment.
+  const needsGate = holdsGateKey(role);
+  const needsSeeds = holdsMakerSeeds(role);
+  const needsFaucet = role !== "data" && Boolean(deployment.faucet);
+  const botSeeds = needsSeeds ? botSeedsText(env) : "";
+  const neededKeys: RoleKey[] = [
+    ...(needsGate ? (["GATE_SECRET_KEY"] as const) : []),
+    ...(needsFaucet ? (["FAUCET_SECRET_KEY"] as const) : []),
+  ];
   const missing = [
     ...URLS.filter((name) => !env[name]),
-    ...(botSeeds ? [] : ["BOT_TRADER_SEEDS"]),
+    ...(needsSeeds && !botSeeds ? ["BOT_TRADER_SEEDS"] : []),
     ...neededKeys.filter((name) => !env[name] && !env[`${name}_FILE`]),
   ];
   if (missing.length > 0) throw new Error(`VENUE=rollup needs ${missing.join(", ")}`);
@@ -222,11 +231,11 @@ export const loadRollupSettings = (
     if (!URL.canParse(env[name] ?? "")) throw new Error(`${name} must be a URL`);
   }
 
-  const gate = roleKey(env, "GATE_SECRET_KEY");
-  if (gate.publicKey.toBase58() !== deployment.gate) {
+  const gate = needsGate ? roleKey(env, "GATE_SECRET_KEY") : null;
+  if (gate && gate.publicKey.toBase58() !== deployment.gate) {
     throw new Error("the gate key is not the gate this deployment names");
   }
-  const faucet = deployment.faucet ? roleKey(env, "FAUCET_SECRET_KEY") : null;
+  const faucet = needsFaucet ? roleKey(env, "FAUCET_SECRET_KEY") : null;
   if (faucet && faucet.publicKey.toBase58() !== deployment.faucet) {
     throw new Error("the faucet key is not the faucet this deployment names");
   }
@@ -239,6 +248,6 @@ export const loadRollupSettings = (
     deployment,
     gate,
     faucet,
-    botOwners: botOwnersFrom(botSeeds, botCount),
+    botOwners: needsSeeds ? botOwnersFrom(botSeeds, botCount) : [],
   };
 };

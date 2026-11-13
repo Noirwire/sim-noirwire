@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { isMainnet } from "../../config/config.js";
+import { servesAccountDesk } from "../../config/role.js";
 import type { AppContext } from "../context.js";
 
 /**
@@ -24,7 +25,10 @@ export const registerHealthRoute = (app: FastifyInstance, ctx: AppContext): void
       venue: ctx.config.VENUE,
       network: ctx.config.NETWORK,
       awake: ctx.activity.awake,
-      ...(isMainnet(ctx.config) ? { gate: ctx.config.GATE_OPEN ? "open" : "invite-only" } : {}),
+      ...(ctx.config.SIM_ROLE === "combined" ? {} : { role: ctx.config.SIM_ROLE }),
+      ...(isMainnet(ctx.config) && servesAccountDesk(ctx.config.SIM_ROLE)
+        ? { gate: ctx.config.GATE_OPEN ? "open" : "invite-only" }
+        : {}),
     };
     const trading = ctx.activity.awake ? ctx.trading?.() : undefined;
     const tradingField = trading ? { trading } : {};

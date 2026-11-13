@@ -3,7 +3,7 @@ import type { TraderKey } from "../engine/types.js";
 import type { DepositTarget, KeyCheckpoint } from "./chain-types.js";
 import type { Session } from "./connections.js";
 import type { Generation } from "./generation.js";
-import type { Program, ProgramTrader } from "./program.js";
+import type { GateAccess, KeyReset, Program, ProgramTrader } from "./program.js";
 import type { RollupSettings } from "./settings.js";
 import { COLLATERAL_TOKEN, deployedToken } from "./tokens.js";
 import { toChainAmount } from "./units.js";
@@ -24,7 +24,10 @@ export interface BotAccountsOptions {
   program: Program;
   settings: RollupSettings;
   bots: BotSpec[];
-  gate: Session;
+  /** Null in a process that holds no gate key: a seat that is not open then stays closed, and the bot says so. */
+  gate: Session | null;
+  /** What to do with order keys that no checkpoint accounts for: "replace" them (the default) or "refuse" to start. */
+  keyReset?: KeyReset;
   /** Null on a deployment without a faucet: the bots are then funded by whoever runs the deployment. */
   faucet: Session | null;
   /** Per bot owner address, where its order keys stood when an earlier run last saved. */
@@ -73,17 +76,17 @@ export class BotAccounts {
     const life = this.options.life();
     let opening = this.opening.get(key);
     if (!opening) {
-      const { program, settings, gate, keyCheckpoints } = this.options;
-      const attempt: Promise<ProgramTrader> = gate
-        .use((gateConnection) =>
-          program.openOwnTrader(
-            settings.rollupRpcUrl,
-            bot.owner,
-            settings.gate,
-            gateConnection,
-            this.letGo[address] ?? keyCheckpoints[address],
-            life,
-          ),
+      const { program, settings, gate, keyCheckpoints, keyReset } = this.options;
+      const gateAccess: GateAccess | null =
+        gate && settings.gate ? { key: settings.gate, use: (work) => gate.use(work) } : null;
+      const attempt: Promise<ProgramTrader> = program
+        .openOwnTrader(
+          settings.rollupRpcUrl,
+          bot.owner,
+          gateAccess,
+          this.letGo[address] ?? keyCheckpoints[address],
+          life,
+          keyReset,
         )
         .finally(() => {
           // A retire may have cleared the map, and a new wake started another opening of this bot.

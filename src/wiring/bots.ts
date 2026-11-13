@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { makerTraderKey } from "../bots/bot-traders.js";
 import { FundingUpdater } from "../bots/funding-updater.js";
@@ -27,7 +28,8 @@ import {
 import { connectionTo } from "../rollup/connections.js";
 import { pythPriceAccountOf } from "../rollup/program.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
-import { KeeperHeartbeat } from "./keeper-heartbeat.js";
+import { KeeperHeartbeat, type KeeperProblemSource } from "./keeper-heartbeat.js";
+import { NetworkKeeperHeartbeat, keeperSources } from "./keeper-network-heartbeat.js";
 import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
@@ -65,6 +67,48 @@ const readWithinDeadline = <T>(
       },
     );
   });
+
+/**
+ * The keeper's heartbeat from the transport the settings name: the network (signed statuses from one
+ * or more keepers) or, as ever, the file. With neither, mainnet fails closed and the other networks
+ * leave the keeper out of it.
+ */
+export const keeperHeartbeatFor = (config: Config): KeeperProblemSource => {
+  if (config.KEEPER_HEARTBEAT_URLS && config.KEEPER_HEARTBEAT_SECRETS_FILE) {
+    return new NetworkKeeperHeartbeat({
+      sources: keeperSources(
+        config.KEEPER_HEARTBEAT_URLS,
+        readKeeperSecrets(config.KEEPER_HEARTBEAT_SECRETS_FILE),
+      ),
+      network: config.NETWORK,
+      minHealthy: config.KEEPER_HEARTBEAT_MIN_HEALTHY,
+      maxAgeMs: config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+      pollEveryMs: config.KEEPER_HEARTBEAT_POLL_MS,
+      clock: systemClock,
+    });
+  }
+  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
+  return new KeeperHeartbeat(
+    keeperFile
+      ? () =>
+          readWithinDeadline(
+            () => readFile(keeperFile, "utf8"),
+            "the keeper heartbeat file was not read",
+          )
+      : undefined,
+    isMainnet(config),
+    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+    systemClock,
+  );
+};
+
+const readKeeperSecrets = (path: string): string => {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    throw new Error("KEEPER_HEARTBEAT_SECRETS_FILE must be a readable file");
+  }
+};
 
 export interface BotProblems {
   onError(what: string, error: unknown): void;
@@ -130,7 +174,7 @@ const makerSafety = (
   reference: ReferencePrice,
   control: MakerControl,
   problems: BotProblems,
-  keeper: KeeperHeartbeat,
+  keeper: KeeperProblemSource,
   hedge?: HedgeGate,
 ): MakerSafety => {
   if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
@@ -275,21 +319,9 @@ export const openBots = async (
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)
     : undefined;
-  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
-  // Readiness is a synchronous function of cached state, so the file is read by the readiness loop, not by `trading()`.
+  // Readiness is a synchronous function of cached state, so the heartbeat is read by the readiness loop, not by `trading()`.
   // Every maker's safety reads the same heartbeat.
-  const keeper = new KeeperHeartbeat(
-    keeperFile
-      ? () =>
-          readWithinDeadline(
-            () => readFile(keeperFile, "utf8"),
-            "the keeper heartbeat file was not read",
-          )
-      : undefined,
-    isMainnet(config),
-    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
-    systemClock,
-  );
+  const keeper = keeperHeartbeatFor(config);
   for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
     // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.

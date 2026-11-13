@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DECIMAL_TEXT, fromDecimalString } from "../engine/money.js";
 import { mainnetConfig } from "./mainnet.js";
+import { SIM_ROLES, type SimRole, roleProblems } from "./role.js";
 
 const decimalAmount = (defaultValue: string) =>
   z
@@ -54,6 +55,8 @@ const keyBearingUrl = (defaultValue: string) =>
 
 /** Every variable this service reads, with its default. `.env.example` documents each one. */
 const envSchema = z.object({
+  /** Which part of the service this process runs (`config/role.ts`). Combined is everything in one process. */
+  SIM_ROLE: z.enum(SIM_ROLES).default("combined"),
   PORT: positiveInt(4100),
   HOST: z.string().default("0.0.0.0"),
   VENUE: z.enum(["memory", "rollup"]).default("memory"),
@@ -101,6 +104,26 @@ const envSchema = z.object({
   KEEPER_HEARTBEAT_FILE: z.string().min(1).optional(),
   /** Trading is not ready when that sweep is older than this. */
   KEEPER_HEARTBEAT_MAX_AGE_MS: positiveInt(30_000),
+  /**
+   * The network transport for the keeper's heartbeat, instead of the file: one `id=url` per keeper,
+   * comma separated. Each keeper's status is signed with its own secret from KEEPER_HEARTBEAT_SECRETS_FILE
+   * (`id=secret` per line). Setting both this and KEEPER_HEARTBEAT_FILE stops the start.
+   */
+  KEEPER_HEARTBEAT_URLS: z.string().min(1).optional(),
+  KEEPER_HEARTBEAT_SECRETS_FILE: z.string().min(1).optional(),
+  /** The keepers that must report a healthy, fresh sweep for the maker to quote. One of two copies is enough by default. */
+  KEEPER_HEARTBEAT_MIN_HEALTHY: positiveInt(1),
+  /** How often the maker asks each keeper; a failed ask is retried on the next readiness tick. */
+  KEEPER_HEARTBEAT_POLL_MS: positiveInt(2_000),
+  /**
+   * On, a maker whose order key checkpoint is missing or no longer fits the chain refuses to start, and
+   * never replaces its order keys by itself (`bin reset-order-keys` is the deliberate way). Unset: on for
+   * mainnet, off elsewhere.
+   */
+  REQUIRE_KEY_CHECKPOINT: z
+    .enum(["0", "1"])
+    .optional()
+    .transform((value) => (value === undefined ? undefined : value === "1")),
 
   /** Accounts are opened with a message the owner signs, not a transaction. Only valid once the deployed program has the signed instructions. */
   SIGNED_OWNER_ACTIONS: boolFlag("0"),
@@ -200,7 +223,45 @@ export const questSettings = (config: Config): QuestSettings | null => {
 
 export const isMainnet = (config: Pick<Config, "NETWORK">): boolean => config.NETWORK === "mainnet";
 
-export const loadConfig = (env: NodeJS.ProcessEnv = process.env): Config => {
-  const config = envSchema.parse(env);
+/** Whether a missing or unusable order key checkpoint stops the maker instead of resetting its keys. */
+export const requiresKeyCheckpoint = (
+  config: Pick<Config, "NETWORK" | "REQUIRE_KEY_CHECKPOINT">,
+): boolean => config.REQUIRE_KEY_CHECKPOINT ?? isMainnet(config);
+
+/**
+ * The service's settings from the environment. An entry point that runs one
+ * part of the service names its role; the environment may not contradict it.
+ */
+export const loadConfig = (env: NodeJS.ProcessEnv = process.env, entryRole?: SimRole): Config => {
+  if (entryRole && isSet(env, "SIM_ROLE") && env.SIM_ROLE !== entryRole) {
+    throw new Error(
+      `this entry point runs the ${entryRole} role, but SIM_ROLE=${env.SIM_ROLE}. Remove SIM_ROLE or set it to ${entryRole}.`,
+    );
+  }
+  const config = envSchema.parse(entryRole ? { ...env, SIM_ROLE: entryRole } : env);
+  const problems = [...roleProblems(config.SIM_ROLE, env), ...keeperTransportProblems(config, env)];
+  if (problems.length > 0) {
+    throw new Error(
+      `SIM_ROLE=${config.SIM_ROLE} cannot start. What to fix:\n${problems.map((line) => `- ${line}`).join("\n")}`,
+    );
+  }
   return isMainnet(config) ? mainnetConfig(config, env) : config;
 };
+
+const isSet = (env: NodeJS.ProcessEnv, name: string): boolean => (env[name] ?? "") !== "";
+
+const keeperTransportProblems = (config: Config, env: NodeJS.ProcessEnv): string[] => [
+  ...(isSet(env, "KEEPER_HEARTBEAT_FILE") && config.KEEPER_HEARTBEAT_URLS
+    ? [
+        "KEEPER_HEARTBEAT_FILE and KEEPER_HEARTBEAT_URLS are both set. Pick one transport for the keeper's heartbeat.",
+      ]
+    : []),
+  ...(config.KEEPER_HEARTBEAT_URLS && !config.KEEPER_HEARTBEAT_SECRETS_FILE
+    ? [
+        "KEEPER_HEARTBEAT_URLS is set without KEEPER_HEARTBEAT_SECRETS_FILE. A keeper's status counts only when it is signed.",
+      ]
+    : []),
+  ...(!config.KEEPER_HEARTBEAT_URLS && config.KEEPER_HEARTBEAT_SECRETS_FILE
+    ? ["KEEPER_HEARTBEAT_SECRETS_FILE is set without KEEPER_HEARTBEAT_URLS."]
+    : []),
+];

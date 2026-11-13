@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { Activity, type Lifecycle } from "./activity/activity.js";
 import { type Config, isMainnet } from "./config/config.js";
+import { runsMaker, servesAccountDesk } from "./config/role.js";
 import { CandleAggregator } from "./data/candles.js";
 import { FundLedger } from "./data/fund-ledger.js";
 import { SnapshotStore } from "./data/snapshot.js";
@@ -23,6 +24,7 @@ import { StartUp } from "./scheduling/start-up.js";
 import { HedgeNotAvailable, type OpenedBots, openBots } from "./wiring/bots.js";
 import { memoryWiring } from "./wiring/memory-wiring.js";
 import { rollupWiring } from "./wiring/rollup-wiring.js";
+import { KeyCheckpointRequired } from "./rollup/program.js";
 
 const STATS_BROADCAST_INTERVAL_MS = 2_000;
 const WAIT_FOR_LOOPS_ON_CLOSE_MS = 2_000;
@@ -191,7 +193,8 @@ export const startApp = async (
     isFatal: (error) =>
       error instanceof NetworkMismatch ||
       error instanceof HedgeNotAvailable ||
-      error instanceof HedgeVenueLoadError,
+      error instanceof HedgeVenueLoadError ||
+      error instanceof KeyCheckpointRequired,
     onFailure: (error, failures, retryInMs) =>
       console.error(
         `sim-noirwire: start-up failed (try ${failures}), trying again in ${Math.round(retryInMs / 1_000)} s: ${firstLine(error)}`,
@@ -251,11 +254,19 @@ export const startApp = async (
   botsStarted.then(
     () => {
       if (config.VENUE === "rollup") activity.settle();
+      // Where the order keys stand is saved now, not at the next interval: a restart a moment after
+      // a first start must still find the checkpoint it is set to insist on.
+      if (config.VENUE === "rollup" && runsMaker(config.SIM_ROLE)) {
+        saveSnapshot().catch((error) => logError("saving the snapshot", error));
+      }
     },
     () => {},
   );
   // On mainnet the maker is the only liquidity, so it quotes whether or not anybody is watching.
-  if (config.VENUE === "memory" || isMainnet(config)) activity.holdAwake();
+  // A maker process on its own is never asked anything, so nothing would ever wake it.
+  if (config.VENUE === "memory" || isMainnet(config) || config.SIM_ROLE === "maker") {
+    activity.holdAwake();
+  }
 
   const server = await buildServer({
     config,
@@ -277,11 +288,14 @@ export const startApp = async (
   const address = server.server.address();
   const port = typeof address === "object" && address ? address.port : config.PORT;
   console.log(`sim-noirwire: listening on http://${config.HOST}:${port} (venue=${config.VENUE})`);
+  if (config.SIM_ROLE !== "combined") {
+    console.log(`sim-noirwire: running the ${config.SIM_ROLE} role only`);
+  }
   if (isMainnet(config)) {
     console.log(
       "sim-noirwire: mainnet mode: running the house maker, the gate and the market data only",
     );
-    if (config.GATE_OPEN) {
+    if (config.GATE_OPEN && servesAccountDesk(config.SIM_ROLE)) {
       console.log("sim-noirwire: the gate is open: any owner key may open an account");
     }
   }

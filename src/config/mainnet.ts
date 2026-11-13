@@ -1,6 +1,13 @@
 import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import { SCALE } from "../engine/money.js";
 import type { Config } from "./config.js";
+import {
+  type SimRole,
+  holdsGateKey,
+  holdsMakerSeeds,
+  servesAccountDesk,
+  servesMarketData,
+} from "./role.js";
 
 type Env = NodeJS.ProcessEnv;
 
@@ -110,17 +117,27 @@ const testMachinery = (config: Config, env: Env): string[] => [
       ]),
 ];
 
-const secretsFromFiles = (env: Env): string[] =>
-  FROM_A_FILE.flatMap(({ inline, file, why }) => {
+/** Which of the secrets in FROM_A_FILE a role needs: the others are not asked for, and `roleProblems` refuses them. */
+const neededByRole = (role: SimRole): Record<string, boolean> => ({
+  GATE_SECRET_KEY: holdsGateKey(role),
+  BOT_TRADER_SEEDS: holdsMakerSeeds(role),
+  DEPLOYMENT_JSON: true,
+});
+
+const secretsFromFiles = (env: Env, role: SimRole): string[] => {
+  const needed = neededByRole(role);
+  return FROM_A_FILE.flatMap(({ inline, file, why }) => {
     if (isSet(env, inline)) {
       return [
         `${inline} is set, but on mainnet ${why}. Remove it and set ${file} to the file's path.`,
       ];
     }
+    if (!needed[inline]) return [];
     return isSet(env, file)
       ? []
       : [`${file} is not set. On mainnet ${why}. Set it to the file's path.`];
   });
+};
 
 const publicUrls = (env: Env): string[] =>
   PUBLIC_URLS.flatMap(({ name, private: privateName, sharedScheme }) => {
@@ -231,13 +248,14 @@ const makerLimits = (config: Config, env: Env): string[] => [
  */
 export const mainnetConfig = (config: Config, env: Env): Config => {
   const sized = withMakerDefaults(config, env);
+  const role = config.SIM_ROLE;
   const problems = [
     ...testMachinery(sized, env),
     ...makerLimits(sized, env),
-    ...secretsFromFiles(env),
-    ...gateSettings(sized, env),
-    ...publicUrls(env),
-    ...proxyHops(sized),
+    ...secretsFromFiles(env, role),
+    ...(servesAccountDesk(role) ? gateSettings(sized, env) : []),
+    ...(servesMarketData(role) ? publicUrls(env) : []),
+    ...(role === "maker" ? [] : proxyHops(sized)),
   ];
   if (problems.length > 0) {
     throw new Error(

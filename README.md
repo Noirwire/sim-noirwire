@@ -136,6 +136,42 @@ start when a required one is missing or a key is not the one the deployment name
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`                                  | no         | Bot order sizes as notional                                                                                                                                               |
 | `LIQUIDATOR_SEATS_PER_TICK`                                                                   | no         | Consecutive seats the liquidator sweeps in one call per market per tick; the sweep walks the exchange's whole seat capacity                                               |
 
+### Running the parts as separate processes
+
+`node dist/main.js` runs everything in one process, as ever. For a cluster, the same image has three
+more entry points, each of which loads only its own settings, credentials and `DATA_DIR`, and
+answers its own `/v1/health`. All three need `VENUE=rollup`.
+
+| Entry point        | Role    | Holds                                | Serves                                                        |
+| ------------------ | ------- | ------------------------------------ | ------------------------------------------------------------- |
+| `dist/maker.js`    | `maker` | `BOT_TRADER_SEEDS`; never a gate key | its own health only                                           |
+| `dist/gate.js`     | `gate`  | the gate key, the seat record        | the account desk (`/v1/open`, or the fund routes off mainnet) |
+| `dist/data-api.js` | `data`  | no key at all                        | market data, the stream, `/v1/deployment`                     |
+
+A process refuses to start with a credential that is not its role's (the message names the variable,
+never the value). The maker never signs in the gate: a seat that exists is found with the owner key
+alone, and a seat that is missing stops it with a message to open it from the gate. The data API's
+readiness does not depend on the maker quoting.
+
+The keeper's heartbeat can come over the network instead of the file. Set `KEEPER_HEARTBEAT_URLS`
+(`id=url`, comma separated, one per keeper) and `KEEPER_HEARTBEAT_SECRETS_FILE` (`id=secret` per line,
+32 characters or more). Each keeper answers `GET <url>?nonce=<random>` with a JSON status and the header
+`x-keeper-signature`, the hex HMAC-SHA256 of the exact body under its own secret. The status is
+`{ v: 1, keeper, network, nonce, issuedAtMs, healthy, sweepSeq, sweepCompletedAtMs, failedSteps }`: `nonce`
+echoes the request, `healthy` is true only for a sweep that did not fail, ended no market at "stale price"
+and left no ALERT standing, and both times are the keeper's own clock (only their difference is used).
+`KEEPER_HEARTBEAT_MIN_HEALTHY` (1) says how many keepers must be fresh and healthy. A lost transport
+makes the maker go dark once the last healthy sweep is `KEEPER_HEARTBEAT_MAX_AGE_MS` old, as a stale file
+does; a wrong answer (bad signature, wrong nonce, unhealthy) counts at once. Setting both the file and the
+URLs stops the start.
+
+`REQUIRE_KEY_CHECKPOINT` (on by default on mainnet): a maker whose seat exists but whose saved order key
+checkpoint is missing, or no longer fits the chain, refuses to start instead of replacing its order keys
+(the replacement is unconditional on chain, so any other copy holding the owner key can take the keys back
+with it). A view that still holds the first four keys is picked up as it is. To reset deliberately, with
+every other instance stopped: `npm run reset-order-keys` lists the owners, and `-- --confirm <owner address>`
+replaces that owner's keys and saves the checkpoint.
+
 ### Mainnet mode
 
 `NETWORK=mainnet` runs only what a live market needs: the house maker, the gate and the

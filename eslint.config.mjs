@@ -52,8 +52,10 @@ export default defineConfig([
     files: [
       "scripts/**",
       "src/main.ts",
+      "src/run.ts",
       "src/app.ts",
       "src/kill-switch.ts",
+      "src/reset-order-keys.ts",
       "src/bots/maker-state.ts",
     ],
     rules: { "no-console": "off" },

@@ -7,6 +7,16 @@ const DIGITS = /^\d+$/;
 /** The problem before the first read: normal for a moment after a start or a wake, so it is not worth an alert. */
 export const KEEPER_NOT_READ_YET = "keeper heartbeat has not been read yet";
 
+/** What the maker asks of whichever transport carries the keeper's heartbeat: the file or the network. */
+export interface KeeperProblemSource {
+  /** Forget what was read, so nothing is ready before a read has said it is. */
+  reset(): void;
+  /** Reads the heartbeat. Never throws. */
+  poll(): Promise<void>;
+  /** Why the keeper counts as not running, or undefined when it is fine or not part of this deployment. */
+  problem(): string | undefined;
+}
+
 /**
  * What the liquidation keeper, which runs outside this process, last said about itself: the Unix
  * time in ms of its last healthy sweep, as decimal text in a file. `poll` reads the file and never
@@ -14,7 +24,7 @@ export const KEEPER_NOT_READ_YET = "keeper heartbeat has not been read yet";
  * stays a function of cached state. The age is worked out at each `problem` call, so a poll loop
  * that dies shows up as a stale heartbeat rather than a frozen "fresh" one.
  */
-export class KeeperHeartbeat {
+export class KeeperHeartbeat implements KeeperProblemSource {
   private seen: Seen = { at: "none" };
 
   constructor(
