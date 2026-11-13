@@ -1159,8 +1159,27 @@ describe("the mainnet settings of the maker", () => {
     expect(config.ROLLUP_MAKER_LEVEL_NUSD).toBe(dollars(50));
     expect(config.HOUSE_MAKER_POSITION_LIMIT_NUSD).toBe(dollars(250));
     expect(config.HOUSE_MAKER_LEVELS).toBe(3);
-    expect(config.HOUSE_MAKER_REQUOTE_INTERVAL_MS).toBe(10_000);
+    expect(config.HOUSE_MAKER_REQUOTE_INTERVAL_MS).toBe(5_000);
+    expect(config.HOUSE_MAKER_REQUOTE_THRESHOLD_BPS).toBe(3);
+    expect(config.HOUSE_MAKER_TICK_MS).toBe(250);
     expect(config.HOUSE_MAKER_SPREAD_BPS).toBe(15);
+  });
+
+  it("quotes from the rollup's price by default, and keeps its limits on how old and how far from Pyth", () => {
+    const config = loadConfig(env());
+
+    expect(config.MAGICBLOCK_REFERENCE).toBe(true);
+    expect(config.MAGICBLOCK_MAX_AGE_MS).toBe(3_000);
+    expect(config.MAGICBLOCK_PYTH_MAX_BPS).toBe(30);
+    expect(loadConfig(env({ MAGICBLOCK_REFERENCE: "off" })).MAGICBLOCK_REFERENCE).toBe(false);
+    expect(loadConfig({ NETWORK: "devnet" }).MAGICBLOCK_REFERENCE).toBe(false);
+    expect(refusals({ MAGICBLOCK_MAX_AGE_MS: "10001" })).toEqual([
+      expect.stringContaining("MAGICBLOCK_MAX_AGE_MS is over 10000 ms"),
+    ]);
+    expect(refusals({ MAGICBLOCK_PYTH_MAX_BPS: "31" })).toEqual([
+      expect.stringContaining("MAGICBLOCK_PYTH_MAX_BPS is over 30 bps"),
+    ]);
+    expect(loadConfig(env({ MAGICBLOCK_MAX_AGE_MS: "10000" })).MAGICBLOCK_MAX_AGE_MS).toBe(10_000);
   });
 
   it("takes the sizes it is given, within the limits", () => {
@@ -1735,6 +1754,31 @@ describe("the makers opened by the service", () => {
     const { opened } = await openedWith(MARKETS[1], { HOUSE_MAKER_RISK_RULES: "1" });
 
     await expect(opened).rejects.toThrow("cannot cover NNVDA-PERP");
+  });
+
+  it("refuses the rollup's price without the risk rules, or without the rollup's addresses", async () => {
+    const withoutRules = await openedWith(MARKETS[0], { MAGICBLOCK_REFERENCE: "on" });
+    await expect(withoutRules.opened).rejects.toThrow("set HOUSE_MAKER_RISK_RULES=1");
+
+    const withoutAddresses = await openedWith(MARKETS[0], {
+      HOUSE_MAKER_RISK_RULES: "1",
+      MAGICBLOCK_REFERENCE: "on",
+    });
+    await expect(withoutAddresses.opened).rejects.toThrow("needs ROLLUP_RPC_URL and ROLLUP_WS_URL");
+  });
+
+  it("follows the rollup's price while its loops run, and lets go of the socket when they stop", async () => {
+    const { opened } = await openedWith(MARKETS[0], {
+      HOUSE_MAKER_RISK_RULES: "1",
+      MAGICBLOCK_REFERENCE: "on",
+      ROLLUP_RPC_URL: "http://127.0.0.1:1",
+      ROLLUP_WS_URL: "ws://127.0.0.1:1",
+    });
+    const bots = await opened;
+    const loops = bots.start();
+    expect(loops.length).toBeGreaterThan(1);
+    for (const loop of loops) loop.stop();
+    await Promise.all(loops.map((loop) => loop.idle()));
   });
 });
 

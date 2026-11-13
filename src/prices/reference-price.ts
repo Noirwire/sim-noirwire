@@ -25,6 +25,11 @@ export type Reference =
   /** `leftOut` names the stale exchange readings that were dropped from the median, with their age. */
   { ok: true; price: bigint; leftOut?: string[] } | { ok: false; reason: string };
 
+/** What the maker's risk rules and the hedge read the reference price from. */
+export interface ReferenceReader {
+  read(): Promise<Reference>;
+}
+
 export type FetchJson = (url: string) => Promise<unknown>;
 
 /** The data of Pyth's SOL/USD price account on Solana mainnet, or null when the account does not exist. */
@@ -128,8 +133,22 @@ const okxBody = z.object({
  * Pyth's SOL/USD price, read from its price account on Solana mainnet (free,
  * through the Solana RPC connection; the account is the one the exchange's SOL
  * market is bound to). It is pushed every few seconds, so it may be up to
- * `maxOracleAgeMs` old. The exchanges are the public SOL tickers of Coinbase,
- * Kraken and OKX, and no call carries a key. Each exchange price is the middle
+ * `maxOracleAgeMs` old.
+ */
+export const pythSource = (readAccount: ReadPythAccount): ReferenceSource => ({
+  name: "Pyth",
+  exchange: false,
+  minIntervalMs: PYTH_MIN_INTERVAL_MS,
+  read: async () => {
+    const data = await readAccount();
+    if (!data) throw new SourceRefused("the Pyth price account does not exist");
+    return readPythAccount(data);
+  },
+});
+
+/**
+ * Pyth, and the public SOL tickers of Coinbase, Kraken and OKX, where no call
+ * carries a key. Each exchange price is the middle
  * of its best bid and ask, which is its quote now rather than its last trade,
  * so a quiet market does not read as a stale one. Coinbase and Kraken say
  * nothing of when the quote was set, so their reading is dated at the moment
@@ -140,16 +159,7 @@ export const referenceSources = (
   getJson: FetchJson = fetchJson,
   nowMs: () => number = Date.now,
 ): ReferenceSource[] => [
-  {
-    name: "Pyth",
-    exchange: false,
-    minIntervalMs: PYTH_MIN_INTERVAL_MS,
-    read: async () => {
-      const data = await readAccount();
-      if (!data) throw new SourceRefused("the Pyth price account does not exist");
-      return readPythAccount(data);
-    },
-  },
+  pythSource(readAccount),
   {
     name: "Coinbase",
     exchange: true,
@@ -278,30 +288,22 @@ export const referenceOf = (
 };
 
 /**
- * Reads every source at once, and hands what came back to `referenceOf`. A
- * source is called at most once per `minIntervalMs`; in between, its last
+ * Calls a source at most once per its `minIntervalMs`; in between, its last
  * answer is used again as it was, a reading keeping its own time (so it ages
  * and goes stale when it would have) and a failure failing the same way (so a
- * source that is down is not called every time either).
+ * source that is down is not called every time either). `monotonicMs` times the
+ * gap between calls and nothing else: the wall clock can be corrected backward
+ * or forward, which must neither bring a source's next call early nor push it late.
  */
-export class ReferencePrice {
+export class Throttle {
   private readonly lastCalls = new Map<
     ReferenceSource,
     { monotonicAtMs: number; answer: Promise<PriceReading> }
   >();
 
-  /**
-   * `monotonicMs` times the gap between calls and nothing else: the wall clock
-   * can be corrected backward or forward, which must neither bring a source's
-   * next call early nor push it late. Readings are dated, and aged, by `clock`.
-   */
-  constructor(
-    private readonly sources: ReferenceSource[],
-    private readonly clock: Clock,
-    private readonly monotonicMs: () => number = () => performance.now(),
-  ) {}
+  constructor(private readonly monotonicMs: () => number = () => performance.now()) {}
 
-  private readSource(source: ReferenceSource): Promise<PriceReading> {
+  read(source: ReferenceSource): Promise<PriceReading> {
     const monotonicNowMs = this.monotonicMs();
     const last = this.lastCalls.get(source);
     if (last && monotonicNowMs - last.monotonicAtMs < (source.minIntervalMs ?? 0)) {
@@ -311,9 +313,24 @@ export class ReferencePrice {
     this.lastCalls.set(source, { monotonicAtMs: monotonicNowMs, answer });
     return answer;
   }
+}
+
+/** Reads every source at once, throttled, and hands what came back to `referenceOf`. Readings are dated, and aged, by `clock`. */
+export class ReferencePrice implements ReferenceReader {
+  private readonly throttle: Throttle;
+
+  constructor(
+    private readonly sources: ReferenceSource[],
+    private readonly clock: Clock,
+    monotonicMs?: () => number,
+  ) {
+    this.throttle = new Throttle(monotonicMs);
+  }
 
   async read(): Promise<Reference> {
-    const answers = await Promise.allSettled(this.sources.map((source) => this.readSource(source)));
+    const answers = await Promise.allSettled(
+      this.sources.map((source) => this.throttle.read(source)),
+    );
     const readings: PriceReading[] = [];
     const silent: string[] = [];
     const refusals: string[] = [];

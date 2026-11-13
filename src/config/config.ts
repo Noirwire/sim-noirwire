@@ -88,7 +88,8 @@ const envSchema = z.object({
   MAX_FUNDING_RATE_BPS_PER_UPDATE: positiveInt(75),
   FUNDING_INTERVAL_MS: positiveInt(60_000),
 
-  HOUSE_MAKER_TICK_MS: positiveInt(1_000),
+  /** How often the maker looks at the price. Quotes follow it as fast as this, so it is a fraction of a second. */
+  HOUSE_MAKER_TICK_MS: positiveInt(250),
   HOUSE_MAKER_LEVELS: positiveInt(5),
   HOUSE_MAKER_SPREAD_BPS: positiveInt(15),
   HOUSE_MAKER_LEVEL_STEP_BPS: positiveInt(5),
@@ -96,6 +97,15 @@ const envSchema = z.object({
   HOUSE_MAKER_REQUOTE_INTERVAL_MS: positiveInt(90_000),
   HOUSE_MAKER_POSITION_LIMIT_NUSD: decimalAmount("50000"),
   HOUSE_MAKER_MAX_SKEW_BPS: positiveInt(20),
+  /**
+   * The maker quotes from MagicBlock's SOL/USD price inside the rollup (ROLLUP_RPC_URL and ROLLUP_WS_URL), with
+   * Pyth only as a sanity check, instead of the median of Pyth and the exchanges. Needs the risk rules. On by default on mainnet.
+   */
+  MAGICBLOCK_REFERENCE: onOffFlag("off"),
+  /** The MagicBlock price is not quoted from when it is older than this. Mainnet caps it (`maker-limits.ts`). */
+  MAGICBLOCK_MAX_AGE_MS: positiveInt(3_000),
+  /** The maker pulls its quotes when the MagicBlock price and a fresh Pyth price are further apart than this. Mainnet caps it. */
+  MAGICBLOCK_PYTH_MAX_BPS: positiveInt(30),
   /** The maker follows the risk rules (`bots/maker-safety.ts`). Always on, and not switchable off, on mainnet. */
   HOUSE_MAKER_RISK_RULES: boolFlag("0"),
   /** Pinged after each good requote of the house maker, so an outside monitor notices when the pings stop. */

@@ -457,6 +457,32 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   so it goes stale on the same limits as before (30 s for Pyth, 10 s for an exchange), and a
   source that failed is not called again before its interval has passed.
 
+### The rollup's own price as the reference (on by default on mainnet)
+
+Pyth's price account on Solana is pushed about once a minute, and has gone silent for minutes at
+a time, so a maker that quotes from it alone pulls its quotes for much of every minute.
+`MAGICBLOCK_REFERENCE=on` (the mainnet default) makes the maker quote from MagicBlock's price
+oracle inside the rollup instead: the SOL/USD account (feed 6) of program
+`PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd`, which updates about ten times a second.
+
+- **Where it is read:** over the websocket at `ROLLUP_WS_URL`. While that socket says nothing for
+  1 s, the account is read from `ROLLUP_RPC_URL` every 500 ms instead, until the socket speaks again.
+  The account must be owned by the oracle program, 134 bytes, the right discriminator, fully
+  verified, carry its own address as feed id, an exponent of 8 decimals and a price above zero;
+  an update that is not so clears the price and pulls the quotes.
+- **When the maker pulls:** the price is older than `MAGICBLOCK_MAX_AGE_MS` (3,000 by default,
+  and at most 10,000 on mainnet), or a Pyth price no older than 10 s is more than
+  `MAGICBLOCK_PYTH_MAX_BPS` (30 by default, the most on mainnet) away from it. A Pyth price older
+  than 10 s, or one that cannot be read, checks nothing and pulls nothing: Pyth is a sanity check
+  here, not the clock the quotes keep. The exchanges' tickers are not read in this mode.
+- **The maker's pace:** it looks at the price every `HOUSE_MAKER_TICK_MS` (250 ms by default) and
+  on mainnet requotes after a 3 bps move or every 5 s, whichever comes first.
+- **The program's own check is unchanged:** the program refuses a quote when the mark on chain is
+  older than the market's age limit, and the maker keeps reading that and pulling on it. Until
+  the mark on chain is itself MagicBlock's, it is Pyth's, up to about a minute old, so the maker
+  quotes at the fresh price while the mark lags: a mark more than 10 bps behind widens the quotes
+  by the gap, and more than 100 bps pulls them.
+
 ### The hedge controller on mainnet (off by default)
 
 `HEDGE_ENABLED` is unset by default and nothing hedge-related runs. This repository contains

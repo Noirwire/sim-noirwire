@@ -190,12 +190,15 @@ const gateSettings = (config: Config, env: Env): string[] => [
 /**
  * What the house maker uses on mainnet when its setting is not given: small
  * enough for a maker of about 1,000 USDC. The testnet defaults would quote
- * far more than that.
+ * far more than that. It quotes from the rollup's own price, which moves about
+ * ten times a second, so it requotes after a 3 bps move (the half-spread is
+ * never under 15) and at least every 5 s.
  */
 const MAINNET_MAKER_DEFAULTS = {
   HOUSE_MAKER_LEVELS: 3,
-  HOUSE_MAKER_REQUOTE_THRESHOLD_BPS: 6,
-  HOUSE_MAKER_REQUOTE_INTERVAL_MS: 10_000,
+  HOUSE_MAKER_REQUOTE_THRESHOLD_BPS: 3,
+  HOUSE_MAKER_REQUOTE_INTERVAL_MS: 5_000,
+  MAGICBLOCK_REFERENCE: true,
   HOUSE_MAKER_POSITION_LIMIT_NUSD: 250n * SCALE,
   ROLLUP_MAKER_LEVEL_NUSD: 50n * SCALE,
 } satisfies Partial<Config>;
@@ -223,6 +226,16 @@ const makerLimits = (config: Config, env: Env): string[] => [
   ...(config.HOUSE_MAKER_REQUOTE_INTERVAL_MS > MAKER_LIMITS.maxRequoteIntervalMs
     ? [
         `HOUSE_MAKER_REQUOTE_INTERVAL_MS is over ${MAKER_LIMITS.maxRequoteIntervalMs} ms. Quotes expire a little after it, so a long interval leaves them standing. Lower it.`,
+      ]
+    : []),
+  ...(config.MAGICBLOCK_MAX_AGE_MS > MAKER_LIMITS.maxMagicblockAgeMs
+    ? [
+        `MAGICBLOCK_MAX_AGE_MS is over ${MAKER_LIMITS.maxMagicblockAgeMs} ms, so the maker would quote through an outage of the rollup's price. Lower it.`,
+      ]
+    : []),
+  ...(config.MAGICBLOCK_PYTH_MAX_BPS > MAKER_LIMITS.maxSourceDisagreementBps
+    ? [
+        `MAGICBLOCK_PYTH_MAX_BPS is over ${MAKER_LIMITS.maxSourceDisagreementBps} bps, the most two price sources may differ by. Lower it.`,
       ]
     : []),
   ...(config.ROLLUP_MAKER_LEVEL_NUSD > MAKER_LIMITS.maxQuoteSizeNusd

@@ -20,9 +20,18 @@ import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
 import { PublicKey } from "@solana/web3.js";
 import {
+  MagicblockPrice,
+  MagicblockReference,
+  SOL_USD_FEED_NUMBER,
+  magicblockPriceAddress,
+  rollupPriceLink,
+} from "../prices/magicblock-price.js";
+import {
   ReferencePrice,
   type ReadPythAccount,
+  type ReferenceReader,
   SOL_USD_FEED_ID,
+  pythSource,
   referenceSources,
 } from "../prices/reference-price.js";
 import { connectionTo } from "../rollup/connections.js";
@@ -134,7 +143,7 @@ const hedgeController = (
   config: Config,
   market: MarketConfig,
   ledger: MakerLedger,
-  reference: ReferencePrice,
+  reference: ReferenceReader,
   botVenue: Venue,
   hedgeVenue: HedgeVenue | undefined,
   problems: BotProblems,
@@ -171,7 +180,7 @@ const hedgeController = (
 const makerSafety = (
   market: MarketConfig,
   ledger: MakerLedger,
-  reference: ReferencePrice,
+  reference: ReferenceReader,
   control: MakerControl,
   problems: BotProblems,
   keeper: KeeperProblemSource,
@@ -294,6 +303,16 @@ const pythAccountReader = (solanaRpcUrl: string | undefined): ReadPythAccount =>
   };
 };
 
+/** The SOL/USD price inside the rollup, which the maker follows over the rollup's own endpoints. */
+const magicblockPrice = (config: Config): MagicblockPrice => {
+  const { ROLLUP_RPC_URL: rpcUrl, ROLLUP_WS_URL: wsUrl } = config;
+  if (!rpcUrl || !wsUrl) {
+    throw new Error("MAGICBLOCK_REFERENCE=on needs ROLLUP_RPC_URL and ROLLUP_WS_URL.");
+  }
+  const address = magicblockPriceAddress(SOL_USD_FEED_NUMBER);
+  return new MagicblockPrice(address, () => rollupPriceLink(rpcUrl, wsUrl, address), systemClock);
+};
+
 export const openBots = async (
   config: Config,
   wiring: VenueWiring,
@@ -312,9 +331,21 @@ export const openBots = async (
       "the hedge couples to the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
     );
   }
-  const reference = rules
-    ? new ReferencePrice(referenceSources(pythAccountReader(config.SOLANA_RPC_URL)), systemClock)
-    : null;
+  if (config.MAGICBLOCK_REFERENCE && !rules) {
+    throw new Error(
+      "MAGICBLOCK_REFERENCE=on feeds the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
+    );
+  }
+  const readPyth = pythAccountReader(config.SOLANA_RPC_URL);
+  const magicblock = config.MAGICBLOCK_REFERENCE ? magicblockPrice(config) : null;
+  const reference: ReferenceReader | null = !rules
+    ? null
+    : magicblock
+      ? new MagicblockReference(magicblock, pythSource(readPyth), systemClock, {
+          maxAgeMs: config.MAGICBLOCK_MAX_AGE_MS,
+          maxPythBps: config.MAGICBLOCK_PYTH_MAX_BPS,
+        })
+      : new ReferencePrice(referenceSources(readPyth), systemClock);
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)
@@ -423,6 +454,7 @@ export const openBots = async (
         ),
       ),
     ];
+    if (magicblock) loops.push(magicblock.follow());
     if (watch) {
       watch.resume();
       markNotRead();

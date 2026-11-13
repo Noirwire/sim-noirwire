@@ -17,6 +17,11 @@ export const MAKER_LIMITS = {
   maxSourceAgeMs: 10_000,
   /** The oracle price, pushed on chain every few seconds, gets longer: it is 3 to 12 s old when read. */
   maxOracleAgeMs: 30_000,
+  /**
+   * The most MAGICBLOCK_MAX_AGE_MS may be set to. The rollup's price is a second or two old when
+   * read, so a limit past this would keep quoting through a real outage of the feed.
+   */
+  maxMagicblockAgeMs: 10_000,
   /** Sources further apart than this (highest to lowest, against the median) pull the quotes. */
   maxSourceDisagreementBps: 30,
   /** Large exchanges that must answer, besides the oracle. */

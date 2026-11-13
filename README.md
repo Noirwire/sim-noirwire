@@ -375,6 +375,9 @@ elsewhere is off by default and on mainnet cannot be set to 0):
   fully verified and carry the SOL/USD feed id). It needs the oracle (none older than 30 s)
   and at least two exchanges (none older than 10 s), within 30 bps of each other; else
   it pulls its quotes and, once the prices are back, watches them for 10 s before quoting.
+  With `MAGICBLOCK_REFERENCE=on` (the mainnet default) it quotes instead around MagicBlock's own
+  SOL/USD price inside the rollup, which updates about ten times a second, and pulls when that
+  price is more than 3 s old or a fresh Pyth price is more than 30 bps away (`docs/deploy.md`).
 - **Widen and pull.** The half-spread is at least 15 bps and grows by half the price range
   of the last minute. A NoirWire mark more than 10 bps behind the reference widens it by
   the gap; more than 100 bps behind, or a move of more than 0.5% in 10 s, pulls the quotes
