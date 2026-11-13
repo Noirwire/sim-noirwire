@@ -63,9 +63,8 @@ import { ORDER_EXPIRY_TOO_NEAR, placingOrdersThrough } from "../src/engine/venue
 import { openBots } from "../src/wiring/bots.js";
 import { KEEPER_NOT_READ_YET } from "../src/wiring/keeper-heartbeat.js";
 import { TradingWatch } from "../src/wiring/trading-watch.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
-import { dollars, makeVenue } from "./helpers.js";
+import { dollars, makeVenue, makerWiring } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
 const SPOT = "NSOL-NUSD";
@@ -1483,21 +1482,7 @@ describe("the makers opened by the service", () => {
       cancelAll: async () => (sent.cancels += 1),
       ...(marketsOf ? { markets: marketsOf(() => venue.markets()) } : {}),
     };
-    const wiring = {
-      venue: counting,
-      botVenue: counting,
-      botMarkets: [market],
-      botSizes: async () => ({
-        makerLevel: dollars(0.3),
-        takerMin: 0n,
-        takerMax: 0n,
-        lotSize: dollars(0.001),
-        takerStartingBase: 0n,
-      }),
-      afterMakersOpen: async () => {},
-      needsFundingUpdater: false,
-      liquidationTargets: () => [],
-    } as unknown as VenueWiring;
+    const wiring = makerWiring(counting, market);
     const config = loadConfig({
       VENUE: "memory",
       NOISE_TAKERS_ENABLED: "0",

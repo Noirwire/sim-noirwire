@@ -23,8 +23,7 @@ import { MARKETS } from "../src/engine/markets.js";
 import type { Venue } from "../src/engine/types.js";
 import { placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
-import { dollars, makeVenue } from "./helpers.js";
+import { dollars, makeVenue, makerWiring } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
 const ROOT = join("data-test", `maker-durability-${Date.now()}`);
@@ -220,21 +219,7 @@ describe("the makers opened by the service, on mainnet without a state file", ()
     const counting: Venue = placingOrdersThrough(venue, (trader, order) =>
       venue.placeOrder(trader, order),
     );
-    const wiring = {
-      venue: counting,
-      botVenue: counting,
-      botMarkets: [MARKETS[0]],
-      botSizes: async () => ({
-        makerLevel: dollars(0.3),
-        takerMin: 0n,
-        takerMax: 0n,
-        lotSize: dollars(0.001),
-        takerStartingBase: 0n,
-      }),
-      afterMakersOpen: async () => {},
-      needsFundingUpdater: false,
-      liquidationTargets: () => [],
-    } as unknown as VenueWiring;
+    const wiring = makerWiring(counting, MARKETS[0]);
     const config = {
       ...loadConfig({
         VENUE: "memory",

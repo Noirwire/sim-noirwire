@@ -10,9 +10,6 @@ export const SIM_ROLES = ["combined", "maker", "gate", "data"] as const;
 
 export type SimRole = (typeof SIM_ROLES)[number];
 
-export const isSimRole = (value: string): value is SimRole =>
-  (SIM_ROLES as readonly string[]).includes(value);
-
 /** The process places and cancels the house maker's orders. */
 export const runsMaker = (role: SimRole): boolean => role === "combined" || role === "maker";
 

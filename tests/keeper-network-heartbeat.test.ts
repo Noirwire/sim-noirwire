@@ -21,8 +21,7 @@ import {
   parseKeeperUrls,
   signKeeperStatus,
 } from "../src/wiring/keeper-network-heartbeat.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
-import { dollars, makeVenue } from "./helpers.js";
+import { makeVenue, makerWiring } from "./helpers.js";
 
 const SECRET_A = "a".repeat(40);
 const SECRET_B = "b".repeat(40);
@@ -335,21 +334,7 @@ describe("the maker's trading readiness, with the keeper reached over a real con
     const counting: Venue = placingOrdersThrough(venue, (trader, order) =>
       venue.placeOrder(trader, order),
     );
-    const wiring = {
-      venue: counting,
-      botVenue: counting,
-      botMarkets: [MARKETS[0]],
-      botSizes: async () => ({
-        makerLevel: dollars(0.3),
-        takerMin: 0n,
-        takerMax: 0n,
-        lotSize: dollars(0.001),
-        takerStartingBase: 0n,
-      }),
-      afterMakersOpen: async () => {},
-      needsFundingUpdater: false,
-      liquidationTargets: () => [],
-    } as unknown as VenueWiring;
+    const wiring = makerWiring(counting, MARKETS[0]);
     const config = {
       ...loadConfig({
         VENUE: "memory",
@@ -393,41 +378,27 @@ describe("the maker's trading readiness, with the keeper reached over a real con
     expect(await settled(bots, heardFrom)).toEqual({ ready: true });
   });
 
-  it("is not ready when the keeper's status is stale", async () => {
-    behaviour = { sweepAgeMs: 60_000 };
-    const bots = await maker("stale", await startKeeper());
+  it.each([
+    ["the keeper's status is stale", "stale", { sweepAgeMs: 60_000 }, "healthy sweep for"],
+    ["the keeper is missing", "missing", { down: true }, "keeper k1 is unreachable"],
+    [
+      "the keeper's answer is not signed with its secret",
+      "unauthenticated",
+      { secret: SECRET_B },
+      "not signed with its secret",
+    ],
+    ["the keeper says its sweep was unhealthy", "unhealthy", { healthy: false }, "was not healthy"],
+  ] satisfies [string, string, Behaviour, string][])(
+    "is not ready when %s",
+    async (_what, name, kept, reasonPart) => {
+      behaviour = kept;
+      const bots = await maker(name, await startKeeper());
 
-    const trading = await settled(bots, (reason) => reason.includes("healthy sweep for"));
+      const trading = await settled(bots, (reason) => reason.includes(reasonPart));
 
-    expect(trading.ready).toBe(false);
-  });
-
-  it("is not ready when the keeper is missing", async () => {
-    behaviour = { down: true };
-    const bots = await maker("missing", await startKeeper());
-
-    const trading = await settled(bots, (reason) => reason.includes("keeper k1 is unreachable"));
-
-    expect(trading.ready).toBe(false);
-  });
-
-  it("is not ready when the keeper's answer is not signed with its secret", async () => {
-    behaviour = { secret: SECRET_B };
-    const bots = await maker("unauthenticated", await startKeeper());
-
-    const trading = await settled(bots, (reason) => reason.includes("not signed with its secret"));
-
-    expect(trading.ready).toBe(false);
-  });
-
-  it("is not ready when the keeper says its sweep was unhealthy", async () => {
-    behaviour = { healthy: false };
-    const bots = await maker("unhealthy", await startKeeper());
-
-    const trading = await settled(bots, (reason) => reason.includes("was not healthy"));
-
-    expect(trading.ready).toBe(false);
-  });
+      expect(trading.ready).toBe(false);
+    },
+  );
 
   it("goes not ready after the keeper is lost, once its last healthy sweep is too old", async () => {
     behaviour = { sweepAgeMs: 0 };

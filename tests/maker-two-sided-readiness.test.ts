@@ -9,8 +9,7 @@ import { MemoryVenue } from "../src/engine/memory-venue.js";
 import type { NewOrder, Venue } from "../src/engine/types.js";
 import { placingOrdersThrough, rejectedOrder } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
-import { dollars } from "./helpers.js";
+import { dollars, makerWiring } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
 const ROOT = join("data-test", `maker-two-sided-${Date.now()}`);
@@ -25,21 +24,7 @@ const quotingBots = async (refusing: { side: "buy" | "sell" | null }) => {
       ? Promise.resolve(rejectedOrder("refused", 0n, order, "post-only order would match"))
       : memory.placeOrder(trader, order);
   const venue: Venue = placingOrdersThrough(memory, refuse);
-  const wiring = {
-    venue,
-    botVenue: venue,
-    botMarkets: [MARKETS[0]],
-    botSizes: async () => ({
-      makerLevel: dollars(0.3),
-      takerMin: 0n,
-      takerMax: 0n,
-      lotSize: dollars(0.001),
-      takerStartingBase: 0n,
-    }),
-    afterMakersOpen: async () => {},
-    needsFundingUpdater: false,
-    liquidationTargets: () => [],
-  } as unknown as VenueWiring;
+  const wiring = makerWiring(venue, MARKETS[0]);
   const dir = join(ROOT, `run-${Math.random().toString(36).slice(2)}`);
   await mkdir(dir, { recursive: true });
   const config = {

@@ -79,9 +79,8 @@ import { LATE_DISPATCH_QUARANTINE_MS } from "../src/hedge/hedge-limits.js";
 import type { HedgeAck, HedgeOrder } from "../src/hedge/hedge-venue.js";
 import { PLACE_DEADLINE_MS } from "../src/rollup/rollup-venue.js";
 import { type OpenedBots, openBots } from "../src/wiring/bots.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
-import { dollars } from "./helpers.js";
+import { dollars, makerWiring } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
 const START_MS = Date.parse("2026-11-02T12:00:00Z");
@@ -594,21 +593,7 @@ const rig = async (name: string, options: RigOptions = {}) => {
   };
   const start = async (): Promise<void> => {
     const venue = world.venueFor(world.generation);
-    const wiring = {
-      venue,
-      botVenue: venue,
-      botMarkets: [MARKETS[0]],
-      botSizes: async () => ({
-        makerLevel: dollars(0.3),
-        takerMin: 0n,
-        takerMax: 0n,
-        lotSize: dollars(0.001),
-        takerStartingBase: 0n,
-      }),
-      afterMakersOpen: async () => {},
-      needsFundingUpdater: false,
-      liquidationTargets: () => [],
-    } as unknown as VenueWiring;
+    const wiring = makerWiring(venue, MARKETS[0]);
     world.bots = await openBots(config, wiring, problems, options.hedge ? hedgeVenue : undefined);
     loops = world.bots.start();
   };
