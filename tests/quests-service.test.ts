@@ -107,8 +107,8 @@ describe("matching fills to secrets", () => {
     const r = rig();
     const person = newPerson();
     const secret = newSecret();
-    const first = againstBot(secret, 30, r.clock.nowMs());
-    const second = againstBot(secret, 20, r.clock.nowMs());
+    const first = againstBot(secret, 6, r.clock.nowMs());
+    const second = againstBot(secret, 4, r.clock.nowMs());
 
     const before = r.open();
     await switchOn(before, r.clock, person);
@@ -144,22 +144,19 @@ describe("the Get started quest", () => {
     expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
-  it("needs one order to total 50 dollars, here across two partial fills, and not two orders", async () => {
+  it("needs one order to total 9 dollars, here across two partial fills, and not two orders", async () => {
     const r = rig();
     const service = r.open();
     const person = newPerson();
-    await trade(r, service, person, 25, r.clock.nowMs());
-    await trade(r, service, person, 25, r.clock.nowMs());
+    await trade(r, service, person, 5, r.clock.nowMs());
+    await trade(r, service, person, 5, r.clock.nowMs());
     await service.idle();
     expect(r.push.calls).toHaveLength(0);
 
     const secret = newSecret();
     await switchOn(service, r.clock, person);
     await handOver(service, r.clock, person, [secret]);
-    const [a, b] = [
-      againstBot(secret, 25, r.clock.nowMs()),
-      againstBot(secret, 25, r.clock.nowMs()),
-    ];
+    const [a, b] = [againstBot(secret, 5, r.clock.nowMs()), againstBot(secret, 5, r.clock.nowMs())];
     service.acceptFill(a.fill, a.botSides);
     await service.idle();
     expect(r.push.calls).toHaveLength(0);
@@ -168,14 +165,14 @@ describe("the Get started quest", () => {
     expect(r.push.pushesOf("101")).toHaveLength(1);
   });
 
-  it("stops just short of 50 dollars and completes at exactly 50, once ever", async () => {
+  it("stops just short of 9 dollars and completes at exactly 9, once ever", async () => {
     const r = rig();
     const service = r.open();
     const person = newPerson();
     const secret = newSecret();
     await switchOn(service, r.clock, person);
     await handOver(service, r.clock, person, [secret]);
-    for (const dollars of [49.99, 0.01, 10]) {
+    for (const dollars of [8.99, 0.01, 10]) {
       const { fill, botSides } = againstBot(secret, dollars, r.clock.nowMs());
       service.acceptFill(fill, botSides);
       await service.idle();
@@ -348,10 +345,12 @@ describe("the push outbox", () => {
     const r = rig();
     const service = r.open();
     const person = newPerson();
-    await trade(r, service, person, 10, weekStart(0) + DAY_MS);
-    await trade(r, service, person, 10, weekStart(0) + 2 * DAY_MS);
+    for (const day of [1, 2]) {
+      await trade(r, service, person, 5, weekStart(0) + day * DAY_MS);
+      await trade(r, service, person, 5, weekStart(0) + day * DAY_MS);
+    }
     await service.idle();
-    r.push.calls.length = 0;
+    expect(r.push.calls).toHaveLength(0);
     await trade(r, service, person, FIFTY, weekStart(0) + 3 * DAY_MS);
     await service.idle();
     const stamps = r.push.calls.map((call) => call.timestamp);
@@ -402,20 +401,20 @@ describe("what is kept, and for how long", () => {
     const secret = newSecret();
     await switchOn(service, r.clock, person);
     await handOver(service, r.clock, person, [secret]);
-    const half = againstBot(secret, 30, r.clock.nowMs());
+    const half = againstBot(secret, 6, r.clock.nowMs());
     service.acceptFill(half.fill, half.botSides);
     await service.idle();
 
     r.clock.advance(36 * DAY_MS);
     await service.cleanUp();
-    const lateRest = againstBot(secret, 20, r.clock.nowMs());
+    const lateRest = againstBot(secret, 4, r.clock.nowMs());
     service.acceptFill(lateRest.fill, lateRest.botSides);
     await service.idle();
     expect(r.push.calls).toHaveLength(0);
 
     await switchOn(service, r.clock, person);
     await handOver(service, r.clock, person, [secret]);
-    const rest = againstBot(secret, 20, r.clock.nowMs());
+    const rest = againstBot(secret, 4, r.clock.nowMs());
     service.acceptFill(rest.fill, rest.botSides);
     await service.idle();
     expect(r.push.calls).toHaveLength(0);
