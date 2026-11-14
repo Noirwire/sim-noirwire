@@ -23,7 +23,8 @@
 # machine's network its .localnet folder holds the deployment description and
 # the local keys, mounted read-only. With `--profile network` it is the build
 # context the program binary, the set-up script and the client are copied
-# from, and the deployment description lives on a volume the set-up writes.
+# from (staged by `make orderbook-outputs` into ORDERBOOK_CONTEXT, since the
+# repository's own .dockerignore would hide them), and the deployment description lives on a volume the set-up writes.
 #
 # NETWORK_HOST            where the service finds the network
 # NETWORK_PORT_PREFIX     put before 8899, 8900, 7799, 7800, 6699 and 6700 to
@@ -87,7 +88,7 @@ services:
       context: .
       dockerfile: docker/network.Dockerfile
       additional_contexts:
-        orderbook: ${ORDERBOOK_REPO}
+        orderbook: ${ORDERBOOK_CONTEXT:-.orderbook-context}
     volumes:
       - noirwire-sim-deployment:/deployment
     ports:
@@ -112,9 +113,11 @@ services:
     command: ["node_modules/.bin/ts-node", "-P", "tsconfig.json", "ops/network.ts", "setup"]
     environment:
       NETWORK: localnet
+      GENESIS: local
       KEYS_DIR: /deployment
       DEPLOYMENT: /deployment/deployment.json
       SOLANA_URL: http://network:8899
+      PUBLIC_SOLANA_URL: http://network:8899
       ROLLUP_URL: http://network:7799
       PRIVATE_URL: http://network:6699
       DEPOSIT_URL: http://network:7799

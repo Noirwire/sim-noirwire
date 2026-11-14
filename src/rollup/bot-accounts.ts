@@ -126,11 +126,13 @@ export class BotAccounts {
     const view = await trader.view();
     const spot = view.spot[chainToken.index];
     const held: { target: DepositTarget; amount: bigint }[] = [];
+    const seatTakenByCollateralFirst =
+      view.collateral === 0n && view.spot.every((s) => s.available + s.locked === 0n);
+    if (token === COLLATERAL_TOKEN && (bot.tradesPerps || seatTakenByCollateralFirst)) {
+      held.push({ target: "collateral", amount: view.collateral });
+    }
     if (token !== COLLATERAL_TOKEN || bot.tradesSpot) {
       held.push({ target: { spotToken: chainToken.index }, amount: spot.available + spot.locked });
-    }
-    if (token === COLLATERAL_TOKEN && bot.tradesPerps) {
-      held.push({ target: "collateral", amount: view.collateral });
     }
 
     const wanted = toChainAmount(amount, chainToken.decimals);

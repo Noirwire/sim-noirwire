@@ -60,5 +60,12 @@ export default defineConfig([
     ],
     rules: { "no-console": "off" },
   },
-  globalIgnores(["docker/**", "dist/**", "coverage/**", "data/**", "node_modules/**"]),
+  globalIgnores([
+    "docker/**",
+    "dist/**",
+    "coverage/**",
+    "data/**",
+    "node_modules/**",
+    ".orderbook-context/**",
+  ]),
 ]);

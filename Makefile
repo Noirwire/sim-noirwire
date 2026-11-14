@@ -51,10 +51,13 @@ COMPOSE := ORDERBOOK_REPO=$(abspath $(ORDERBOOK_REPO)) SIM_HOST_PORT=$(SIM_HOST_
 ALL_SIM_HOST_PORT ?= 14100
 NETWORK_PORT_PREFIX ?= 1
 TERMINAL ?=
-COMPOSE_ALL := ORDERBOOK_REPO=$(abspath $(ORDERBOOK_REPO)) SIM_HOST_PORT=$(ALL_SIM_HOST_PORT) \
+COMPOSE_ALL := ORDERBOOK_REPO=$(abspath $(ORDERBOOK_REPO)) ORDERBOOK_CONTEXT=$(abspath $(ORDERBOOK_CONTEXT)) SIM_HOST_PORT=$(ALL_SIM_HOST_PORT) \
 	NETWORK_HOST=network NETWORK_PORT_PREFIX=$(NETWORK_PORT_PREFIX) \
 	DEPLOYMENT_SOURCE=noirwire-sim-deployment docker compose --profile network
 ORDERBOOK_OUTPUTS := target/deploy/noirwire_orderbook.so sdk/dist/index.js ops/network.ts
+ORDERBOOK_CONTEXT := .orderbook-context
+ORDERBOOK_STAGED := package.json package-lock.json tsconfig.json Anchor.toml sdk/package.json \
+	tests/fixtures/local-validator-identity.json target/deploy/noirwire_orderbook.so
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
 NETWORK_PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || true
 
@@ -135,12 +138,24 @@ docker-test: network-up
 	npx tsx scripts/smoke.ts --url http://127.0.0.1:$(SIM_HOST_PORT)
 
 # The network image copies the program binary, the set-up script and the
-# built client out of the order book repository.
+# built client out of the order book repository. Its .dockerignore is an
+# allow list for its own image and applies to a build context too, so exactly
+# the files the image needs are staged into a folder of their own, which is
+# the build context.
 orderbook-outputs:
 	@for file in $(ORDERBOOK_OUTPUTS); do \
 		[ -f $(ORDERBOOK_REPO)/$$file ] || { \
 			echo "$(ORDERBOOK_REPO)/$$file is missing: run 'make build' and 'make sdk-build' in $(ORDERBOOK_REPO), or set ORDERBOOK_REPO." >&2; exit 1; }; \
 	done
+	rm -rf $(ORDERBOOK_CONTEXT)
+	@for file in $(ORDERBOOK_STAGED); do \
+		[ -f $(ORDERBOOK_REPO)/$$file ] || { echo "$(ORDERBOOK_REPO)/$$file is missing." >&2; exit 1; }; \
+		mkdir -p $(ORDERBOOK_CONTEXT)/$$(dirname $$file); \
+		cp $(ORDERBOOK_REPO)/$$file $(ORDERBOOK_CONTEXT)/$$file; \
+	done
+	mkdir -p $(ORDERBOOK_CONTEXT)/sdk $(ORDERBOOK_CONTEXT)/ops
+	cp -R $(ORDERBOOK_REPO)/sdk/dist $(ORDERBOOK_CONTEXT)/sdk/dist
+	cp $(ORDERBOOK_REPO)/ops/*.ts $(ORDERBOOK_CONTEXT)/ops/
 
 docker-up-all: orderbook-outputs
 	$(COMPOSE_ALL) $(if $(TERMINAL),--profile terminal) up --build --detach --wait
