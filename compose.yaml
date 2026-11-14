@@ -16,6 +16,9 @@
 #   network    the local network, only with `--profile network`
 #   setup      one-shot: the order book repository's local set-up against
 #              `network`, only with `--profile network`
+#   oracle     keeps the marks fresh: the order book repository's local oracle,
+#              which publishes each market's mark again every two seconds,
+#              only with `--profile network`
 #   terminal   the trading terminal from ../terminal-noirwire, only with
 #              `--profile terminal`
 #
@@ -130,6 +133,32 @@ services:
       network:
         condition: service_healthy
     restart: "no"
+
+  oracle:
+    profiles: [network]
+    container_name: noirwire-sim-oracle
+    image: noirwire-sim-network:local
+    platform: linux/amd64
+    command: ["node_modules/.bin/ts-node", "-P", "tsconfig.json", "ops/local-oracle.ts"]
+    environment:
+      NETWORK: localnet
+      GENESIS: local
+      KEYS_DIR: /deployment
+      DEPLOYMENT: /deployment/deployment.json
+      SOLANA_URL: http://network:8899
+      PUBLIC_SOLANA_URL: http://network:8899
+      ROLLUP_URL: http://network:7799
+      PRIVATE_URL: http://network:6699
+      DEPOSIT_URL: http://network:7799
+      CUSTODY: sealed
+      VALIDATOR: mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
+      EXCHANGE_FLOAT_LAMPORTS: "200000000"
+    volumes:
+      - noirwire-sim-deployment:/deployment
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   terminal:
     profiles: [terminal]
