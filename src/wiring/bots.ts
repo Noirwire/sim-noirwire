@@ -279,13 +279,6 @@ export interface OpenedBots {
   confirmHedgesBeforeSleep(): Promise<void>;
 }
 
-/**
- * Opens and funds the makers, and returns what starts every bot's loop: a
- * maker per market, a noise taker per market and one liquidator where they
- * are enabled, and the funding updater where the venue needs one. Starting is
- * separate from opening so that the loops can be stopped and started again
- * without opening anything twice. Opening is safe to repeat after a failure.
- */
 /** The SOL/USD price inside the rollup, which the maker follows over the rollup's own endpoints. */
 const magicblockPrice = (config: Config): MagicblockPrice => {
   const { ROLLUP_RPC_URL: rpcUrl, ROLLUP_WS_URL: wsUrl } = config;
@@ -296,6 +289,13 @@ const magicblockPrice = (config: Config): MagicblockPrice => {
   return new MagicblockPrice(address, () => rollupPriceLink(rpcUrl, wsUrl, address), systemClock);
 };
 
+/**
+ * Opens and funds the makers, and returns what starts every bot's loop: a
+ * maker per market, a noise taker per market and one liquidator where they
+ * are enabled, and the funding updater where the venue needs one. Starting is
+ * separate from opening so that the loops can be stopped and started again
+ * without opening anything twice. Opening is safe to repeat after a failure.
+ */
 export const openBots = async (
   config: Config,
   wiring: VenueWiring,

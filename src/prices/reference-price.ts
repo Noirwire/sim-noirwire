@@ -207,7 +207,7 @@ export const referenceOf = (
  * gap between calls and nothing else: the wall clock can be corrected backward
  * or forward, which must neither bring a source's next call early nor push it late.
  */
-export class Throttle {
+class Throttle {
   private readonly lastCalls = new Map<
     ReferenceSource,
     { monotonicAtMs: number; answer: Promise<PriceReading> }
