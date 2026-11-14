@@ -82,7 +82,7 @@ import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
 export type { OwnerMessageForm };
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.9.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.10.0";
 /** How long an owner's signed action stays valid, on the rollup's clock. The program allows 120 seconds. */
 const OWNER_ACTION_LIFETIME_SECONDS = 100;
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
