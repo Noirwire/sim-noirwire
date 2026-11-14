@@ -1,12 +1,10 @@
 import { z } from "zod";
 import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import type { Clock } from "../engine/clock.js";
-import { DECIMAL_TEXT, SCALE, absBigInt, fromDecimalString } from "../engine/money.js";
+import { DECIMAL_TEXT, absBigInt, fromDecimalString } from "../engine/money.js";
 
 export interface PriceReading {
   source: string;
-  /** A large exchange, as opposed to the oracle. */
-  exchange: boolean;
   /** Dollars per SOL, scaled. */
   price: bigint;
   /** When the source says the price was set; the arrival time where it says nothing. */
@@ -15,7 +13,6 @@ export interface PriceReading {
 
 export interface ReferenceSource {
   name: string;
-  exchange: boolean;
   /** The least time between two calls to `read`; a source without it is read every time. */
   minIntervalMs?: number;
   read(): Promise<PriceReading>;
@@ -32,9 +29,6 @@ export interface ReferenceReader {
 
 export type FetchJson = (url: string) => Promise<unknown>;
 
-/** The data of Pyth's SOL/USD price account on Solana mainnet, or null when the account does not exist. */
-export type ReadPythAccount = () => Promise<Uint8Array | null>;
-
 const REQUEST_TIMEOUT_MS = 3_000;
 
 const fetchJson: FetchJson = async (url) => {
@@ -46,56 +40,13 @@ const fetchJson: FetchJson = async (url) => {
 /** A source answered, but with something the maker must not use. The text goes into its pull reason. */
 export class SourceRefused extends Error {}
 
-/** The SOL/USD feed id of Pyth, as hex. The price account must carry this id. */
-export const SOL_USD_FEED_ID = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const MS_PER_SECOND = 1_000;
 /**
- * How often each source is called, however often the price is asked for. The
- * oracle is pushed every few seconds and may be 30 s old, so every 5 s costs
- * it nothing (about 520,000 RPC calls a month instead of 2.6 million). An
+ * How often each exchange is called, however often the price is asked for. An
  * exchange reading may be 10 s old, and Kraken allows about one call a second
  * per address, so every 2 s keeps each well inside both.
  */
-export const PYTH_MIN_INTERVAL_MS = 5_000;
 export const EXCHANGE_MIN_INTERVAL_MS = 2_000;
-const MAX_PYTH_EXPONENT = 18;
-
-/**
- * A PriceUpdateV2 account of the Pyth receiver: an 8 byte discriminator, the
- * 32 byte write authority, the verification level (tag 0 is Partial and
- * followed by a signature count, tag 1 is Full), then the price message: the
- * 32 byte feed id, the price (i64), the confidence (u64), the exponent (i32)
- * and the publish time (i64), all little endian. Later fields are not read.
- */
-const PYTH_AUTHORITY_END = 8 + 32;
-const PYTH_FULL_TAG = 1;
-const PYTH_MESSAGE_LEN = 32 + 8 + 8 + 4 + 8;
-
-/** The oracle reading in a Pyth price account, or the reason it is not to be believed. */
-export const readPythAccount = (data: Uint8Array): PriceReading => {
-  const refused = (why: string): SourceRefused =>
-    new SourceRefused(`the Pyth price account ${why}`);
-  if (data.length <= PYTH_AUTHORITY_END) throw refused("is too short to read");
-  const level = data[PYTH_AUTHORITY_END];
-  if (level !== PYTH_FULL_TAG) throw refused("is not fully verified");
-  const start = PYTH_AUTHORITY_END + 1;
-  if (data.length < start + PYTH_MESSAGE_LEN) throw refused("is too short to read");
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const feed = Buffer.from(data.subarray(start, start + 32)).toString("hex");
-  if (feed !== SOL_USD_FEED_ID) throw refused("is not the SOL/USD feed");
-  const price = view.getBigInt64(start + 32, true);
-  const expo = view.getInt32(start + 32 + 8 + 8, true);
-  const publishTime = view.getBigInt64(start + 32 + 8 + 8 + 4, true);
-  if (expo < -MAX_PYTH_EXPONENT || expo > 0) throw refused("has an exponent out of range");
-  const scaled = (price * SCALE) / 10n ** BigInt(-expo);
-  if (scaled <= 0n) throw refused("holds a price that is not above zero");
-  return {
-    source: "Pyth",
-    exchange: false,
-    price: scaled,
-    atMs: Number(publishTime) * MS_PER_SECOND,
-  };
-};
 
 const dollars = (text: string): bigint => {
   if (!DECIMAL_TEXT.test(text)) throw new Error(`"${text}" is not a plain decimal price`);
@@ -130,24 +81,7 @@ const okxBody = z.object({
 });
 
 /**
- * Pyth's SOL/USD price, read from its price account on Solana mainnet (free,
- * through the Solana RPC connection; the account is the one the exchange's SOL
- * market is bound to). It is pushed every few seconds, so it may be up to
- * `maxOracleAgeMs` old.
- */
-export const pythSource = (readAccount: ReadPythAccount): ReferenceSource => ({
-  name: "Pyth",
-  exchange: false,
-  minIntervalMs: PYTH_MIN_INTERVAL_MS,
-  read: async () => {
-    const data = await readAccount();
-    if (!data) throw new SourceRefused("the Pyth price account does not exist");
-    return readPythAccount(data);
-  },
-});
-
-/**
- * Pyth, and the public SOL tickers of Coinbase, Kraken and OKX, where no call
+ * The public SOL tickers of Coinbase, Kraken and OKX, where no call
  * carries a key. Each exchange price is the middle
  * of its best bid and ask, which is its quote now rather than its last trade,
  * so a quiet market does not read as a stale one. Coinbase and Kraken say
@@ -155,26 +89,22 @@ export const pythSource = (readAccount: ReadPythAccount): ReferenceSource => ({
  * the answer arrived (`nowMs`); OKX dates its own snapshot.
  */
 export const referenceSources = (
-  readAccount: ReadPythAccount,
   getJson: FetchJson = fetchJson,
   nowMs: () => number = Date.now,
 ): ReferenceSource[] => [
-  pythSource(readAccount),
   {
     name: "Coinbase",
-    exchange: true,
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = coinbaseBody.parse(
         await getJson("https://api.exchange.coinbase.com/products/SOL-USD/ticker"),
       );
       const price = midpoint(body.bid, body.ask);
-      return { source: "Coinbase", exchange: true, price, atMs: nowMs() };
+      return { source: "Coinbase", price, atMs: nowMs() };
     },
   },
   {
     name: "Kraken",
-    exchange: true,
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = krakenBody.parse(
@@ -184,12 +114,11 @@ export const referenceSources = (
       const ticker = krakenTicker.safeParse(Object.values(body.result)[0]);
       if (!ticker.success) throw new Error("no ticker in the answer");
       const price = midpoint(ticker.data.b[0], ticker.data.a[0]);
-      return { source: "Kraken", exchange: true, price, atMs: nowMs() };
+      return { source: "Kraken", price, atMs: nowMs() };
     },
   },
   {
     name: "OKX",
-    exchange: true,
     minIntervalMs: EXCHANGE_MIN_INTERVAL_MS,
     read: async () => {
       const body = okxBody.parse(
@@ -197,7 +126,6 @@ export const referenceSources = (
       );
       return {
         source: "OKX",
-        exchange: true,
         price: midpoint(body.data[0].bidPx, body.data[0].askPx),
         atMs: Number(body.data[0].ts),
       };
@@ -214,13 +142,11 @@ const median = (prices: bigint[]): bigint => {
 };
 
 /**
- * The reference price: the median of the oracle and the exchanges, or the
- * reason there is none. There is none when the oracle or too few exchanges
- * answered, when the oracle reading is more than thirty seconds old (or dated
- * that far ahead), when fewer than the needed exchanges are fresh (an exchange
- * reading more than ten seconds old or dated that far ahead is dropped from
- * the median, not fatal in itself), or when the highest and lowest of the
- * readings kept are more than 30 bps apart.
+ * The reference price: the median of the exchanges, or the reason there is
+ * none. There is none when too few exchanges answered, when fewer than the
+ * needed exchanges are fresh (an exchange reading more than ten seconds old or
+ * dated that far ahead is dropped from the median, not fatal in itself), or
+ * when the highest and lowest of the readings kept are more than 30 bps apart.
  */
 export const referenceOf = (
   readings: PriceReading[],
@@ -228,16 +154,13 @@ export const referenceOf = (
   nowMs: number,
   refusals: string[] = [],
 ): Reference => {
-  const exchanges = readings.filter((reading) => reading.exchange).length;
+  const exchanges = readings.length;
   const ageMs = (reading: PriceReading): number => Math.abs(nowMs - reading.atMs);
   const notes = [
     ...(silent.length > 0 ? [`no answer from ${silent.join(", ")}`] : []),
     ...refusals,
   ];
   const silentNote = notes.length > 0 ? ` (${notes.join("; ")})` : "";
-  if (!readings.some((reading) => !reading.exchange)) {
-    return { ok: false, reason: `the oracle price is missing${silentNote}` };
-  }
   if (exchanges < MAKER_LIMITS.minExchanges) {
     return {
       ok: false,
@@ -246,18 +169,7 @@ export const referenceOf = (
   }
   const seconds = (reading: PriceReading): number =>
     Math.round((nowMs - reading.atMs) / MS_PER_SECOND);
-  const staleOracle = readings.find(
-    (reading) => !reading.exchange && ageMs(reading) > MAKER_LIMITS.maxOracleAgeMs,
-  );
-  if (staleOracle) {
-    return {
-      ok: false,
-      reason: `the ${staleOracle.source} price is ${seconds(staleOracle)} s old`,
-    };
-  }
-  const staleExchanges = readings.filter(
-    (reading) => reading.exchange && ageMs(reading) > MAKER_LIMITS.maxSourceAgeMs,
-  );
+  const staleExchanges = readings.filter((reading) => ageMs(reading) > MAKER_LIMITS.maxSourceAgeMs);
   const kept = readings.filter((reading) => !staleExchanges.includes(reading));
   if (exchanges - staleExchanges.length < MAKER_LIMITS.minExchanges) {
     const named = staleExchanges.map((reading) => `${reading.source} is ${seconds(reading)} s old`);

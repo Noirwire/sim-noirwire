@@ -98,14 +98,12 @@ const envSchema = z.object({
   HOUSE_MAKER_POSITION_LIMIT_NUSD: decimalAmount("50000"),
   HOUSE_MAKER_MAX_SKEW_BPS: positiveInt(20),
   /**
-   * The maker quotes from MagicBlock's SOL/USD price inside the rollup (ROLLUP_RPC_URL and ROLLUP_WS_URL), with
-   * Pyth only as a sanity check, instead of the median of Pyth and the exchanges. Needs the risk rules. On by default on mainnet.
+   * The maker quotes from MagicBlock's SOL/USD price inside the rollup (ROLLUP_RPC_URL and ROLLUP_WS_URL), instead
+   * of the median of the exchanges. Needs the risk rules. On by default on mainnet.
    */
   MAGICBLOCK_REFERENCE: onOffFlag("off"),
   /** The MagicBlock price is not quoted from when it is older than this. Mainnet caps it (`maker-limits.ts`). */
   MAGICBLOCK_MAX_AGE_MS: positiveInt(3_000),
-  /** The maker pulls its quotes when the MagicBlock price and a fresh Pyth price are further apart than this. Mainnet caps it. */
-  MAGICBLOCK_PYTH_MAX_BPS: positiveInt(30),
   /** The maker follows the risk rules (`bots/maker-safety.ts`). Always on, and not switchable off, on mainnet. */
   HOUSE_MAKER_RISK_RULES: boolFlag("0"),
   /** Pinged after each good requote of the house maker, so an outside monitor notices when the pings stop. */

@@ -10,7 +10,7 @@ const address = z.string().min(32).max(44);
 /**
  * Only what this service reads of the description the order book
  * repository's set-up writes. A test network's names a faucet; a
- * mainnet-profile deployment has none, and prices its markets from Pyth.
+ * mainnet-profile deployment has none, and prices its markets from MagicBlock's oracle.
  */
 const deploymentSchema = z.object({
   network: z.string(),

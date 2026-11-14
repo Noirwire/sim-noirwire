@@ -1,6 +1,4 @@
 import { type AccountInfo, PublicKey } from "@solana/web3.js";
-import { bpsApart } from "../bots/maker-safety.js";
-import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import type { Clock } from "../engine/clock.js";
 import { SCALE } from "../engine/money.js";
 import { connectionTo, hangUp } from "../rollup/connections.js";
@@ -9,9 +7,7 @@ import {
   type PriceReading,
   type Reference,
   type ReferenceReader,
-  type ReferenceSource,
   SourceRefused,
-  Throttle,
 } from "./reference-price.js";
 
 /** MagicBlock's price oracle program: the owner of every price account inside the rollup. */
@@ -47,7 +43,7 @@ export interface PriceAccount {
 
 /**
  * The price in a MagicBlock price account, or the reason it is not to be believed. The account is a
- * `PriceUpdateV3`, laid out like Pyth's update and read byte by byte, little endian, in the way the
+ * `PriceUpdateV3`, read byte by byte, little endian, in the way the
  * order book program reads it: the owner must be the oracle program, the size 134 bytes, the
  * discriminator and the verification level (Full) the expected ones, the feed id the account's own
  * address, the exponent +8, and the price above zero. The confidence is always zero and is not read.
@@ -71,7 +67,6 @@ export const readMagicblockAccount = (account: PriceAccount, address: PublicKey)
   if (price <= 0n) throw refused("holds a price that is not above zero");
   return {
     source: "MagicBlock",
-    exchange: false,
     price,
     atMs: Number(view.getBigInt64(PUBLISH_TIME_AT, true)) * MS_PER_SECOND,
   };
@@ -191,30 +186,19 @@ export class MagicblockPrice {
 export interface MagicblockLimits {
   /** The oldest MagicBlock price the maker quotes from. */
   maxAgeMs: number;
-  /** The most the MagicBlock and a fresh Pyth price may differ by. */
-  maxPythBps: number;
 }
 
 /**
  * The reference price when the rollup's own oracle is the source: its newest price, or the reason
- * there is none. There is none when no good price is held, when it is more than `maxAgeMs` old
- * (or dated that far ahead), or when a Pyth price no older than the exchanges may be is more
- * than `maxPythBps` away from it. A Pyth price that is older than that, or cannot be read, checks
- * nothing and pulls nothing: Pyth's feed pushes about once a minute, so it is a sanity check
- * and never the clock the quotes keep.
+ * there is none. There is none when no good price is held, or when it is more than `maxAgeMs` old
+ * (or dated that far ahead).
  */
 export class MagicblockReference implements ReferenceReader {
-  private readonly throttle: Throttle;
-
   constructor(
     private readonly feed: Pick<MagicblockPrice, "latest">,
-    private readonly pyth: ReferenceSource,
     private readonly clock: Clock,
     private readonly limits: MagicblockLimits,
-    monotonicMs?: () => number,
-  ) {
-    this.throttle = new Throttle(monotonicMs);
-  }
+  ) {}
 
   async read(): Promise<Reference> {
     let price: PriceReading;
@@ -229,16 +213,6 @@ export class MagicblockReference implements ReferenceReader {
     if (ageMs > this.limits.maxAgeMs) {
       const seconds = Math.round((now - price.atMs) / MS_PER_SECOND);
       return { ok: false, reason: `the MagicBlock price is ${seconds} s old` };
-    }
-    const pyth = await this.throttle.read(this.pyth).catch(() => null);
-    if (pyth && Math.abs(now - pyth.atMs) <= MAKER_LIMITS.maxSourceAgeMs) {
-      const apart = bpsApart(price.price, pyth.price);
-      if (apart > this.limits.maxPythBps) {
-        return {
-          ok: false,
-          reason: `the MagicBlock and Pyth prices are ${apart.toFixed(1)} bps apart, past the ${this.limits.maxPythBps} bps allowed`,
-        };
-      }
     }
     return { ok: true, price: price.price };
   }

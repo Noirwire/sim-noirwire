@@ -11,7 +11,6 @@ import {
   magicblockPriceAddress,
   readMagicblockAccount,
 } from "../src/prices/magicblock-price.js";
-import type { PriceReading, ReferenceSource } from "../src/prices/reference-price.js";
 import { dollars } from "./helpers.js";
 
 /** The mainnet SOL/USD account as the rollup served it: price 80.02901727, published at second 1_794_592_456. */
@@ -52,7 +51,6 @@ describe("the MagicBlock price account", () => {
     expect(SOL).toHaveLength(134);
     expect(readMagicblockAccount(goodAccount(), address)).toEqual({
       source: "MagicBlock",
-      exchange: false,
       price: dollars(80.029017),
       atMs: PUBLISHED_AT_MS,
     });
@@ -72,7 +70,7 @@ describe("the MagicBlock price account", () => {
   const refused = (account: PriceAccount, address_ = address) =>
     expect(() => readMagicblockAccount(account, address_));
 
-  it("refuses an account another program owns, Pyth's receiver included", () => {
+  it("refuses an account another program owns, a price receiver included", () => {
     refused({ ...goodAccount(), owner: PublicKey.default.toBase58() }).toThrow(
       "not owned by the oracle",
     );
@@ -122,35 +120,14 @@ describe("the MagicBlock price account", () => {
 
 const NOW = PUBLISHED_AT_MS + 700;
 
-/** A reference over a price that the test sets, and a Pyth source it controls. */
-const rig = (limits = { maxAgeMs: 3_000, maxPythBps: 30 }) => {
+/** A reference over a price that the test sets. */
+const rig = (limits = { maxAgeMs: 3_000 }) => {
   const clock = new ManualClock(NOW);
   const mark = {
-    reading: { source: "MagicBlock", exchange: false, price: dollars(80), atMs: NOW },
+    reading: { source: "MagicBlock", price: dollars(80), atMs: NOW },
   };
-  const pyth = {
-    calls: 0,
-    reading: { source: "Pyth", exchange: false, price: dollars(80), atMs: NOW } as PriceReading,
-    failing: false,
-  };
-  const source: ReferenceSource = {
-    name: "Pyth",
-    exchange: false,
-    minIntervalMs: 5_000,
-    read: async () => {
-      pyth.calls += 1;
-      if (pyth.failing) throw new Error("the Solana RPC did not answer");
-      return pyth.reading;
-    },
-  };
-  const reference = new MagicblockReference(
-    { latest: () => mark.reading },
-    source,
-    clock,
-    limits,
-    () => clock.nowMs(),
-  );
-  return { clock, mark, pyth, reference };
+  const reference = new MagicblockReference({ latest: () => mark.reading }, clock, limits);
+  return { clock, mark, reference };
 };
 
 describe("the maker's reference from MagicBlock", () => {
@@ -171,7 +148,7 @@ describe("the maker's reference from MagicBlock", () => {
   });
 
   it("pulls on a price dated further ahead than the limit, and honours a limit set tighter", async () => {
-    const { clock, mark, reference } = rig({ maxAgeMs: 1_000, maxPythBps: 30 });
+    const { clock, mark, reference } = rig({ maxAgeMs: 1_000 });
     mark.reading.atMs = NOW + 1_001;
     expect((await reference.read()).ok).toBe(false);
     mark.reading.atMs = NOW;
@@ -179,58 +156,10 @@ describe("the maker's reference from MagicBlock", () => {
     expect((await reference.read()).ok).toBe(false);
   });
 
-  it("refuses when a fresh Pyth price is further apart than the limit", async () => {
-    const { pyth, reference } = rig();
-    pyth.reading = { ...pyth.reading, price: dollars(80.25) };
-    const answer = await reference.read();
-    expect(answer).toEqual({
-      ok: false,
-      reason: expect.stringMatching(
-        /the MagicBlock and Pyth prices are 31\.\d bps apart, past the 30 bps/,
-      ),
-    });
-  });
-
-  it("quotes when a fresh Pyth price is within the limit, either side of it", async () => {
-    for (const price of [80.24, 79.78]) {
-      const { pyth, reference } = rig();
-      pyth.reading = { ...pyth.reading, price: dollars(price) };
-      expect((await reference.read()).ok).toBe(true);
-    }
-  });
-
-  it("keeps quoting on a Pyth price too old to mean anything, even a wildly different one", async () => {
-    const { pyth, reference } = rig();
-    pyth.reading = { ...pyth.reading, price: dollars(60), atMs: NOW - 10_001 };
-    expect(await reference.read()).toEqual({ ok: true, price: dollars(80) });
-  });
-
-  it("checks against a Pyth price of exactly the exchanges' age limit", async () => {
-    const { pyth, reference } = rig();
-    pyth.reading = { ...pyth.reading, price: dollars(60), atMs: NOW - 10_000 };
-    expect((await reference.read()).ok).toBe(false);
-  });
-
-  it("keeps quoting when Pyth cannot be read, and does not hammer it", async () => {
-    const { clock, mark, pyth, reference } = rig();
-    pyth.failing = true;
-    for (let tick = 0; tick < 20; tick += 1) {
-      clock.advance(250);
-      mark.reading = { ...mark.reading, atMs: clock.nowMs() };
-      expect(await reference.read()).toEqual({ ok: true, price: dollars(80) });
-    }
-    expect(pyth.calls).toBe(1);
-  });
-
   it("says why when no MagicBlock price is held", async () => {
     const clock = new ManualClock(NOW);
     const feed = new MagicblockPrice(address, () => new FakeLink(), clock);
-    const reference = new MagicblockReference(
-      feed,
-      { name: "Pyth", exchange: false, read: async () => Promise.reject(new Error("none")) },
-      clock,
-      { maxAgeMs: 3_000, maxPythBps: 30 },
-    );
+    const reference = new MagicblockReference(feed, clock, { maxAgeMs: 3_000 });
     expect(await reference.read()).toEqual({
       ok: false,
       reason: "no MagicBlock price has arrived yet",
@@ -361,22 +290,9 @@ describe("following the price over the websocket", () => {
     expect(link.reads).toBe(reads);
   });
 
-  it("keeps the maker quoting through a dead Pyth feed, and pulls when its own socket is silent too long", async () => {
+  it("keeps the maker quoting while the socket is read by hand, and pulls when it is silent too long", async () => {
     const { clock, link, feed, loop, elapse } = following();
-    const stalePyth: ReferenceSource = {
-      name: "Pyth",
-      exchange: false,
-      read: async () => ({
-        source: "Pyth",
-        exchange: false,
-        price: dollars(70),
-        atMs: clock.nowMs() - 270_000,
-      }),
-    };
-    const reference = new MagicblockReference(feed, stalePyth, clock, {
-      maxAgeMs: 3_000,
-      maxPythBps: 30,
-    });
+    const reference = new MagicblockReference(feed, clock, { maxAgeMs: 3_000 });
     link.push(published(8_000_000_000n, seconds(clock.nowMs())));
     expect(await reference.read()).toEqual({ ok: true, price: dollars(80) });
 

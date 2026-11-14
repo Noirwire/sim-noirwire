@@ -14,7 +14,7 @@ there), is the deployment this service runs against. It is at program
 
 - one market, `SOL-PERP`, which this service follows as its `NSOL-PERP`, and one token,
   `USDC` (a test mint of six decimals), which it counts as nUSD;
-- its mark is Pyth's, synced by the order book repository's crank (`make rehearsal-crank`),
+- its mark is MagicBlock's oracle price, synced by the order book repository's crank (`make rehearsal-crank`),
   and its liquidations are swept by that repository's keeper (`make rehearsal-keeper`);
 - no faucet: nothing here can fund a seat, so test funds are not handed out
   (`/v1/fund/*` answers 503) and only the house maker runs;
@@ -54,7 +54,7 @@ or a key is not the one the description names for its role.
 description names a faucet; this one has none.
 
 No oracle key: the service publishes no price and advances no funding. The mark is the
-program's own, synced from Pyth by the crank, and the program's own schedule advances
+program's own, synced from MagicBlock's oracle by the crank, and the program's own schedule advances
 funding.
 
 A key variable takes the JSON array of 64 bytes that is in the keypair file, on one line.
@@ -201,7 +201,7 @@ curl -s https://<domain>/v1/deployment  # what a browser needs to trade on chain
 deployment with a faucet and fails its fund checks here.
 
 `pricesFresh` is false while any followed market's mark on chain is older than its own
-age limit: this service does not set the mark, so look at the Pyth crank. Railway waits
+age limit: this service does not set the mark, so look at the price crank. Railway waits
 up to five minutes for the first 200.
 
 ## What the hosted endpoint needs, and how the service meets it
@@ -446,23 +446,19 @@ The maker follows its risk rules (README, "The maker's risk rules"). What an ope
   service stops at start and says so: fix or move it away on purpose, since starting
   without it would forget the limits.
 - **Outbound addresses the maker needs** (public, no key): `api.exchange.coinbase.com`,
-  `api.kraken.com` and `www.okx.com`, on port 443, and the Solana RPC address
-  (`SOLANA_RPC_URL`), from which it reads Pyth's SOL/USD price account. With one exchange
-  blocked the maker keeps quoting on the rest as long as Pyth and two exchanges answer;
-  with the Pyth account unreadable, or two of the exchanges blocked, it pulls its quotes.
+  `api.kraken.com` and `www.okx.com`, on port 443. With one exchange blocked the maker keeps
+  quoting on the rest as long as two exchanges answer; with two of them blocked it pulls its
+  quotes.
 - **How often those sources are called:** the maker asks for the reference price every second,
-  but Pyth's account is read at most every 5 s (about 520,000 RPC calls a month, against 2.6
-  million if read every second) and each exchange at most every 2 s (Kraken allows about one
-  call a second per address). In between, the last reading is used again with its own time,
-  so it goes stale on the same limits as before (30 s for Pyth, 10 s for an exchange), and a
-  source that failed is not called again before its interval has passed.
+  but each exchange is called at most every 2 s (Kraken allows about one call a second per
+  address). In between, the last reading is used again with its own time, so it goes stale on
+  the same limit as before (10 s), and a source that failed is not called again before its
+  interval has passed.
 
 ### The rollup's own price as the reference (on by default on mainnet)
 
-Pyth's price account on Solana is pushed about once a minute, and has gone silent for minutes at
-a time, so a maker that quotes from it alone pulls its quotes for much of every minute.
 `MAGICBLOCK_REFERENCE=on` (the mainnet default) makes the maker quote from MagicBlock's price
-oracle inside the rollup instead: the SOL/USD account (feed 6) of program
+oracle inside the rollup rather than from the exchanges' tickers: the SOL/USD account (feed 6) of program
 `PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd`, which updates about ten times a second.
 
 - **Where it is read:** over the websocket at `ROLLUP_WS_URL`. While that socket says nothing for
@@ -471,16 +467,14 @@ oracle inside the rollup instead: the SOL/USD account (feed 6) of program
   verified, carry its own address as feed id, an exponent of 8 decimals and a price above zero;
   an update that is not so clears the price and pulls the quotes.
 - **When the maker pulls:** the price is older than `MAGICBLOCK_MAX_AGE_MS` (3,000 by default,
-  and at most 10,000 on mainnet), or a Pyth price no older than 10 s is more than
-  `MAGICBLOCK_PYTH_MAX_BPS` (30 by default, the most on mainnet) away from it. A Pyth price older
-  than 10 s, or one that cannot be read, checks nothing and pulls nothing: Pyth is a sanity check
-  here, not the clock the quotes keep. The exchanges' tickers are not read in this mode.
+  and at most 10,000 on mainnet), or dated that far ahead. The exchanges' tickers are not read in
+  this mode.
 - **The maker's pace:** it looks at the price every `HOUSE_MAKER_TICK_MS` (250 ms by default) and
   on mainnet requotes after a 3 bps move or every 5 s, whichever comes first.
 - **The program's own check is unchanged:** the program refuses a quote when the mark on chain is
   older than the market's age limit, and the maker keeps reading that and pulling on it. Until
-  the mark on chain is itself MagicBlock's, it is Pyth's, up to about a minute old, so the maker
-  quotes at the fresh price while the mark lags: a mark more than 10 bps behind widens the quotes
+  the mark on chain has caught up with MagicBlock's price, the maker quotes at the fresh price
+  while the mark lags: a mark more than 10 bps behind widens the quotes
   by the gap, and more than 100 bps pulls them.
 
 ### The hedge controller on mainnet (off by default)

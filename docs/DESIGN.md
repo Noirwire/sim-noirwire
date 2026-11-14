@@ -162,7 +162,7 @@ types of `src/rollup/chain-types.ts`, so a new client release is an edit to that
 
 - **Prices.** The service reads the mark from each market's price feed on chain and
   never sets it: on a test network whoever holds the oracle key publishes it, on a
-  mainnet-profile deployment a crank syncs it from Pyth. `/v1/health` calls prices fresh
+  mainnet-profile deployment a crank syncs it from MagicBlock's oracle. `/v1/health` calls prices fresh
   while every followed market's mark is within that market's own age limit. Funding is
   advanced by the program's own schedule.
 - **Which markets.** Only the markets the deployment description has are followed, under

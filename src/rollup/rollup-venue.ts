@@ -124,8 +124,8 @@ export interface Readiness {
 
 /**
  * The real order book program behind the `Venue` interface. The marks are
- * the program's own (on a mainnet-profile deployment, Pyth's, synced by a
- * crank this service does not run), and so is funding, which the program's
+ * the program's own (on a mainnet-profile deployment, MagicBlock's price,
+ * synced by a crank this service does not run), and so is funding, which the program's
  * schedule advances. Every bot is an ordinary trader with its own seat,
  * private view and one-time order keys, and everything public (fills, marks,
  * counters) is read back from the chain, never from what this process

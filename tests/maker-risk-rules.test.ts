@@ -52,12 +52,9 @@ import {
   type Reference,
   ReferencePrice,
   type ReferenceSource,
-  SOL_USD_FEED_ID,
-  readPythAccount,
   referenceOf,
   referenceSources,
 } from "../src/prices/reference-price.js";
-import { pythPriceAccountOf } from "../src/rollup/program.js";
 import { MARKETS } from "../src/engine/markets.js";
 import { ORDER_EXPIRY_TOO_NEAR, placingOrdersThrough } from "../src/engine/venue-orders.js";
 import { openBots } from "../src/wiring/bots.js";
@@ -73,37 +70,29 @@ const ROOT = join("data-test", `maker-rules-${Date.now()}`);
 
 afterAll(() => rm(ROOT, { recursive: true, force: true }));
 
-const reading = (source: string, price: number, atMs: number, exchange = true): PriceReading => ({
+const reading = (source: string, price: number, atMs: number): PriceReading => ({
   source,
-  exchange,
   price: dollars(price),
   atMs,
 });
 
 describe("the reference price", () => {
   const now = START_MS;
-  const pyth = reading("Pyth", 150, now - 1_000, false);
 
-  it("is the median of the oracle and the exchanges", () => {
-    const three = [pyth, reading("Coinbase", 150.1, now), reading("Kraken", 150.3, now)];
+  it("is the median of the exchanges", () => {
+    const three = [
+      reading("Coinbase", 150.1, now),
+      reading("Kraken", 150.3, now),
+      reading("OKX", 150, now),
+    ];
     expect(referenceOf(three, [], now)).toEqual({ ok: true, price: dollars(150.1) });
 
-    const four = [...three, reading("OKX", 150.2, now)];
+    const four = [...three, reading("Bitstamp", 150.2, now)];
     expect(referenceOf(four, [], now)).toEqual({ ok: true, price: dollars(150.15) });
   });
 
-  it("needs the oracle and two exchanges, and names the sources that did not answer", () => {
-    const noOracle = referenceOf(
-      [reading("Coinbase", 150, now), reading("Kraken", 150, now)],
-      ["Pyth"],
-      now,
-    );
-    expect(noOracle).toEqual({
-      ok: false,
-      reason: expect.stringContaining("oracle price is missing"),
-    });
-
-    const oneExchange = referenceOf([pyth, reading("Coinbase", 150, now)], ["Kraken", "OKX"], now);
+  it("needs two exchanges, and names the sources that did not answer", () => {
+    const oneExchange = referenceOf([reading("Coinbase", 150, now)], ["Kraken", "OKX"], now);
     expect(oneExchange).toEqual({
       ok: false,
       reason: expect.stringContaining(
@@ -113,18 +102,18 @@ describe("the reference price", () => {
   });
 
   it("drops one exchange reading more than 10 s old, or dated more than 10 s ahead, and goes on without it", () => {
-    const fresh = [pyth, reading("Coinbase", 150.1, now), reading("OKX", 150.3, now)];
+    const fresh = [reading("Coinbase", 150.1, now), reading("OKX", 150.3, now)];
     const kept = referenceOf(fresh, [], now);
     const old = referenceOf([...fresh, reading("Kraken", 140, now - 11_000)], [], now);
-    expect(kept).toEqual({ ok: true, price: dollars(150.1) });
+    expect(kept).toEqual({ ok: true, price: dollars(150.2) });
     expect(old).toEqual({
       ok: true,
-      price: dollars(150.1),
+      price: dollars(150.2),
       leftOut: ["Kraken left out, 11 s old"],
     });
 
     const ahead = referenceOf([...fresh, reading("Kraken", 140, now + 11_000)], [], now);
-    expect(ahead).toMatchObject({ ok: true, price: dollars(150.1) });
+    expect(ahead).toMatchObject({ ok: true, price: dollars(150.2) });
 
     const tenSeconds = referenceOf([...fresh, reading("Kraken", 150, now - 10_000)], [], now);
     expect(tenSeconds.ok).toBe(true);
@@ -133,7 +122,7 @@ describe("the reference price", () => {
   it("gives none when too few exchange readings are fresh, and names the stale ones", () => {
     const old = (source: string, seconds: number) => reading(source, 150, now - seconds * 1_000);
     const two = referenceOf(
-      [pyth, reading("Coinbase", 150, now), old("Kraken", 11), old("OKX", 14)],
+      [reading("Coinbase", 150, now), old("Kraken", 11), old("OKX", 14)],
       [],
       now,
     );
@@ -144,24 +133,20 @@ describe("the reference price", () => {
   });
 
   it("measures the disagreement over the readings kept, not the stale one dropped", () => {
-    const fresh = [pyth, reading("Coinbase", 150, now), reading("OKX", 150.1, now)];
+    const fresh = [reading("Coinbase", 150, now), reading("OKX", 150.1, now)];
     const wildButStale = referenceOf([...fresh, reading("Kraken", 160, now - 11_000)], [], now);
     expect(wildButStale.ok).toBe(true);
 
     const wildAndFresh = referenceOf([...fresh, reading("Kraken", 160, now)], [], now);
     expect(wildAndFresh.ok).toBe(false);
 
-    const kept = referenceOf(
-      [pyth, reading("Coinbase", 150, now), reading("OKX", 150.46, now)],
-      [],
-      now,
-    );
+    const kept = referenceOf([reading("Coinbase", 150, now), reading("OKX", 150.46, now)], [], now);
     expect(kept).toEqual({ ok: false, reason: "the price sources are 30.6 bps apart" });
   });
 
   it("gives none when the sources are more than 30 bps apart, and one when they are 30 bps apart", () => {
     const apart = (high: number) =>
-      referenceOf([pyth, reading("Coinbase", 150, now), reading("Kraken", high, now)], [], now);
+      referenceOf([reading("Coinbase", 150, now), reading("Kraken", high, now)], [], now);
 
     expect(apart(150.46)).toEqual({ ok: false, reason: "the price sources are 30.6 bps apart" });
     expect(apart(150.45).ok).toBe(true);
@@ -170,12 +155,10 @@ describe("the reference price", () => {
   it("reads every source at once and treats one that fails as silent", async () => {
     const clock = new ManualClock(now);
     const sources = [
-      { name: "Pyth", exchange: false, read: async () => pyth },
-      { name: "Coinbase", exchange: true, read: async () => reading("Coinbase", 150, now) },
-      { name: "Kraken", exchange: true, read: async () => reading("Kraken", 150, now) },
+      { name: "Coinbase", read: async () => reading("Coinbase", 150, now) },
+      { name: "Kraken", read: async () => reading("Kraken", 150, now) },
       {
         name: "OKX",
-        exchange: true,
         read: async (): Promise<PriceReading> => {
           throw new Error("timed out");
         },
@@ -186,24 +169,26 @@ describe("the reference price", () => {
       ok: true,
       price: dollars(150),
     });
+    expect(await new ReferencePrice(sources.slice(0, 2), clock).read()).toEqual({
+      ok: true,
+      price: dollars(150),
+    });
     expect(await new ReferencePrice(sources.slice(1), clock).read()).toEqual({
       ok: false,
-      reason: expect.stringContaining("the oracle price is missing"),
+      reason: expect.stringContaining("only 1 exchange prices came in"),
     });
   });
 
   describe("how often the sources are called", () => {
-    /** Sources that count their calls; a reading is dated by the clock at the call, `pythAgeMs` older for Pyth. */
-    const counted = (clock: ManualClock, failing: string[] = [], pythAgeMs = 3_000) => {
-      const calls: Record<string, number> = { Pyth: 0, Coinbase: 0, Kraken: 0, OKX: 0 };
-      const sources = referenceSources(async () => null).map((source) => ({
+    /** Sources that count their calls; a reading is dated by the clock at the call. */
+    const counted = (clock: ManualClock, failing: string[] = []) => {
+      const calls: Record<string, number> = { Coinbase: 0, Kraken: 0, OKX: 0 };
+      const sources = referenceSources().map((source) => ({
         ...source,
         read: async () => {
           calls[source.name] += 1;
           if (failing.includes(source.name)) throw new Error("timed out");
-          return source.exchange
-            ? reading(source.name, 150, clock.nowMs())
-            : reading(source.name, 150, clock.nowMs() - pythAgeMs, false);
+          return reading(source.name, 150, clock.nowMs());
         },
       }));
       return { calls, sources };
@@ -225,7 +210,7 @@ describe("the reference price", () => {
     const referenceOn = (sources: ReferenceSource[], clock: SteppedClock) =>
       new ReferencePrice(sources, clock, () => clock.monotonicMs());
 
-    it("calls Pyth every 5 s and each exchange every 2 s over a minute of 1 s ticks", async () => {
+    it("calls each exchange every 2 s over a minute of 1 s ticks", async () => {
       const clock = new SteppedClock(now);
       const { calls, sources } = counted(clock);
       const reference = referenceOn(sources, clock);
@@ -233,7 +218,7 @@ describe("the reference price", () => {
         expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
         clock.advance(1_000);
       }
-      expect(calls).toEqual({ Pyth: 12, Coinbase: 30, Kraken: 30, OKX: 30 });
+      expect(calls).toEqual({ Coinbase: 30, Kraken: 30, OKX: 30 });
     });
 
     it("keeps a reused reading's own time, so it goes stale when it would have", async () => {
@@ -253,32 +238,20 @@ describe("the reference price", () => {
       });
     });
 
-    it("lets a reused oracle reading go stale at 30 s, as a fresh read of the same time would", async () => {
-      const clock = new SteppedClock(now);
-      const { sources } = counted(clock, [], 29_000);
-      const reference = referenceOn(
-        sources.map((source) => ({ ...source, minIntervalMs: 60_000 })),
-        clock,
-      );
-      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
-      clock.advance(1_000);
-      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
-      clock.advance(1);
-      expect(await reference.read()).toEqual({ ok: false, reason: "the Pyth price is 30 s old" });
-    });
-
     it("does not call a failing source again before the interval, and reports it each time", async () => {
       const clock = new SteppedClock(now);
-      const { calls, sources } = counted(clock, ["OKX", "Pyth"]);
+      const { calls, sources } = counted(clock, ["OKX", "Kraken"]);
       const reference = referenceOn(sources, clock);
       for (let tick = 0; tick < 10; tick += 1) {
         expect(await reference.read()).toEqual({
           ok: false,
-          reason: expect.stringContaining("the oracle price is missing (no answer from Pyth, OKX)"),
+          reason: expect.stringContaining(
+            "only 1 exchange prices came in, 2 are needed (no answer from Kraken, OKX)",
+          ),
         });
         clock.advance(1_000);
       }
-      expect(calls.Pyth).toBe(2);
+      expect(calls.Kraken).toBe(5);
       expect(calls.OKX).toBe(5);
     });
 
@@ -287,29 +260,20 @@ describe("the reference price", () => {
       let price = 150;
       const source: ReferenceSource = {
         name: "Coinbase",
-        exchange: true,
         minIntervalMs: 2_000,
         read: async () => reading("Coinbase", price, clock.nowMs()),
       };
-      const others = [
-        {
-          name: "Pyth",
-          exchange: false,
-          read: async () => reading("Pyth", 150, clock.nowMs(), false),
-        },
-        {
-          name: "Kraken",
-          exchange: true,
-          read: async () => reading("Kraken", 150.2, clock.nowMs()),
-        },
-      ];
-      const reference = referenceOn([others[0], source, others[1]], clock);
+      const other = {
+        name: "Kraken",
+        read: async () => reading("Kraken", 150.2, clock.nowMs()),
+      };
+      const reference = referenceOn([source, other], clock);
       await reference.read();
       price = 150.1;
       clock.advance(1_999);
-      expect(await reference.read()).toEqual({ ok: true, price: dollars(150) });
-      clock.advance(1);
       expect(await reference.read()).toEqual({ ok: true, price: dollars(150.1) });
+      clock.advance(1);
+      expect(await reference.read()).toEqual({ ok: true, price: dollars(150.15) });
     });
 
     it("does not call a source early when the wall clock is corrected backward", async () => {
@@ -324,7 +288,7 @@ describe("the reference price", () => {
       await reference.read();
       clock.set(now - 7_200_000);
       await reference.read();
-      expect(calls).toEqual({ Pyth: 1, Coinbase: 1, Kraken: 1, OKX: 1 });
+      expect(calls).toEqual({ Coinbase: 1, Kraken: 1, OKX: 1 });
     });
 
     it("does not call a source early when the wall clock jumps forward past the interval", async () => {
@@ -337,11 +301,11 @@ describe("the reference price", () => {
       await reference.read();
       clock.set(now + 3_600_000);
       await reference.read();
-      expect(calls).toEqual({ Pyth: 1, Coinbase: 1, Kraken: 1, OKX: 1 });
+      expect(calls).toEqual({ Coinbase: 1, Kraken: 1, OKX: 1 });
 
       clock.advance(60_000);
       await reference.read();
-      expect(calls).toEqual({ Pyth: 2, Coinbase: 2, Kraken: 2, OKX: 2 });
+      expect(calls).toEqual({ Coinbase: 2, Kraken: 2, OKX: 2 });
     });
 
     it("still ages a reused reading by the wall clock after a backward correction", async () => {
@@ -363,118 +327,7 @@ describe("the reference price", () => {
     });
   });
 
-  describe("the Pyth price account", () => {
-    const FEED = Buffer.from(SOL_USD_FEED_ID, "hex");
-    /** A PriceUpdateV2 account as the chain holds it: 134 bytes, a Full one using 133 of them. */
-    const account = (
-      over: {
-        level?: number;
-        feed?: Buffer;
-        price?: bigint;
-        expo?: number;
-        publishS?: number;
-      } = {},
-    ): Buffer => {
-      const data = Buffer.alloc(134);
-      Buffer.from("22f123639d7ef4cd", "hex").copy(data, 0);
-      data.fill(7, 8, 40);
-      const level = over.level ?? 1;
-      data[40] = level;
-      let at = 41;
-      if (level === 0) data[at++] = 5;
-      (over.feed ?? FEED).copy(data, at);
-      data.writeBigInt64LE(over.price ?? 15012345678n, at + 32);
-      data.writeBigUInt64LE(1_000_000n, at + 40);
-      data.writeInt32LE(over.expo ?? -8, at + 48);
-      data.writeBigInt64LE(BigInt(over.publishS ?? now / 1_000 - 4), at + 52);
-      return data;
-    };
-
-    it("is read from a real shaped 134 byte account", () => {
-      expect(readPythAccount(account())).toEqual({
-        source: "Pyth",
-        exchange: false,
-        price: dollars(150.123456),
-        atMs: now - 4_000,
-      });
-    });
-
-    it("is the account the exchange's SOL market is bound to", () => {
-      expect(pythPriceAccountOf(SOL_USD_FEED_ID)).toBe(
-        "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
-      );
-    });
-
-    it("is refused unless fully verified, with the reason", () => {
-      expect(() => readPythAccount(account({ level: 0 }))).toThrow(
-        "the Pyth price account is not fully verified",
-      );
-    });
-
-    it("is refused for another feed id", () => {
-      const other = Buffer.from(FEED);
-      other[0] ^= 1;
-      expect(() => readPythAccount(account({ feed: other }))).toThrow(
-        "the Pyth price account is not the SOL/USD feed",
-      );
-    });
-
-    it("is refused when too short, out of range or not above zero", () => {
-      expect(() => readPythAccount(account().subarray(0, 100))).toThrow("too short");
-      expect(() => readPythAccount(account({ expo: 3 }))).toThrow("exponent");
-      expect(() => readPythAccount(account({ price: -5n }))).toThrow("not above zero");
-    });
-
-    it("puts the reason in the maker's pull reason", async () => {
-      const sources = referenceSources(
-        async () => account({ level: 0 }),
-        async () => ({}),
-      );
-      const reference = await new ReferencePrice(sources, new ManualClock(now)).read();
-      expect(reference).toEqual({
-        ok: false,
-        reason: expect.stringContaining(
-          "the oracle price is missing (no answer from Coinbase, Kraken, OKX; the Pyth price account is not fully verified)",
-        ),
-      });
-    });
-
-    it("says so when the account does not exist", async () => {
-      const read = referenceSources(async () => null)[0].read();
-      await expect(read).rejects.toThrow("the Pyth price account does not exist");
-    });
-
-    it("may be 29 s old, but not 31 s, while exchanges stay at 10 s", () => {
-      const exchanges = [reading("Coinbase", 150, now), reading("Kraken", 150, now)];
-      const oracleAged = (seconds: number) =>
-        referenceOf([...exchanges, reading("Pyth", 150, now - seconds * 1_000, false)], [], now);
-
-      expect(oracleAged(29).ok).toBe(true);
-      expect(oracleAged(30).ok).toBe(true);
-      expect(oracleAged(31)).toEqual({ ok: false, reason: "the Pyth price is 31 s old" });
-      const staleExchange = referenceOf(
-        [
-          reading("Pyth", 150, now - 29_000, false),
-          exchanges[0],
-          reading("Kraken", 150, now - 11_000),
-        ],
-        [],
-        now,
-      );
-      expect(staleExchange).toEqual({
-        ok: false,
-        reason: "only 1 fresh exchange prices, 2 are needed (Kraken is 11 s old)",
-      });
-    });
-  });
-
-  it("reads the public answers of Pyth's account, Coinbase, Kraken and OKX", async () => {
-    const pythAccount = Buffer.alloc(134);
-    pythAccount[40] = 1;
-    Buffer.from(SOL_USD_FEED_ID, "hex").copy(pythAccount, 41);
-    pythAccount.writeBigInt64LE(15012345678n, 73);
-    pythAccount.writeInt32LE(-8, 89);
-    pythAccount.writeBigInt64LE(BigInt(now / 1_000 - 2), 93);
+  it("reads the public answers of Coinbase, Kraken and OKX", async () => {
     const answers: Record<string, unknown> = {
       "api.exchange.coinbase.com": {
         ask: "150.12",
@@ -491,7 +344,6 @@ describe("the reference price", () => {
       },
     };
     const sources = referenceSources(
-      async () => pythAccount,
       async (url) => answers[new URL(url).host],
       () => now,
     );
@@ -499,17 +351,15 @@ describe("the reference price", () => {
     const readings = await Promise.all(sources.map((source) => source.read()));
 
     expect(readings).toEqual([
-      { source: "Pyth", exchange: false, price: dollars(150.123456), atMs: now - 2_000 },
-      { source: "Coinbase", exchange: true, price: dollars(150.11), atMs: now },
-      { source: "Kraken", exchange: true, price: dollars(150.12), atMs: now },
-      { source: "OKX", exchange: true, price: dollars(150.13), atMs: now - 300 },
+      { source: "Coinbase", price: dollars(150.11), atMs: now },
+      { source: "Kraken", price: dollars(150.12), atMs: now },
+      { source: "OKX", price: dollars(150.13), atMs: now - 300 },
     ]);
   });
 
   describe("an exchange quote", () => {
     const quoteOf = (name: string, answer: unknown) => {
       const source = referenceSources(
-        async () => null,
         async () => answer,
         () => now,
       ).find((candidate) => candidate.name === name);
@@ -938,7 +788,7 @@ describe("a house maker's reference price", () => {
     await warmUp();
     book.take();
 
-    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    feed.reference = { ok: false, reason: "the MagicBlock price is 31 s old" };
     for (let second = 0; second < 12; second += 1) await tick();
     expect(book.orders).toHaveLength(0);
 
@@ -947,7 +797,7 @@ describe("a house maker's reference price", () => {
     expect(book.orders.length).toBeGreaterThan(0);
     book.take();
 
-    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    feed.reference = { ok: false, reason: "the MagicBlock price is 31 s old" };
     for (let second = 0; second < 12; second += 1) await tick();
     feed.reference = { ok: true, price: dollars(151) };
     await tick();
@@ -1005,7 +855,7 @@ describe("a house maker's reference price", () => {
     for (let second = 0; second < 58; second += 1) {
       feed.reference =
         second % 2 === 0
-          ? { ok: false, reason: "the Pyth price is 31 s old" }
+          ? { ok: false, reason: "the MagicBlock price is 31 s old" }
           : { ok: true, price: dollars(150) };
       await tick();
     }
@@ -1025,7 +875,7 @@ describe("a house maker's reference price", () => {
         (line) => line.includes("pulled its quotes") && !line.includes("watching the price"),
       );
 
-    feed.reference = { ok: false, reason: "the Pyth price is 31 s old" };
+    feed.reference = { ok: false, reason: "the MagicBlock price is 31 s old" };
     await tick();
     feed.reference = { ok: false, reason: "only 1 fresh exchange prices, 2 are needed" };
     for (let second = 0; second < 58; second += 1) await tick();
@@ -1165,19 +1015,15 @@ describe("the mainnet settings of the maker", () => {
     expect(config.HOUSE_MAKER_SPREAD_BPS).toBe(15);
   });
 
-  it("quotes from the rollup's price by default, and keeps its limits on how old and how far from Pyth", () => {
+  it("quotes from the rollup's price by default, and keeps its limit on how old", () => {
     const config = loadConfig(env());
 
     expect(config.MAGICBLOCK_REFERENCE).toBe(true);
     expect(config.MAGICBLOCK_MAX_AGE_MS).toBe(3_000);
-    expect(config.MAGICBLOCK_PYTH_MAX_BPS).toBe(30);
     expect(loadConfig(env({ MAGICBLOCK_REFERENCE: "off" })).MAGICBLOCK_REFERENCE).toBe(false);
     expect(loadConfig({ NETWORK: "devnet" }).MAGICBLOCK_REFERENCE).toBe(false);
     expect(refusals({ MAGICBLOCK_MAX_AGE_MS: "10001" })).toEqual([
       expect.stringContaining("MAGICBLOCK_MAX_AGE_MS is over 10000 ms"),
-    ]);
-    expect(refusals({ MAGICBLOCK_PYTH_MAX_BPS: "31" })).toEqual([
-      expect.stringContaining("MAGICBLOCK_PYTH_MAX_BPS is over 30 bps"),
     ]);
     expect(loadConfig(env({ MAGICBLOCK_MAX_AGE_MS: "10000" })).MAGICBLOCK_MAX_AGE_MS).toBe(10_000);
   });

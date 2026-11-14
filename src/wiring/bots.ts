@@ -18,7 +18,6 @@ import { type Config, isMainnet } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
-import { PublicKey } from "@solana/web3.js";
 import {
   MagicblockPrice,
   MagicblockReference,
@@ -28,14 +27,9 @@ import {
 } from "../prices/magicblock-price.js";
 import {
   ReferencePrice,
-  type ReadPythAccount,
   type ReferenceReader,
-  SOL_USD_FEED_ID,
-  pythSource,
   referenceSources,
 } from "../prices/reference-price.js";
-import { connectionTo } from "../rollup/connections.js";
-import { pythPriceAccountOf } from "../rollup/program.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
 import { KeeperHeartbeat, type KeeperProblemSource } from "./keeper-heartbeat.js";
 import { NetworkKeeperHeartbeat, keeperSources } from "./keeper-network-heartbeat.js";
@@ -292,17 +286,6 @@ export interface OpenedBots {
  * separate from opening so that the loops can be stopped and started again
  * without opening anything twice. Opening is safe to repeat after a failure.
  */
-/** Reads Pyth's SOL/USD price account over the service's own Solana RPC address. */
-const pythAccountReader = (solanaRpcUrl: string | undefined): ReadPythAccount => {
-  const account = new PublicKey(pythPriceAccountOf(SOL_USD_FEED_ID));
-  const connection = solanaRpcUrl ? connectionTo(solanaRpcUrl) : null;
-  return async () => {
-    if (!connection)
-      throw new Error("SOLANA_RPC_URL is not set, so Pyth's price account is not read");
-    return (await connection.getAccountInfo(account))?.data ?? null;
-  };
-};
-
 /** The SOL/USD price inside the rollup, which the maker follows over the rollup's own endpoints. */
 const magicblockPrice = (config: Config): MagicblockPrice => {
   const { ROLLUP_RPC_URL: rpcUrl, ROLLUP_WS_URL: wsUrl } = config;
@@ -336,16 +319,14 @@ export const openBots = async (
       "MAGICBLOCK_REFERENCE=on feeds the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
     );
   }
-  const readPyth = pythAccountReader(config.SOLANA_RPC_URL);
   const magicblock = config.MAGICBLOCK_REFERENCE ? magicblockPrice(config) : null;
   const reference: ReferenceReader | null = !rules
     ? null
     : magicblock
-      ? new MagicblockReference(magicblock, pythSource(readPyth), systemClock, {
+      ? new MagicblockReference(magicblock, systemClock, {
           maxAgeMs: config.MAGICBLOCK_MAX_AGE_MS,
-          maxPythBps: config.MAGICBLOCK_PYTH_MAX_BPS,
         })
-      : new ReferencePrice(referenceSources(readPyth), systemClock);
+      : new ReferencePrice(referenceSources(), systemClock);
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)

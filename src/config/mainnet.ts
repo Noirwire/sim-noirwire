@@ -233,11 +233,6 @@ const makerLimits = (config: Config, env: Env): string[] => [
         `MAGICBLOCK_MAX_AGE_MS is over ${MAKER_LIMITS.maxMagicblockAgeMs} ms, so the maker would quote through an outage of the rollup's price. Lower it.`,
       ]
     : []),
-  ...(config.MAGICBLOCK_PYTH_MAX_BPS > MAKER_LIMITS.maxSourceDisagreementBps
-    ? [
-        `MAGICBLOCK_PYTH_MAX_BPS is over ${MAKER_LIMITS.maxSourceDisagreementBps} bps, the most two price sources may differ by. Lower it.`,
-      ]
-    : []),
   ...(config.ROLLUP_MAKER_LEVEL_NUSD > MAKER_LIMITS.maxQuoteSizeNusd
     ? [
         `ROLLUP_MAKER_LEVEL_NUSD is over ${MAKER_LIMITS.maxQuoteSizeNusd / SCALE} nUSD, the most one quote level may hold. Lower it.`,
