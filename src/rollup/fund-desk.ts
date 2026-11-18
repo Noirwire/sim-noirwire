@@ -17,7 +17,7 @@ import { DepositRefused, ProgramRefused, sendDepositAndConfirm } from "./transac
 
 const PREPARED_FOR_MS = 45_000;
 
-type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
+export type Refusal<Status extends number> = { ok: false; status: Status; reason: string };
 
 export type Prepared = { ok: true; transaction: string; expiresAtMs: number } | Refusal<400 | 503>;
 
@@ -56,6 +56,26 @@ const publicKeyOf = (value: string): PublicKey | null => {
 };
 
 const isPublicKey = (key: PublicKey | null): key is PublicKey => key !== null;
+
+/** The owner and order keys as keys, or the refusal for keys that are not, or not all different. */
+export const parseOwnerAndKeys = (
+  owner: string,
+  orderKeys: string[],
+): { ownerKey: PublicKey; keys: PublicKey[] } | Refusal<400> => {
+  const ownerKey = publicKeyOf(owner);
+  const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
+  if (!ownerKey || keys.length !== orderKeys.length) {
+    return { ok: false, status: 400, reason: "not a public key" };
+  }
+  if (new Set([owner, ...orderKeys]).size !== orderKeys.length + 1) {
+    return {
+      ok: false,
+      status: 400,
+      reason: "the order keys must differ from each other and from the owner",
+    };
+  }
+  return { ownerKey, keys };
+};
 
 /** The causes of a refused opening that a person can be told in plain words. */
 const OPENING_REFUSED_BECAUSE: Record<number, string> = {
@@ -125,18 +145,9 @@ export class FundDesk implements FundRequests {
 
   async prepare(owner: string, orderKeys: string[]): Promise<Prepared> {
     const { program, session, gate, faucet, token, amountAtoms, clock } = this.options;
-    const ownerKey = publicKeyOf(owner);
-    const keys = orderKeys.map(publicKeyOf).filter(isPublicKey);
-    if (!ownerKey || keys.length !== orderKeys.length) {
-      return { ok: false, status: 400, reason: "not a public key" };
-    }
-    if (new Set([owner, ...orderKeys]).size !== orderKeys.length + 1) {
-      return {
-        ok: false,
-        status: 400,
-        reason: "the order keys must differ from each other and from the owner",
-      };
-    }
+    const parsed = parseOwnerAndKeys(owner, orderKeys);
+    if ("ok" in parsed) return parsed;
+    const { ownerKey, keys } = parsed;
     const now = clock.nowMs();
     this.forgetExpired(now);
     const transaction = await session.use((connection) =>

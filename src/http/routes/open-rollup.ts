@@ -3,32 +3,23 @@ import { z } from "zod";
 import type { Opened, OpenRequests, SignedOpenRequests } from "../../rollup/open-desk.js";
 import type { AppContext } from "../context.js";
 import { base58Address } from "../schemas.js";
-import { deskUnavailable } from "./desk-availability.js";
+import {
+  DESK_BUSY,
+  DESK_UNREACHABLE,
+  deskUnavailable,
+  ownerAndOrderKeys,
+  submitSchema,
+} from "./desk-availability.js";
 
-const DESK_UNREACHABLE = "the rollup did not answer, try again";
-const DESK_BUSY = "the desk is busy with another request, try again";
 /** How long a prepare waits for the one under way before it is told the desk is busy. */
 const PREPARE_WAIT_MS = 5_000;
-const ORDER_KEYS_PER_TRADER = 4;
-/** Well above an open transaction in base64, well below anything worth parsing. */
-const MAX_TRANSACTION_CHARS = 4_096;
 
 const prepareSchema = z.object({
-  owner: base58Address,
-  orderKeys: z.array(base58Address).length(ORDER_KEYS_PER_TRADER),
+  ...ownerAndOrderKeys,
   invite: z
     .string()
     .regex(/^[A-Za-z0-9_-]{1,64}$/, "must be the invite code you were given")
     .optional(),
-});
-
-const submitSchema = z.object({
-  owner: base58Address,
-  transaction: z
-    .string()
-    .min(1)
-    .max(MAX_TRANSACTION_CHARS)
-    .regex(/^[A-Za-z0-9+/]+=*$/, "must be base64"),
 });
 
 /** SIGNED_OWNER_ACTIONS on a desk that cannot take a signature is a wiring mistake: stop at start-up. */

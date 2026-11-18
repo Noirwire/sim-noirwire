@@ -112,8 +112,7 @@ const botsOpeningThrough = (
     openOwnTrader: async (
       _rpcUrl: string,
       _owner: Keypair,
-      _gate: Keypair,
-      _gateConnection: unknown,
+      _gate: unknown,
       checkpoint?: KeyCheckpoint,
       madeFor?: Generation,
     ) => {

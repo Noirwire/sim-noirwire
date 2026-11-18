@@ -66,7 +66,6 @@ import { controlPath, requestMode } from "../src/bots/maker-control.js";
 import { makerStatePath } from "../src/bots/maker-state.js";
 import { loadConfig } from "../src/config/config.js";
 import { MARKETS } from "../src/engine/markets.js";
-import { SOL_USD_FEED_ID } from "../src/prices/reference-price.js";
 import type {
   MarketInfo,
   NewOrder,
@@ -79,9 +78,8 @@ import { LATE_DISPATCH_QUARANTINE_MS } from "../src/hedge/hedge-limits.js";
 import type { HedgeAck, HedgeOrder } from "../src/hedge/hedge-venue.js";
 import { PLACE_DEADLINE_MS } from "../src/rollup/rollup-venue.js";
 import { type OpenedBots, openBots } from "../src/wiring/bots.js";
-import type { VenueWiring } from "../src/wiring/venue-wiring.js";
 import { FakeHedgeVenue } from "./fake-hedge-venue.js";
-import { dollars } from "./helpers.js";
+import { dollars, makerWiring } from "./helpers.js";
 
 const PERP = "NSOL-PERP";
 const START_MS = Date.parse("2026-11-02T12:00:00Z");
@@ -139,32 +137,6 @@ interface SavedState {
   hold: SavedHold | null;
 }
 
-const SOLANA_HOST = "solana.example";
-
-/** Pyth's SOL/USD price account as the chain holds it, in the form the RPC answers with. */
-const pythAccountAnswer = (price: number, atMs: number) => {
-  const data = Buffer.alloc(134);
-  data[40] = 1;
-  Buffer.from(SOL_USD_FEED_ID, "hex").copy(data, 41);
-  data.writeBigInt64LE(BigInt(Math.round(price * 1e8)), 73);
-  data.writeInt32LE(-8, 89);
-  data.writeBigInt64LE(BigInt(Math.floor(atMs / SECOND)), 93);
-  return {
-    jsonrpc: "2.0",
-    id: "1",
-    result: {
-      context: { slot: 1 },
-      value: {
-        data: [data.toString("base64"), "base64"],
-        executable: false,
-        lamports: 1,
-        owner: "11111111111111111111111111111111",
-        rentEpoch: 0,
-      },
-    },
-  };
-};
-
 const feedBody = (host: string, price: number, atMs: number) => {
   const text = price.toFixed(2);
   if (host === "api.exchange.coinbase.com") {
@@ -195,7 +167,7 @@ class World {
   mark = dollars(150);
   position = 0n;
   equity = dollars(1_000);
-  feed = { price: 150, mode: "ok" as "ok" | "stale" | "down" | "hang" };
+  feed = { price: 150, mode: "ok" as "ok" | "down" | "hang" };
   marketsHang = false;
   refusedBecause: string | null = null;
   placeFaults: PlaceFault[] = [];
@@ -525,21 +497,13 @@ class World {
     };
   }
 
-  fetchFeed = async (input: unknown, init?: RequestInit): Promise<Response> => {
+  fetchFeed = async (input: unknown): Promise<Response> => {
     const { host } = new URL(String(input));
     if (this.feed.mode === "down") throw new Error("the network is down");
     if (this.feed.mode === "hang") {
       await new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 3_000));
     }
-    const age = this.feed.mode === "stale" ? 60_000 : 1_000;
-    if (host === SOLANA_HOST) {
-      const { id } = JSON.parse(String(init?.body)) as { id: string };
-      const answer = { ...pythAccountAnswer(this.feed.price, Date.now() - age), id };
-      return new Response(JSON.stringify(answer), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    const body = feedBody(host, this.feed.price, Date.now() - age);
+    const body = feedBody(host, this.feed.price, Date.now() - 1_000);
     return { ok: true, status: 200, json: async () => body } as Response;
   };
 }
@@ -572,7 +536,6 @@ const rig = async (name: string, options: RigOptions = {}) => {
   const config = {
     ...loadConfig({
       VENUE: "memory",
-      SOLANA_RPC_URL: `https://${SOLANA_HOST}`,
       NOISE_TAKERS_ENABLED: "0",
       LIQUIDATOR_ENABLED: "0",
       HOUSE_MAKER_RISK_RULES: "1",
@@ -594,21 +557,7 @@ const rig = async (name: string, options: RigOptions = {}) => {
   };
   const start = async (): Promise<void> => {
     const venue = world.venueFor(world.generation);
-    const wiring = {
-      venue,
-      botVenue: venue,
-      botMarkets: [MARKETS[0]],
-      botSizes: async () => ({
-        makerLevel: dollars(0.3),
-        takerMin: 0n,
-        takerMax: 0n,
-        lotSize: dollars(0.001),
-        takerStartingBase: 0n,
-      }),
-      afterMakersOpen: async () => {},
-      needsFundingUpdater: false,
-      liquidationTargets: () => [],
-    } as unknown as VenueWiring;
+    const wiring = makerWiring(venue, MARKETS[0]);
     world.bots = await openBots(config, wiring, problems, options.hedge ? hedgeVenue : undefined);
     loops = world.bots.start();
   };
@@ -926,7 +875,7 @@ describe("the disk goes wrong", () => {
 });
 
 describe("the prices go wrong", () => {
-  for (const mode of ["stale", "down", "hang"] as const) {
+  for (const mode of ["down", "hang"] as const) {
     it(`pulls its quotes while the price feed is ${mode}, and quotes again after it has watched the price`, async () => {
       const t = await rig(`feed-${mode}`);
       await t.step(30);

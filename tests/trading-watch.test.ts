@@ -115,7 +115,7 @@ describe("the trading readiness watch", () => {
     const { said, state, clock, watch } = watched();
     watch.check();
     state.ready = false;
-    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    state.reason = "NSOL-PERP: the MagicBlock price is 42 s old";
     for (let minute = 0; minute <= 400; minute += 1) {
       watch.check();
       clock.advance(MINUTE);
@@ -137,7 +137,7 @@ describe("the trading readiness watch", () => {
     state.ready = false;
     state.reason = "NSOL-PERP maker has had no quotes resting for 25391 s";
     watch.check();
-    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    state.reason = "NSOL-PERP: the MagicBlock price is 42 s old";
     watch.check();
     const before = said.alerts.length;
 
@@ -146,7 +146,7 @@ describe("the trading readiness watch", () => {
       state.reason =
         second % 2 === 0
           ? `NSOL-PERP maker has had no quotes resting for ${25391 + second} s`
-          : `NSOL-PERP: the Pyth price is ${42 + second} s old`;
+          : `NSOL-PERP: the MagicBlock price is ${42 + second} s old`;
       watch.check();
     }
 
@@ -157,13 +157,13 @@ describe("the trading readiness watch", () => {
     const { said, state, watch } = watched();
     watch.check();
     state.ready = false;
-    state.reason = "NSOL-PERP: the Pyth price is 42 s old";
+    state.reason = "NSOL-PERP: the MagicBlock price is 42 s old";
     watch.check();
     state.ready = true;
     watch.check();
     state.ready = false;
     watch.check();
-    state.reason = "NSOL-PERP: the Pyth price is 55 s old";
+    state.reason = "NSOL-PERP: the MagicBlock price is 55 s old";
     watch.check();
 
     expect(said.alerts).toHaveLength(2);

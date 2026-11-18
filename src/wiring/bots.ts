@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { makerTraderKey } from "../bots/bot-traders.js";
 import { FundingUpdater } from "../bots/funding-updater.js";
@@ -17,17 +18,21 @@ import { type Config, isMainnet } from "../config/config.js";
 import { systemClock } from "../engine/clock.js";
 import type { MarketConfig } from "../engine/markets.js";
 import type { Venue } from "../engine/types.js";
-import { PublicKey } from "@solana/web3.js";
+import {
+  MagicblockPrice,
+  MagicblockReference,
+  SOL_USD_FEED_NUMBER,
+  magicblockPriceAddress,
+  rollupPriceLink,
+} from "../prices/magicblock-price.js";
 import {
   ReferencePrice,
-  type ReadPythAccount,
-  SOL_USD_FEED_ID,
+  type ReferenceReader,
   referenceSources,
 } from "../prices/reference-price.js";
-import { connectionTo } from "../rollup/connections.js";
-import { pythPriceAccountOf } from "../rollup/program.js";
 import { type Repeating, every } from "../scheduling/repeating.js";
-import { KeeperHeartbeat } from "./keeper-heartbeat.js";
+import { KeeperHeartbeat, type KeeperProblemSource } from "./keeper-heartbeat.js";
+import { NetworkKeeperHeartbeat, keeperSources } from "./keeper-network-heartbeat.js";
 import { TradingWatch } from "./trading-watch.js";
 import type { BotSizes, VenueWiring } from "./venue-wiring.js";
 
@@ -66,6 +71,48 @@ const readWithinDeadline = <T>(
     );
   });
 
+/**
+ * The keeper's heartbeat from the transport the settings name: the network (signed statuses from one
+ * or more keepers) or, as ever, the file. With neither, mainnet fails closed and the other networks
+ * leave the keeper out of it.
+ */
+export const keeperHeartbeatFor = (config: Config): KeeperProblemSource => {
+  if (config.KEEPER_HEARTBEAT_URLS && config.KEEPER_HEARTBEAT_SECRETS_FILE) {
+    return new NetworkKeeperHeartbeat({
+      sources: keeperSources(
+        config.KEEPER_HEARTBEAT_URLS,
+        readKeeperSecrets(config.KEEPER_HEARTBEAT_SECRETS_FILE),
+      ),
+      network: config.NETWORK,
+      minHealthy: config.KEEPER_HEARTBEAT_MIN_HEALTHY,
+      maxAgeMs: config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+      pollEveryMs: config.KEEPER_HEARTBEAT_POLL_MS,
+      clock: systemClock,
+    });
+  }
+  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
+  return new KeeperHeartbeat(
+    keeperFile
+      ? () =>
+          readWithinDeadline(
+            () => readFile(keeperFile, "utf8"),
+            "the keeper heartbeat file was not read",
+          )
+      : undefined,
+    isMainnet(config),
+    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
+    systemClock,
+  );
+};
+
+const readKeeperSecrets = (path: string): string => {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    throw new Error("KEEPER_HEARTBEAT_SECRETS_FILE must be a readable file");
+  }
+};
+
 export interface BotProblems {
   onError(what: string, error: unknown): void;
   onRecovered(what: string): void;
@@ -90,7 +137,7 @@ const hedgeController = (
   config: Config,
   market: MarketConfig,
   ledger: MakerLedger,
-  reference: ReferencePrice,
+  reference: ReferenceReader,
   botVenue: Venue,
   hedgeVenue: HedgeVenue | undefined,
   problems: BotProblems,
@@ -127,10 +174,10 @@ const hedgeController = (
 const makerSafety = (
   market: MarketConfig,
   ledger: MakerLedger,
-  reference: ReferencePrice,
+  reference: ReferenceReader,
   control: MakerControl,
   problems: BotProblems,
-  keeper: KeeperHeartbeat,
+  keeper: KeeperProblemSource,
   hedge?: HedgeGate,
 ): MakerSafety => {
   if (market.kind !== "perp" || market.base !== REFERENCE_BASE_TOKEN) {
@@ -232,6 +279,16 @@ export interface OpenedBots {
   confirmHedgesBeforeSleep(): Promise<void>;
 }
 
+/** The SOL/USD price inside the rollup, which the maker follows over the rollup's own endpoints. */
+const magicblockPrice = (config: Config): MagicblockPrice => {
+  const { ROLLUP_RPC_URL: rpcUrl, ROLLUP_WS_URL: wsUrl } = config;
+  if (!rpcUrl || !wsUrl) {
+    throw new Error("MAGICBLOCK_REFERENCE=on needs ROLLUP_RPC_URL and ROLLUP_WS_URL.");
+  }
+  const address = magicblockPriceAddress(SOL_USD_FEED_NUMBER);
+  return new MagicblockPrice(address, () => rollupPriceLink(rpcUrl, wsUrl, address), systemClock);
+};
+
 /**
  * Opens and funds the makers, and returns what starts every bot's loop: a
  * maker per market, a noise taker per market and one liquidator where they
@@ -239,17 +296,6 @@ export interface OpenedBots {
  * separate from opening so that the loops can be stopped and started again
  * without opening anything twice. Opening is safe to repeat after a failure.
  */
-/** Reads Pyth's SOL/USD price account over the service's own Solana RPC address. */
-const pythAccountReader = (solanaRpcUrl: string | undefined): ReadPythAccount => {
-  const account = new PublicKey(pythPriceAccountOf(SOL_USD_FEED_ID));
-  const connection = solanaRpcUrl ? connectionTo(solanaRpcUrl) : null;
-  return async () => {
-    if (!connection)
-      throw new Error("SOLANA_RPC_URL is not set, so Pyth's price account is not read");
-    return (await connection.getAccountInfo(account))?.data ?? null;
-  };
-};
-
 export const openBots = async (
   config: Config,
   wiring: VenueWiring,
@@ -268,28 +314,26 @@ export const openBots = async (
       "the hedge couples to the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
     );
   }
-  const reference = rules
-    ? new ReferencePrice(referenceSources(pythAccountReader(config.SOLANA_RPC_URL)), systemClock)
-    : null;
+  if (config.MAGICBLOCK_REFERENCE && !rules) {
+    throw new Error(
+      "MAGICBLOCK_REFERENCE=on feeds the maker's risk rules, so set HOUSE_MAKER_RISK_RULES=1.",
+    );
+  }
+  const magicblock = config.MAGICBLOCK_REFERENCE ? magicblockPrice(config) : null;
+  const reference: ReferenceReader | null = !rules
+    ? null
+    : magicblock
+      ? new MagicblockReference(magicblock, systemClock, {
+          maxAgeMs: config.MAGICBLOCK_MAX_AGE_MS,
+        })
+      : new ReferencePrice(referenceSources(), systemClock);
   const control = new MakerControl(controlPath(config.DATA_DIR));
   const afterRequote = config.HEALTHCHECK_URL
     ? healthPing(config.HEALTHCHECK_URL, problems)
     : undefined;
-  const keeperFile = config.KEEPER_HEARTBEAT_FILE;
-  // Readiness is a synchronous function of cached state, so the file is read by the readiness loop, not by `trading()`.
+  // Readiness is a synchronous function of cached state, so the heartbeat is read by the readiness loop, not by `trading()`.
   // Every maker's safety reads the same heartbeat.
-  const keeper = new KeeperHeartbeat(
-    keeperFile
-      ? () =>
-          readWithinDeadline(
-            () => readFile(keeperFile, "utf8"),
-            "the keeper heartbeat file was not read",
-          )
-      : undefined,
-    isMainnet(config),
-    config.KEEPER_HEARTBEAT_MAX_AGE_MS,
-    systemClock,
-  );
+  const keeper = keeperHeartbeatFor(config);
   for (const market of botMarkets) {
     const sizes = await wiring.botSizes(market);
     // What a maker must remember lives beside the snapshot; the in-memory venue forgets it all at a restart.
@@ -391,6 +435,7 @@ export const openBots = async (
         ),
       ),
     ];
+    if (magicblock) loops.push(magicblock.follow());
     if (watch) {
       watch.resume();
       markNotRead();

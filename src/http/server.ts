@@ -2,6 +2,7 @@ import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance } from "fastify";
 import { isMainnet } from "../config/config.js";
+import { servesAccountDesk, servesMarketData } from "../config/role.js";
 import { systemClock } from "../engine/clock.js";
 import type { AppContext } from "./context.js";
 import { RateLimiter, SocketLimiter } from "./rate-limit.js";
@@ -66,22 +67,30 @@ export const buildServer = async (ctx: AppContext): Promise<FastifyInstance> => 
     ctx.activity.touch();
   });
 
+  // Every role answers its own health. The rest is what the role is for.
+  const { SIM_ROLE: role } = config;
   registerHealthRoute(app, ctx);
-  if (ctx.deployment) registerDeploymentRoute(app, ctx.deployment);
-  registerMarketsRoute(app, ctx);
-  registerTapeRoute(app, ctx);
-  registerCandlesRoute(app, ctx);
-  registerStatsRoute(app, ctx);
-  if (ctx.quests) registerQuestRoutes(app, ctx.quests);
-  if (mainnet) {
-    if (ctx.openDesk) registerOpenRoutes(app, ctx, ctx.openDesk);
-  } else if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
-  else registerFundRoute(app, ctx);
-  registerStreamRoute(
-    app,
-    ctx,
-    mainnet ? new SocketLimiter(config.PUBLIC_SOCKETS_PER_IP) : undefined,
-  );
+  if (servesMarketData(role)) {
+    if (ctx.deployment) registerDeploymentRoute(app, ctx.deployment);
+    registerMarketsRoute(app, ctx);
+    registerTapeRoute(app, ctx);
+    registerCandlesRoute(app, ctx);
+    registerStatsRoute(app, ctx);
+    if (ctx.quests) registerQuestRoutes(app, ctx.quests);
+  }
+  if (servesAccountDesk(role)) {
+    if (mainnet) {
+      if (ctx.openDesk) registerOpenRoutes(app, ctx, ctx.openDesk);
+    } else if (ctx.fundDesk) registerRollupFundRoutes(app, ctx, ctx.fundDesk);
+    else registerFundRoute(app, ctx);
+  }
+  if (servesMarketData(role)) {
+    registerStreamRoute(
+      app,
+      ctx,
+      mainnet ? new SocketLimiter(config.PUBLIC_SOCKETS_PER_IP) : undefined,
+    );
+  }
 
   if (config.VENUE === "memory" && config.DEV_TRADING && !mainnet) {
     registerDevTradingRoutes(app, ctx);

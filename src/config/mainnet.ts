@@ -1,6 +1,13 @@
 import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import { SCALE } from "../engine/money.js";
 import type { Config } from "./config.js";
+import {
+  type SimRole,
+  holdsGateKey,
+  holdsMakerSeeds,
+  servesAccountDesk,
+  servesMarketData,
+} from "./role.js";
 
 type Env = NodeJS.ProcessEnv;
 
@@ -110,17 +117,27 @@ const testMachinery = (config: Config, env: Env): string[] => [
       ]),
 ];
 
-const secretsFromFiles = (env: Env): string[] =>
-  FROM_A_FILE.flatMap(({ inline, file, why }) => {
+/** Which of the secrets in FROM_A_FILE a role needs: the others are not asked for, and `roleProblems` refuses them. */
+const neededByRole = (role: SimRole): Record<string, boolean> => ({
+  GATE_SECRET_KEY: holdsGateKey(role),
+  BOT_TRADER_SEEDS: holdsMakerSeeds(role),
+  DEPLOYMENT_JSON: true,
+});
+
+const secretsFromFiles = (env: Env, role: SimRole): string[] => {
+  const needed = neededByRole(role);
+  return FROM_A_FILE.flatMap(({ inline, file, why }) => {
     if (isSet(env, inline)) {
       return [
         `${inline} is set, but on mainnet ${why}. Remove it and set ${file} to the file's path.`,
       ];
     }
+    if (!needed[inline]) return [];
     return isSet(env, file)
       ? []
       : [`${file} is not set. On mainnet ${why}. Set it to the file's path.`];
   });
+};
 
 const publicUrls = (env: Env): string[] =>
   PUBLIC_URLS.flatMap(({ name, private: privateName, sharedScheme }) => {
@@ -173,12 +190,15 @@ const gateSettings = (config: Config, env: Env): string[] => [
 /**
  * What the house maker uses on mainnet when its setting is not given: small
  * enough for a maker of about 1,000 USDC. The testnet defaults would quote
- * far more than that.
+ * far more than that. It quotes from the rollup's own price, which moves about
+ * ten times a second, so it requotes after a 3 bps move (the half-spread is
+ * never under 15) and at least every 5 s.
  */
 const MAINNET_MAKER_DEFAULTS = {
   HOUSE_MAKER_LEVELS: 3,
-  HOUSE_MAKER_REQUOTE_THRESHOLD_BPS: 6,
-  HOUSE_MAKER_REQUOTE_INTERVAL_MS: 10_000,
+  HOUSE_MAKER_REQUOTE_THRESHOLD_BPS: 3,
+  HOUSE_MAKER_REQUOTE_INTERVAL_MS: 5_000,
+  MAGICBLOCK_REFERENCE: true,
   HOUSE_MAKER_POSITION_LIMIT_NUSD: 250n * SCALE,
   ROLLUP_MAKER_LEVEL_NUSD: 50n * SCALE,
 } satisfies Partial<Config>;
@@ -208,6 +228,11 @@ const makerLimits = (config: Config, env: Env): string[] => [
         `HOUSE_MAKER_REQUOTE_INTERVAL_MS is over ${MAKER_LIMITS.maxRequoteIntervalMs} ms. Quotes expire a little after it, so a long interval leaves them standing. Lower it.`,
       ]
     : []),
+  ...(config.MAGICBLOCK_MAX_AGE_MS > MAKER_LIMITS.maxMagicblockAgeMs
+    ? [
+        `MAGICBLOCK_MAX_AGE_MS is over ${MAKER_LIMITS.maxMagicblockAgeMs} ms, so the maker would quote through an outage of the rollup's price. Lower it.`,
+      ]
+    : []),
   ...(config.ROLLUP_MAKER_LEVEL_NUSD > MAKER_LIMITS.maxQuoteSizeNusd
     ? [
         `ROLLUP_MAKER_LEVEL_NUSD is over ${MAKER_LIMITS.maxQuoteSizeNusd / SCALE} nUSD, the most one quote level may hold. Lower it.`,
@@ -231,13 +256,14 @@ const makerLimits = (config: Config, env: Env): string[] => [
  */
 export const mainnetConfig = (config: Config, env: Env): Config => {
   const sized = withMakerDefaults(config, env);
+  const role = config.SIM_ROLE;
   const problems = [
     ...testMachinery(sized, env),
     ...makerLimits(sized, env),
-    ...secretsFromFiles(env),
-    ...gateSettings(sized, env),
-    ...publicUrls(env),
-    ...proxyHops(sized),
+    ...secretsFromFiles(env, role),
+    ...(servesAccountDesk(role) ? gateSettings(sized, env) : []),
+    ...(servesMarketData(role) ? publicUrls(env) : []),
+    ...(role === "maker" ? [] : proxyHops(sized)),
   ];
   if (problems.length > 0) {
     throw new Error(

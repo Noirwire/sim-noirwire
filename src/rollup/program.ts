@@ -31,7 +31,6 @@ import {
   ownFills,
   ownerActionMessage,
   ownerExpiry,
-  pythPriceAccount,
   randomSecret,
   sendAndConfirm,
   verifyOwnerSignature,
@@ -83,17 +82,13 @@ import { fetchWithin } from "./timeouts.js";
 import { sendDepositAndConfirm } from "./transactions.js";
 
 export type { OwnerMessageForm };
-export const CLIENT_RELEASE = "@noirwire/orderbook 0.9.0";
+export const CLIENT_RELEASE = "@noirwire/orderbook 0.10.0";
 /** How long an owner's signed action stays valid, on the rollup's clock. The program allows 120 seconds. */
 const OWNER_ACTION_LIFETIME_SECONDS = 100;
 /** The program's error number for "the exchange has opened its daily limit of new seats". */
 export const DAILY_SEAT_LIMIT_ERROR = 6137;
 /** The fee and insurance seats come first; traders sit from here up. */
 export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
-
-/** The address of Pyth's price account for a feed id (64 hex characters): the one a market bound to that feed reads. */
-export const pythPriceAccountOf = (feedIdHex: string): string =>
-  pythPriceAccount(Uint8Array.from(Buffer.from(feedIdHex, "hex"))).toBase58();
 
 const ORDER_KEY_SEARCH_WINDOW = 4_096;
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -585,16 +580,24 @@ export class Program {
   /**
    * A trader whose owner key this process holds and whose seat exists, or
    * null when it has none. Its order keys are picked up from `checkpoint`.
-   * Without one, or when the keys moved further than it reaches, all four
-   * are replaced by the first four of the derivation, signed by the owner.
+   *
+   * Without a checkpoint, or when the keys moved further than it reaches,
+   * `keyReset` decides. "replace" (the default) sends an owner-signed
+   * `set_order_keys` that puts the first four keys of the derivation in all
+   * four slots. That call is unconditional on chain, so any process holding
+   * the owner key can take the keys back with it, which is why "refuse"
+   * exists: it throws `KeyCheckpointRequired` and sends nothing. The one
+   * case "refuse" lets through is a view that already holds exactly the first
+   * four keys, where nothing has moved and nothing needs to be sent.
    */
   async ownTrader(
     rpcUrl: string,
     owner: Keypair,
     checkpoint?: KeyCheckpoint,
     life?: Generation,
+    keyReset: KeyReset = "replace",
   ): Promise<ProgramTrader | null> {
-    const connection = await signedInConnection(rpcUrl, owner, life, true);
+    const connection = await this.ownerConnection(rpcUrl, owner, life);
     const account = await connection.getAccountInfo(
       this.instructions.addresses.view(owner.publicKey),
     );
@@ -603,31 +606,82 @@ export class Program {
     let keys = checkpoint ? restoredKeys(seed, account.data, checkpoint) : null;
     if (!keys) {
       keys = OrderKeyManager.fresh(seed);
-      await sendAndConfirm(
-        connection,
-        [this.instructions.setOrderKeys(owner.publicKey, keys.publicKeys)],
-        owner,
-      );
+      if (keyReset === "refuse") {
+        if (!viewHoldsKeys(account.data, keys.publicKeys)) {
+          throw new KeyCheckpointRequired(owner.publicKey.toBase58(), checkpoint !== undefined);
+        }
+      } else {
+        await this.sendNewOrderKeys(connection, owner, keys);
+      }
     }
     return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection, life);
   }
 
-  /** As `ownTrader`, and opens the seat with the gate's signature when there is none. */
+  /** A connection signed in as `owner`: the one place a trader's own sign-in happens, so a test can stand in for it. */
+  protected ownerConnection(
+    rpcUrl: string,
+    owner: Keypair,
+    life?: Generation,
+  ): Promise<Connection> {
+    return signedInConnection(rpcUrl, owner, life, true);
+  }
+
+  private async sendNewOrderKeys(
+    connection: Connection,
+    owner: Keypair,
+    keys: OrderKeyManager,
+  ): Promise<void> {
+    await sendAndConfirm(
+      connection,
+      [this.instructions.setOrderKeys(owner.publicKey, keys.publicKeys)],
+      owner,
+    );
+  }
+
+  /**
+   * The deliberate reset: puts the first four keys of the derivation in all four slots, signed by
+   * the owner, and returns where the keys then stand, to be saved as the checkpoint. Null when
+   * the owner has no seat. Whoever else holds this owner key can undo it the same way, so it is
+   * only ever run with every other instance stopped.
+   */
+  async resetOrderKeys(
+    rpcUrl: string,
+    owner: Keypair,
+    life?: Generation,
+  ): Promise<KeyCheckpoint | null> {
+    const connection = await this.ownerConnection(rpcUrl, owner, life);
+    const account = await connection.getAccountInfo(
+      this.instructions.addresses.view(owner.publicKey),
+    );
+    if (!account) return null;
+    const keys = OrderKeyManager.fresh(orderKeySeedOf(owner));
+    await this.sendNewOrderKeys(connection, owner, keys);
+    return keys.checkpoint;
+  }
+
+  /**
+   * As `ownTrader`, and opens the seat with the gate's signature when there is none. The gate is
+   * reached only then: a seat that exists is picked up with the owner key alone, so a process
+   * that holds no gate key (or whose gate sign-in is down) still finds its seat.
+   */
   async openOwnTrader(
     rpcUrl: string,
     owner: Keypair,
-    gate: Keypair,
-    gateConnection: Connection,
+    gate: GateAccess | null,
     checkpoint?: KeyCheckpoint,
     life?: Generation,
+    keyReset: KeyReset = "replace",
   ): Promise<ProgramTrader> {
-    const existing = await this.ownTrader(rpcUrl, owner, checkpoint, life);
+    const existing = await this.ownTrader(rpcUrl, owner, checkpoint, life, keyReset);
     if (existing) return existing;
-    await sendAndConfirm(
-      gateConnection,
-      [this.instructions.openTrader(gate.publicKey, owner.publicKey, firstOrderKeys(owner))],
-      gate,
-      [owner],
+    if (!gate) throw new SeatNotOpen(owner.publicKey.toBase58());
+    await gate.use((connection) =>
+      sendAndConfirm(
+        connection,
+        [this.instructions.openTrader(gate.key.publicKey, owner.publicKey, firstOrderKeys(owner))],
+        gate.key,
+        [owner],
+      ),
     );
     return this.newTrader(rpcUrl, owner, life);
   }
@@ -639,6 +693,58 @@ export class Program {
     return new ProgramTrader(rpcUrl, owner, keys, this.programId, connection, life);
   }
 }
+
+/** What to do with order keys that cannot be picked up from a checkpoint: send new ones, or stop. */
+export type KeyReset = "replace" | "refuse";
+
+/** What a process that may open seats uses of the gate: its key, and a connection signed in as it. */
+export interface GateAccess {
+  key: Keypair;
+  use<T>(work: (connection: Connection) => Promise<T>): Promise<T>;
+}
+
+/**
+ * The maker's seat exists but there is no usable record of where its order keys stand, and the
+ * service is set not to replace them by itself. No wait cures it: an operator decides.
+ */
+export class KeyCheckpointRequired extends Error {
+  constructor(
+    readonly owner: string,
+    readonly checkpointWasSaved: boolean,
+  ) {
+    super(
+      `the seat of ${owner} exists, but ${
+        checkpointWasSaved
+          ? "its saved order key checkpoint no longer fits the keys on chain"
+          : "there is no saved order key checkpoint for it"
+      }. Refusing to start: replacing the order keys would let any other copy of this service holding the same owner key take them back. ` +
+        "If this is the right data directory and no other instance is running, restore the checkpoint (the snapshot file in DATA_DIR) " +
+        'or reset deliberately with "node dist/reset-order-keys.js" (it lists what it would do and asks for the owner address).',
+    );
+    this.name = "KeyCheckpointRequired";
+  }
+}
+
+/** A seat is missing for a process that holds no gate key and so cannot open one. */
+export class SeatNotOpen extends Error {
+  constructor(readonly owner: string) {
+    super(
+      `the seat of ${owner} is not open, and this process holds no gate key to open it. ` +
+        "Open it from the process that holds the gate key (the gate role or the combined service), then start this one again.",
+    );
+    this.name = "SeatNotOpen";
+  }
+}
+
+/** Whether the view holds exactly these four order keys, in order. */
+const viewHoldsKeys = (viewData: Buffer, keys: PublicKey[]): boolean => {
+  try {
+    const held = decodeView(viewData).orderKeys;
+    return held.length === keys.length && held.every((key, at) => key.equals(keys[at]));
+  } catch {
+    return false;
+  }
+};
 
 /** Null when the view's keys are not where the checkpoint says, nor within reach of it. */
 const restoredKeys = (

@@ -322,6 +322,10 @@ export class SeatLedger {
     };
     record.signatures = [...(record.signatures ?? []), signature];
     record.lastValidBlockHeight = Math.max(record.lastValidBlockHeight ?? 0, lastValidBlockHeight);
+    await this.saveOrRestore(record, before);
+  }
+
+  private async saveOrRestore(record: SeatRecord, before: Partial<SeatRecord>): Promise<void> {
     try {
       await this.save();
     } catch (error) {
@@ -349,12 +353,7 @@ export class SeatLedger {
     record.signatures = (record.signatures ?? []).filter((entry) => entry !== signature);
     if (lastValidBlockHeight === undefined) delete record.lastValidBlockHeight;
     else record.lastValidBlockHeight = lastValidBlockHeight;
-    try {
-      await this.save();
-    } catch (error) {
-      Object.assign(record, before);
-      throw error;
-    }
+    await this.saveOrRestore(record, before);
   }
 
   /** The rollup confirmed the seat. */

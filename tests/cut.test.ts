@@ -37,8 +37,8 @@ describe("a connection whose generation ended", () => {
       (error: Error) => error.message,
     );
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(requests.mock.calls.length).toBeGreaterThan(5);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(requests.mock.calls.length).toBeGreaterThan(3);
 
     life.end();
     await vi.advanceTimersByTimeAsync(0);

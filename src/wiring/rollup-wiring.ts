@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { liquidatorTraderKey, makerTraderKey, takerTraderKey } from "../bots/bot-traders.js";
-import { type Config, isMainnet, questSettings } from "../config/config.js";
+import { type Config, isMainnet, questSettings, requiresKeyCheckpoint } from "../config/config.js";
+import { runsMaker, servesAccountDesk, servesMarketData } from "../config/role.js";
 import type { SnapshotData } from "../data/snapshot.js";
 import { systemClock } from "../engine/clock.js";
 import { MARKETS, type MarketConfig } from "../engine/markets.js";
@@ -136,20 +137,29 @@ const botRoles = (
 export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   const { config, data, snapshot, onError, onRecovered } = options;
   const mainnet = isMainnet(config);
+  const role = config.SIM_ROLE;
+  const makerHere = runsMaker(role);
+  const deskHere = servesAccountDesk(role);
   const deployment = loadDeployment(config);
   if (mainnet) requireMainnetDeployment(deployment);
   const markets = deployedMarkets(deployment, MARKETS);
-  if (!deployment.faucet && (config.NOISE_TAKERS_ENABLED || config.LIQUIDATOR_ENABLED)) {
+  if (
+    makerHere &&
+    !deployment.faucet &&
+    (config.NOISE_TAKERS_ENABLED || config.LIQUIDATOR_ENABLED)
+  ) {
     throw new Error(
       "this deployment has no faucet, so only the house makers can run on it: " +
         "set NOISE_TAKERS_ENABLED=0 and LIQUIDATOR_ENABLED=0",
     );
   }
-  const takerKeys = config.NOISE_TAKERS_ENABLED
-    ? Array.from({ length: config.NOISE_TAKER_COUNT }, (_, i) => takerTraderKey(i))
-    : [];
-  const roles = botRoles(markets, takerKeys, config.LIQUIDATOR_ENABLED);
-  const settings = loadRollupSettings(config, deployment, roles.length);
+  const takerKeys =
+    makerHere && config.NOISE_TAKERS_ENABLED
+      ? Array.from({ length: config.NOISE_TAKER_COUNT }, (_, i) => takerTraderKey(i))
+      : [];
+  // A process that is not the maker has no bots at all: no seeds, no seats, nothing to open or fund.
+  const roles = makerHere ? botRoles(markets, takerKeys, config.LIQUIDATOR_ENABLED) : [];
+  const settings = loadRollupSettings(config, deployment, roles.length, role);
   // On mainnet the private endpoints may carry a key: no log line or answer repeats one.
   if (mainnet) {
     hideAddresses([
@@ -159,7 +169,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       settings.depositRpcUrl,
     ]);
   }
-  for (const [at, market] of markets.entries()) {
+  for (const [at, market] of makerHere ? markets.entries() : []) {
     onError(
       `the ${market.id} maker's seat owner is ${settings.botOwners[at]?.publicKey.toBase58()}; ` +
         "on a market with a maker list, the exchange admin lists it with set_seat_access",
@@ -176,10 +186,13 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     userOrders.startFrom(BigInt(snapshot.userOrderBaseline));
   }
 
-  const seatLedger = mainnet
-    ? new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock)
+  const seatLedger =
+    mainnet && deskHere
+      ? new SeatLedger(join(config.DATA_DIR, SEAT_RECORD_FILE), systemClock)
+      : null;
+  const quests = servesMarketData(role)
+    ? questServiceFor(config, markets, seatLedger, onError)
     : null;
-  const quests = questServiceFor(config, markets, seatLedger, onError);
 
   let rollup: RollupVenue | null = null;
   let networkChecked = false;
@@ -197,6 +210,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
       bots: roles.map((role, at) => ({ ...role, owner: settings.botOwners[at] })),
       recordedThrough: snapshot?.tapeCursors ?? {},
       keyCheckpoints: snapshot?.orderKeyCheckpoints ?? {},
+      keyReset: requiresKeyCheckpoint(config) ? "refuse" : "replace",
       handlers: {
         onFill: ({ fill, origin, botSides, replayed }) => {
           quests?.acceptFill(fill, botSides);
@@ -312,37 +326,40 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
   };
   let publicDescription: PublicDeployment | null = null;
 
+  // Mainnet hands out no funds. It opens accounts for the invited, and nobody else.
+  // Only the process that holds the gate key has a desk at all.
+  const mainnetDesk = {
+    openDesk: {
+      prepare: (request: OpenRequest) => viaOpenDesk((desk) => desk.prepare(request)),
+      submit: (owner: string, transaction: string, ip: string) =>
+        viaOpenDesk((desk) => desk.submit(owner, transaction, ip)),
+      prepareMessage: (request: OpenRequest) => viaOpenDesk((desk) => desk.prepareMessage(request)),
+      submitSigned: (owner: string, signature: string, expiresAt: number, ip: string) =>
+        viaOpenDesk((desk) => desk.submitSigned(owner, signature, expiresAt, ip)),
+    },
+    seatOccupancy: () => ({
+      viewsOpened: admission?.viewsOpened() ?? 0,
+      seatCapacity: rollup?.seatCapacity() ?? null,
+    }),
+  };
+  const testDesk = {
+    fundDesk: {
+      prepare: (owner: string, orderKeys: string[]) =>
+        viaDesk((desk) => desk.prepare(owner, orderKeys)),
+      submit: (owner: string, transaction: string) =>
+        viaDesk((desk) => desk.submit(owner, transaction)),
+    },
+  };
+  const deskRoutes = !deskHere ? {} : mainnet ? mainnetDesk : testDesk;
+
   return {
     venue,
     botVenue,
-    botMarkets: markets,
+    // Only the maker's process has bots to open; the others follow the chain and nothing more.
+    botMarkets: makerHere ? markets : [],
     rollupRoutes: {
       ...(quests ? { quests } : {}),
-      // Mainnet hands out no funds. It opens accounts for the invited, and nobody else.
-      ...(mainnet
-        ? {
-            openDesk: {
-              prepare: (request: OpenRequest) => viaOpenDesk((desk) => desk.prepare(request)),
-              submit: (owner: string, transaction: string, ip: string) =>
-                viaOpenDesk((desk) => desk.submit(owner, transaction, ip)),
-              prepareMessage: (request: OpenRequest) =>
-                viaOpenDesk((desk) => desk.prepareMessage(request)),
-              submitSigned: (owner: string, signature: string, expiresAt: number, ip: string) =>
-                viaOpenDesk((desk) => desk.submitSigned(owner, signature, expiresAt, ip)),
-            },
-            seatOccupancy: () => ({
-              viewsOpened: admission?.viewsOpened() ?? 0,
-              seatCapacity: rollup?.seatCapacity() ?? null,
-            }),
-          }
-        : {
-            fundDesk: {
-              prepare: (owner: string, orderKeys: string[]) =>
-                viaDesk((desk) => desk.prepare(owner, orderKeys)),
-              submit: (owner: string, transaction: string) =>
-                viaDesk((desk) => desk.submit(owner, transaction)),
-            },
-          }),
+      ...deskRoutes,
       readiness: () => rollup?.readiness() ?? NOT_CONNECTED,
       deployment: () => {
         if (!rollup) return null;
@@ -377,7 +394,7 @@ export const rollupWiring = (options: RollupWiringOptions): VenueWiring => {
     },
     botSizes,
     liquidationTargets: () => connected().nextLiquidationTargets(config.LIQUIDATOR_SEATS_PER_TICK),
-    afterMakersOpen: openTheOtherBots,
+    afterMakersOpen: makerHere ? openTheOtherBots : async () => {},
     needsFundingUpdater: false,
     snapshotExtras: () => ({
       tapeCursors: rollup?.tapeCursors() ?? snapshot?.tapeCursors ?? {},

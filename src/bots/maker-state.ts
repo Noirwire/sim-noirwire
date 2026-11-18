@@ -180,26 +180,24 @@ const writeMarker = (statePath: string, marker: Marker): Promise<void> =>
  */
 const readMarker = async (statePath: string): Promise<Marker | null> => {
   const path = failedMarkerPath(statePath);
+  const unreadable = (error: unknown): Error =>
+    new Error(
+      `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
+        "write failed before. Repair the state directory and inspect the state file, then start again.",
+      { cause: error },
+    );
   let text: string;
   try {
     await lstat(path);
   } catch (error) {
     if (isMissing(error)) return null;
-    throw new Error(
-      `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
-        "write failed before. Repair the state directory and inspect the state file, then start again.",
-      { cause: error },
-    );
+    throw unreadable(error);
   }
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
     if (isMissing(error)) return FAILED_MARKER;
-    throw new Error(
-      `the maker's recovery marker ${path} cannot be checked, so it is not known whether a state ` +
-        "write failed before. Repair the state directory and inspect the state file, then start again.",
-      { cause: error },
-    );
+    throw unreadable(error);
   }
   try {
     return markerSchema.parse(JSON.parse(text));

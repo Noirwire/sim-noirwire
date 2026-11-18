@@ -136,6 +136,42 @@ start when a required one is missing or a key is not the one the deployment name
 | `ROLLUP_MAKER_LEVEL_NUSD`, `ROLLUP_TAKER_MIN_NUSD` / `_MAX_`                                  | no         | Bot order sizes as notional                                                                                                                                               |
 | `LIQUIDATOR_SEATS_PER_TICK`                                                                   | no         | Consecutive seats the liquidator sweeps in one call per market per tick; the sweep walks the exchange's whole seat capacity                                               |
 
+### Running the parts as separate processes
+
+`node dist/main.js` runs everything in one process, as ever. For a cluster, the same image has three
+more entry points, each of which loads only its own settings, credentials and `DATA_DIR`, and
+answers its own `/v1/health`. All three need `VENUE=rollup`.
+
+| Entry point        | Role    | Holds                                | Serves                                                        |
+| ------------------ | ------- | ------------------------------------ | ------------------------------------------------------------- |
+| `dist/maker.js`    | `maker` | `BOT_TRADER_SEEDS`; never a gate key | its own health only                                           |
+| `dist/gate.js`     | `gate`  | the gate key, the seat record        | the account desk (`/v1/open`, or the fund routes off mainnet) |
+| `dist/data-api.js` | `data`  | no key at all                        | market data, the stream, `/v1/deployment`                     |
+
+A process refuses to start with a credential that is not its role's (the message names the variable,
+never the value). The maker never signs in the gate: a seat that exists is found with the owner key
+alone, and a seat that is missing stops it with a message to open it from the gate. The data API's
+readiness does not depend on the maker quoting.
+
+The keeper's heartbeat can come over the network instead of the file. Set `KEEPER_HEARTBEAT_URLS`
+(`id=url`, comma separated, one per keeper) and `KEEPER_HEARTBEAT_SECRETS_FILE` (`id=secret` per line,
+32 characters or more). Each keeper answers `GET <url>?nonce=<random>` with a JSON status and the header
+`x-keeper-signature`, the hex HMAC-SHA256 of the exact body under its own secret. The status is
+`{ v: 1, keeper, network, nonce, issuedAtMs, healthy, sweepSeq, sweepCompletedAtMs, failedSteps }`: `nonce`
+echoes the request, `healthy` is true only for a sweep that did not fail, ended no market at "stale price"
+and left no ALERT standing, and both times are the keeper's own clock (only their difference is used).
+`KEEPER_HEARTBEAT_MIN_HEALTHY` (1) says how many keepers must be fresh and healthy. A lost transport
+makes the maker go dark once the last healthy sweep is `KEEPER_HEARTBEAT_MAX_AGE_MS` old, as a stale file
+does; a wrong answer (bad signature, wrong nonce, unhealthy) counts at once. Setting both the file and the
+URLs stops the start.
+
+`REQUIRE_KEY_CHECKPOINT` (on by default on mainnet): a maker whose seat exists but whose saved order key
+checkpoint is missing, or no longer fits the chain, refuses to start instead of replacing its order keys
+(the replacement is unconditional on chain, so any other copy holding the owner key can take the keys back
+with it). A view that still holds the first four keys is picked up as it is. To reset deliberately, with
+every other instance stopped: `npm run reset-order-keys` lists the owners, and `-- --confirm <owner address>`
+replaces that owner's keys and saves the checkpoint.
+
 ### Mainnet mode
 
 `NETWORK=mainnet` runs only what a live market needs: the house maker, the gate and the
@@ -333,12 +369,13 @@ elsewhere is off by default and on mainnet cannot be set to 0):
 - **Quotes expire.** Every resting order carries the program's own expiry, the requote
   interval plus 10 s, so a maker that dies leaves no quote standing for longer than that.
   A stop of the service cancels its quotes first.
-- **A reference price.** It quotes around the median of Pyth's SOL/USD price and the
-  public tickers of Coinbase, Kraken and OKX, not around the NoirWire mark. Pyth's price is
-  read from its price account on Solana mainnet through `SOLANA_RPC_URL` (the account must be
-  fully verified and carry the SOL/USD feed id). It needs the oracle (none older than 30 s)
-  and at least two exchanges (none older than 10 s), within 30 bps of each other; else
-  it pulls its quotes and, once the prices are back, watches them for 10 s before quoting.
+- **A reference price.** It quotes around the median of the public tickers of Coinbase,
+  Kraken and OKX, not around the NoirWire mark. It needs at least two exchanges (none older
+  than 10 s), within 30 bps of each other; else it pulls its quotes and, once the prices are
+  back, watches them for 10 s before quoting.
+  With `MAGICBLOCK_REFERENCE=on` (the mainnet default) it quotes instead around MagicBlock's own
+  SOL/USD price inside the rollup, which updates about ten times a second, and pulls when that
+  price is more than 3 s old (`docs/deploy.md`).
 - **Widen and pull.** The half-spread is at least 15 bps and grows by half the price range
   of the last minute. A NoirWire mark more than 10 bps behind the reference widens it by
   the gap; more than 100 bps behind, or a move of more than 0.5% in 10 s, pulls the quotes
