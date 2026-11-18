@@ -76,7 +76,7 @@ const readWithinDeadline = <T>(
  * or more keepers) or, as ever, the file. With neither, mainnet fails closed and the other networks
  * leave the keeper out of it.
  */
-export const keeperHeartbeatFor = (config: Config): KeeperProblemSource => {
+const keeperHeartbeatFor = (config: Config): KeeperProblemSource => {
   if (config.KEEPER_HEARTBEAT_URLS && config.KEEPER_HEARTBEAT_SECRETS_FILE) {
     return new NetworkKeeperHeartbeat({
       sources: keeperSources(

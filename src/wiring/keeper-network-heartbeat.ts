@@ -7,7 +7,7 @@ import { KEEPER_NOT_READ_YET, type KeeperProblemSource } from "./keeper-heartbea
 export const KEEPER_SIGNATURE_HEADER = "x-keeper-signature";
 /** The query parameter the maker puts its random challenge in. The keeper echoes it in the signed body. */
 export const KEEPER_NONCE_PARAMETER = "nonce";
-export const KEEPER_STATUS_VERSION = 1;
+const KEEPER_STATUS_VERSION = 1;
 
 const NONCE_BYTES = 16;
 const REQUEST_TIMEOUT_MS = 5_000;

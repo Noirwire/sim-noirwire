@@ -9,7 +9,7 @@ import { z } from "zod";
  * orders around the reference price. stopped (the hard stop): quotes nothing,
  * which leaves users unable to close against it.
  */
-export const MAKER_MODES = ["run", "reduce", "flatten", "stopped"] as const;
+const MAKER_MODES = ["run", "reduce", "flatten", "stopped"] as const;
 export type MakerMode = (typeof MAKER_MODES)[number];
 
 /**
@@ -217,7 +217,7 @@ const RECOVERY_REQUIRED =
   "its resume was saved, but the recovery marker could not be removed. Run the kill switch " +
   '"resume" again to finish the recovery';
 
-export const NO_SAVED_STATE =
+const NO_SAVED_STATE =
   "no saved state was found for it, and with real money it does not start from a blank slate. " +
   'Check that the data directory is the right one, then run the kill switch "resume" to start it';
 

@@ -69,6 +69,7 @@ import type {
   SweepStop,
   Unsubscribe,
 } from "./chain-types.js";
+import { base58Of } from "./base58.js";
 import { backedOffSockets } from "./bot-socket.js";
 import { Session, connectionTo } from "./connections.js";
 import type { Generation } from "./generation.js";
@@ -238,20 +239,6 @@ const signerOf = (key: Keypair) => {
     type: "pkcs8",
   });
   return async (message: Uint8Array) => new Uint8Array(sign(null, message, privateKey));
-};
-
-const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-const base58Of = (bytes: Uint8Array): string => {
-  let number = 0n;
-  for (const byte of bytes) number = number * 256n + BigInt(byte);
-  let text = "";
-  for (; number > 0n; number /= 58n) text = BASE58[Number(number % 58n)] + text;
-  for (const byte of bytes) {
-    if (byte !== 0) break;
-    text = `1${text}`;
-  }
-  return text;
 };
 
 /**

@@ -115,7 +115,7 @@ export class OrderRefused extends Error {
  * no ledger to record an operator's review in. With a ledger such an order holds the maker until the
  * operator has looked.
  */
-export const UNKNOWN_ORDER_QUARANTINE_MS = 60_000;
+const UNKNOWN_ORDER_QUARANTINE_MS = 60_000;
 
 /** The unknown orders a hold remembers by name. */
 const HELD_ORDER_IDS = 5;

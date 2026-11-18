@@ -148,7 +148,7 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
 };
 
 /** `Expired`: a signed action or order reached the program after its expiry. */
-export const EXPIRED_ERROR = 6133;
+const EXPIRED_ERROR = 6133;
 
 /** What the program refused an owner's signed action for, in words for the person, with the HTTP status that fits. */
 export const ownerRefusalOf = (
