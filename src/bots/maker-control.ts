@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isMissing, writeAtomically } from "./maker-state.js";
 
 /** What an operator can ask for. Flattening is the maker's own answer to a loss limit, not a request. */
-export const CONTROL_MODES = ["run", "reduce", "stopped"] as const;
+const CONTROL_MODES = ["run", "reduce", "stopped"] as const;
 export type ControlMode = (typeof CONTROL_MODES)[number];
 
 /** What an operator asks of every maker on this service, through a file only someone on the machine can write. */

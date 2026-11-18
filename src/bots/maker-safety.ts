@@ -87,16 +87,12 @@ export class PriceHistory {
 }
 
 /** How far apart two prices are, in bps of the second. */
-export const bpsApart = (price: bigint, against: bigint): number =>
+const bpsApart = (price: bigint, against: bigint): number =>
   Number((absBigInt(price - against) * SCALE_OF_BPS) / against) / 1_000;
 
 /** The seat's equity, given at the venue's `mark`, valued at `price` instead. */
-export const equityAtPrice = (
-  equity: bigint,
-  position: bigint,
-  mark: bigint,
-  price: bigint,
-): bigint => equity + mulDivScale(position, price - mark);
+const equityAtPrice = (equity: bigint, position: bigint, mark: bigint, price: bigint): bigint =>
+  equity + mulDivScale(position, price - mark);
 
 /**
  * The seat's equity at the venue's mark, or at the reference price when that

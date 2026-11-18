@@ -5,13 +5,12 @@ import {
   type SimRole,
   holdsGateKey,
   holdsMakerSeeds,
+  isSet,
   servesAccountDesk,
   servesMarketData,
 } from "./role.js";
 
 type Env = NodeJS.ProcessEnv;
-
-const isSet = (env: Env, name: string): boolean => (env[name] ?? "") !== "";
 
 /** Switches that start test machinery. Mainnet never runs it: set to 1, they stop the start. */
 const TEST_SWITCHES = [

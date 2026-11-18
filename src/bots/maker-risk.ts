@@ -1,5 +1,5 @@
 import type { Clock } from "../engine/clock.js";
-import { mulDivScale, toDecimalString } from "../engine/money.js";
+import { BPS_PER_WHOLE, mulDivScale, toDecimalString } from "../engine/money.js";
 import type { OrderView } from "../engine/types.js";
 import { sol } from "../hedge/hedge-controller.js";
 import { MAKER_LIMITS } from "./maker-limits.js";
@@ -12,7 +12,6 @@ export interface MakerVoice {
   notice(message: string): void;
 }
 
-const BPS = 10_000n;
 const KILL_SWITCH_HINT =
   'When the market is checked, run the kill switch with "resume" to start again.';
 
@@ -28,10 +27,14 @@ const breachOf = (
   drawdownBps: number,
 ): string | null => {
   const { dayStartEquity: start, peakEquity: peak } = state;
-  if (start !== null && start > 0n && (start - equity) * BPS >= start * BigInt(dailyLossBps)) {
+  if (
+    start !== null &&
+    start > 0n &&
+    (start - equity) * BPS_PER_WHOLE >= start * BigInt(dailyLossBps)
+  ) {
     return `it lost ${nusd(start - equity)} nUSD today, ${dailyLossBps / 100}% of the ${nusd(start)} it started the UTC day with`;
   }
-  if (peak !== null && peak > 0n && (peak - equity) * BPS >= peak * BigInt(drawdownBps)) {
+  if (peak !== null && peak > 0n && (peak - equity) * BPS_PER_WHOLE >= peak * BigInt(drawdownBps)) {
     return `it is ${nusd(peak - equity)} nUSD below its peak of ${nusd(peak)}, ${drawdownBps / 100}% or more`;
   }
   return null;

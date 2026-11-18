@@ -20,7 +20,7 @@ export type NotAdmitted = { ok: false; status: 403 | 409 | 429 | 503; reason: st
 const NEXT_DAY = "it resets at 00:00 UTC";
 
 /** Prepares that nobody has submitted yet which one network address may hold at once. */
-export const HELD_RESERVATIONS_PER_ADDRESS = 1;
+const HELD_RESERVATIONS_PER_ADDRESS = 1;
 
 /** The day is full, but some of its seats are prepares that have not been submitted and may be freed. */
 export const RESERVATIONS_HELD: NotAdmitted = {

@@ -27,7 +27,7 @@ export const holdsMakerSeeds = runsMaker;
 
 type Env = NodeJS.ProcessEnv;
 
-const isSet = (env: Env, name: string): boolean => (env[name] ?? "") !== "";
+export const isSet = (env: Env, name: string): boolean => (env[name] ?? "") !== "";
 
 const KEEPER_SETTINGS = [
   "KEEPER_HEARTBEAT_FILE",

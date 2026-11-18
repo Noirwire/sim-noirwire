@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { DECIMAL_TEXT, fromDecimalString } from "../engine/money.js";
 import { mainnetConfig } from "./mainnet.js";
-import { SIM_ROLES, type SimRole, roleProblems } from "./role.js";
+import { SIM_ROLES, type SimRole, isSet, roleProblems } from "./role.js";
 
 const decimalAmount = (defaultValue: string) =>
   z
@@ -255,8 +255,6 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env, entryRole?: Sim
   }
   return isMainnet(config) ? mainnetConfig(config, env) : config;
 };
-
-const isSet = (env: NodeJS.ProcessEnv, name: string): boolean => (env[name] ?? "") !== "";
 
 const keeperTransportProblems = (config: Config, env: NodeJS.ProcessEnv): string[] => [
   ...(isSet(env, "KEEPER_HEARTBEAT_FILE") && config.KEEPER_HEARTBEAT_URLS

@@ -17,9 +17,7 @@ export class HedgeVenueLoadError extends Error {
 }
 
 /** The settings the module is given: every HEDGE_VENUE_* variable but the module's path, without the prefix. */
-export const venueModuleConfig = (
-  env: Record<string, string | undefined>,
-): Record<string, string> => {
+const venueModuleConfig = (env: Record<string, string | undefined>): Record<string, string> => {
   const settings: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
     if (!name.startsWith(CONFIG_PREFIX) || name === MODULE_VARIABLE || value === undefined)

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { MAKER_LIMITS } from "../bots/maker-limits.js";
 import type { Clock } from "../engine/clock.js";
-import { DECIMAL_TEXT, absBigInt, fromDecimalString } from "../engine/money.js";
+import { BPS_PER_WHOLE, DECIMAL_TEXT, absBigInt, fromDecimalString } from "../engine/money.js";
 
 export interface PriceReading {
   source: string;
@@ -46,7 +46,7 @@ const MS_PER_SECOND = 1_000;
  * exchange reading may be 10 s old, and Kraken allows about one call a second
  * per address, so every 2 s keeps each well inside both.
  */
-export const EXCHANGE_MIN_INTERVAL_MS = 2_000;
+const EXCHANGE_MIN_INTERVAL_MS = 2_000;
 
 const dollars = (text: string): bigint => {
   if (!DECIMAL_TEXT.test(text)) throw new Error(`"${text}" is not a plain decimal price`);
@@ -133,8 +133,6 @@ export const referenceSources = (
   },
 ];
 
-const BPS = 10_000n;
-
 const median = (prices: bigint[]): bigint => {
   const sorted = [...prices].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const middle = sorted.length >> 1;
@@ -185,8 +183,8 @@ export const referenceOf = (
   const widest = absBigInt(
     prices.reduce((a, b) => (a > b ? a : b)) - prices.reduce((a, b) => (a < b ? a : b)),
   );
-  if (widest * BPS > middle * BigInt(MAKER_LIMITS.maxSourceDisagreementBps)) {
-    const bps = Number((widest * BPS * 10n) / middle) / 10;
+  if (widest * BPS_PER_WHOLE > middle * BigInt(MAKER_LIMITS.maxSourceDisagreementBps)) {
+    const bps = Number((widest * BPS_PER_WHOLE * 10n) / middle) / 10;
     return { ok: false, reason: `the price sources are ${bps} bps apart` };
   }
   if (staleExchanges.length === 0) return { ok: true, price: middle };
