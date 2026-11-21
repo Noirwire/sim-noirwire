@@ -10,6 +10,9 @@ export const NOT_SEATED_ERROR = SEAT_ERROR.notSeated;
 /** `SeatDepositTooSmall`: a deposit that would take a seat was spot, or below the exchange's minimum. */
 export const SEAT_DEPOSIT_TOO_SMALL_ERROR = SEAT_ERROR.seatDepositTooSmall;
 
+/** `LayoutNotActive`: the exchange's seat layout is not live yet, so ordinary trading is refused during an upgrade. */
+export const LAYOUT_NOT_ACTIVE_ERROR = 6175;
+
 const OWNER_TRANSACTION_ERROR = {
   invalidProof: 6151,
   wrongNonce: 6152,
@@ -135,12 +138,16 @@ const PROGRAM_ERROR_NAMES: Record<number, string> = {
   6150: "CustodyCapReached",
   [NOT_SEATED_ERROR]: "NotSeated",
   [SEAT_DEPOSIT_TOO_SMALL_ERROR]: "SeatDepositTooSmall",
-  [SEAT_ERROR.layoutNotMigrated]: "LayoutNotMigrated",
-  [SEAT_ERROR.alreadyMigrated]: "AlreadyMigrated",
   [SEAT_ERROR.ledgerTooLarge]: "LedgerTooLarge",
-  [SEAT_ERROR.relayoutOutOfOrder]: "RelayoutOutOfOrder",
-  [SEAT_ERROR.relayoutMismatch]: "RelayoutMismatch",
-  [SEAT_ERROR.relayoutIncomplete]: "RelayoutIncomplete",
+  6094: "SeatEpochExhausted",
+  6174: "TriggerBookCorrupt",
+  [LAYOUT_NOT_ACTIVE_ERROR]: "LayoutNotActive",
+  6176: "LayoutAlreadyActive",
+  6177: "SeatLayoutUnexpected",
+  6178: "LayoutScanIncomplete",
+  6179: "ExchangeNotPaused",
+  6180: "TooManyPerpMarkets",
+  6181: "MarketNotRebound",
   [OWNER_TRANSACTION_ERROR.invalidProof]: "InvalidOwnerProof",
   [OWNER_TRANSACTION_ERROR.wrongNonce]: "WrongOwnerNonce",
   [OWNER_TRANSACTION_ERROR.expiryTooFar]: "OwnerExpiryTooFar",
@@ -221,12 +228,8 @@ const SEAT_REFUSAL_TEXT: Record<number, string> = {
     "this account holds no seat right now. Nothing changed: deposit collateral to take one",
   [SEAT_DEPOSIT_TOO_SMALL_ERROR]:
     "the first deposit of an account must be collateral and at least what the exchange asks for a seat. Nothing changed",
-  [SEAT_ERROR.relayoutOutOfOrder]:
-    "the exchange is moving to a new seat ledger and cannot take this step right now. Nothing changed",
-  [SEAT_ERROR.relayoutMismatch]:
-    "the exchange's move to a new seat ledger found a seat it could not copy. Nothing changed: tell the operator",
-  [SEAT_ERROR.relayoutIncomplete]:
-    "the exchange's move to a new seat ledger is not finished yet. Nothing changed: try again later",
+  [LAYOUT_NOT_ACTIVE_ERROR]:
+    "the exchange is being upgraded and takes no trading right now. Nothing changed: try again later",
 };
 
 /** What the program refused for, in words for the person, when it is one of the seat refusals; else null. */

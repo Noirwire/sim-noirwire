@@ -3671,6 +3671,7 @@ describe("a ladder is recorded before any order of it is sent", () => {
       "StalePrice (6038)",
       "MarketPaused (6031)",
       "ExchangePaused (6030)",
+      "LayoutNotActive (6175)",
       "MarketReduceOnly (6032)",
       "OracleDislocated (6077)",
     ]) {

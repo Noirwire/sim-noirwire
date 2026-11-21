@@ -6,6 +6,7 @@ import { SEAT_MARKET_SLOTS, type MemoryVenue } from "../src/engine/memory-venue.
 import type { NewOrder, Venue } from "../src/engine/types.js";
 import { isNotSeated, rejectedOrder } from "../src/engine/venue-orders.js";
 import {
+  LAYOUT_NOT_ACTIVE_ERROR,
   NOT_SEATED_ERROR,
   SLOTS_FULL_ERROR,
   programErrorLabel,
@@ -182,10 +183,10 @@ describe("the program's seat refusals in words", () => {
   it("names the codes and says what to do in plain words, without an em dash", () => {
     expect(programErrorLabel(SLOTS_FULL_ERROR)).toBe("SlotsFull (6093)");
     expect(programErrorLabel(NOT_SEATED_ERROR)).toBe("NotSeated (6155)");
-    for (const code of [6156, 6160, 6161, 6162]) {
+    for (const code of [6156, LAYOUT_NOT_ACTIVE_ERROR]) {
       expect(programErrorLabel(code)).not.toContain("unnamed");
     }
-    for (const code of [SLOTS_FULL_ERROR, NOT_SEATED_ERROR, 6156, 6160, 6161, 6162]) {
+    for (const code of [SLOTS_FULL_ERROR, NOT_SEATED_ERROR, 6156, LAYOUT_NOT_ACTIVE_ERROR]) {
       const text = programRefusalText(code);
       expect(text).not.toBeNull();
       expect(text).not.toContain(String.fromCharCode(0x2014));
