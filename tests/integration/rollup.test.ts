@@ -1,18 +1,19 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { clockOf } from "@noirwire/orderbook";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { prepareRequest, submitRequest } from "../../scripts/fund-client.js";
 import { type RunningApp, startApp } from "../../src/app.js";
+import { MAKER_LIMITS } from "../../src/bots/maker-limits.js";
 import { loadConfig } from "../../src/config/config.js";
-import { NVDAX_MINT, SOL_MINT } from "../../src/prices/mints.js";
 import { connectionTo } from "../../src/rollup/connections.js";
 import { Program, type ProgramTrader } from "../../src/rollup/program.js";
 import type { PublicDeployment } from "../../src/rollup/public-deployment.js";
 import { dollars } from "../helpers.js";
 import { CuttableProxy } from "./cuttable-proxy.js";
-import { FixedPriceSource } from "./fixed-price-source.js";
+import { startPricePublisher } from "./price-publisher.js";
 
 const LOCALNET = process.env.ORDERBOOK_LOCALNET;
 if (!LOCALNET) throw new Error("Run this suite with `make test-rollup`.");
@@ -21,12 +22,13 @@ const ROLLUP_RPC_URL = "http://127.0.0.1:6699";
 const ROLLUP_WS_URL = "ws://127.0.0.1:6700";
 const PERP = "NSOL-PERP";
 const PERP_ID = 0;
+/** The two perpetuals and the spot market the local set-up creates; each needs a fresh mark to take orders. */
+const ALL_MARKET_IDS = [0, 1, 2];
 const SOL_LOT = 1_000n;
 const SOL_LOTS_PER_UNIT = 1_000n;
 const GRANT_ATOMS = 5_000_000_000n;
-/** Far from the 150 the local set-up publishes, so every start has a walk of several publishes. */
-const REAL_SOL_PRICE = 139;
-
+/** The mark the local set-up publishes, which the local oracle then keeps fresh without moving it. */
+const SETUP_SOL_PRICE = 150;
 const localFile = (name: string): string => readFileSync(join(LOCALNET, name), "utf8");
 const deployment = JSON.parse(localFile("deployment.json")) as { programId: string };
 const program = new Program(deployment.programId);
@@ -40,8 +42,8 @@ const network = new CuttableProxy([
   { listen: PROXY_RPC_PORT, target: 6699 },
   { listen: PROXY_RPC_PORT + 1, target: 6700 },
 ]);
-const prices = new FixedPriceSource();
 
+let quoteLifeSeconds = 0;
 let running: RunningApp;
 let base: string;
 
@@ -90,11 +92,6 @@ const eventually = async <T>(
   throw new Error(`timed out waiting for ${what}`);
 };
 
-const pushPrices = (sol: number, nvda: number): void => {
-  prices.push({ id: SOL_MINT, price: dollars(sol), atMs: Date.now() });
-  prices.push({ id: NVDAX_MINT, price: dollars(nvda), atMs: Date.now() });
-};
-
 interface User {
   owner: Keypair;
 }
@@ -129,18 +126,17 @@ const startService = async (extraEnv: Record<string, string> = {}): Promise<Warm
     NOISE_TAKER_MAX_INTERVAL_MS: "900",
     ...extraEnv,
   } as NodeJS.ProcessEnv);
-  running = await startApp({ ...config, PORT: 0 }, { priceSource: prices });
+  quoteLifeSeconds =
+    Math.ceil(config.HOUSE_MAKER_REQUOTE_INTERVAL_MS / 1_000) + MAKER_LIMITS.expiryMarginSeconds;
+  running = await startApp({ ...config, PORT: 0 });
   base = `http://127.0.0.1:${running.port}`;
-  pushPrices(REAL_SOL_PRICE, 181);
-  const seen: WarmUp = { warmingUp: false, healthyMeanwhile: false, fillsMeanwhile: 0 };
+  const seen: WarmUp = { warmingUp: false, healthyMeanwhile: false };
   await eventually("the service to report healthy", async () => {
-    pushPrices(REAL_SOL_PRICE, 181);
     const market = (await getJson("/v1/markets")).body.markets.find((entry) => entry.id === PERP);
     const healthy = (await getJson("/v1/health")).status === 200;
     if (market?.warmingUp) {
       seen.warmingUp = true;
       seen.healthyMeanwhile ||= healthy;
-      seen.fillsMeanwhile += (await getJson(`/v1/tape?market=${PERP}&limit=500`)).body.fills.length;
     }
     return healthy;
   });
@@ -150,28 +146,42 @@ const startService = async (extraEnv: Record<string, string> = {}): Promise<Warm
 interface WarmUp {
   warmingUp: boolean;
   healthyMeanwhile: boolean;
-  fillsMeanwhile: number;
 }
 
 let firstStart: WarmUp;
 
+let stopPublishing: (() => void) | null = null;
+
 beforeAll(async () => {
+  stopPublishing = await startPricePublisher(LOCALNET, deployment.programId, ALL_MARKET_IDS);
   await network.start();
   firstStart = await startService();
 });
 
+/**
+ * A stopped service leaves its makers' quotes standing until the chain's clock passes their expiry,
+ * and the next suite on this network would otherwise trade against quotes it cannot recognise as
+ * the house's.
+ */
+const untilQuotesLapse = async (stoppedAtSeconds: number): Promise<void> => {
+  const lapsedAfter = stoppedAtSeconds + quoteLifeSeconds;
+  while ((await clockOf(chain)) <= lapsedAfter) await new Promise((r) => setTimeout(r, 1_000));
+};
+
 afterAll(async () => {
+  stopPublishing?.();
   network.restore();
+  const stoppedAtSeconds = await clockOf(chain);
   await running?.close();
+  await untilQuotesLapse(stoppedAtSeconds);
   await network.stop();
   rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
 describe("the service on the real program (local network)", () => {
-  it("keeps the walk from the set-up price to the real one out of the chart, the tape and its health", async () => {
+  it("keeps the warm-up out of the chart and its health", async () => {
     expect(firstStart.warmingUp).toBe(true);
     expect(firstStart.healthyMeanwhile).toBe(false);
-    expect(firstStart.fillsMeanwhile).toBe(0);
 
     const market = (await getJson("/v1/markets")).body.markets.find((entry) => entry.id === PERP);
     expect(market?.warmingUp).toBe(false);
@@ -181,24 +191,20 @@ describe("the service on the real program (local network)", () => {
       return body.candles.length > 0 && body.candles;
     });
     for (const candle of candles) {
-      expect(Number(candle.high)).toBeLessThan(REAL_SOL_PRICE * 1.01);
-      expect(Number(candle.low)).toBeGreaterThan(REAL_SOL_PRICE * 0.99);
+      expect(Number(candle.high)).toBeLessThan(SETUP_SOL_PRICE * 1.01);
+      expect(Number(candle.low)).toBeGreaterThan(SETUP_SOL_PRICE * 0.99);
     }
   });
 
-  it("walks a new price onto the chain and reports the chain's mark in /v1/markets", async () => {
-    pushPrices(152.3, 181);
-    const onChain = await eventually("the feed to reach 152.3", async () => {
-      const feed = await program.price(chain, PERP_ID);
-      return feed.price === 152_300n && feed;
-    });
-    expect(onChain.price * SOL_LOTS_PER_UNIT).toBe(dollars(152.3));
+  it("reports the chain's mark in /v1/markets", async () => {
+    const onChain = await program.price(chain, PERP_ID);
+    expect(onChain.price * SOL_LOTS_PER_UNIT).toBe(dollars(SETUP_SOL_PRICE));
 
-    const reported = await eventually("/v1/markets to show 152.3", async () => {
+    const reported = await eventually("/v1/markets to show the chain's mark", async () => {
       const market = (await getJson("/v1/markets")).body.markets.find(
         (entry: { id: string }) => entry.id === PERP,
       );
-      return market?.markPrice === "152.300000" && market;
+      return market?.markPrice === `${SETUP_SOL_PRICE}.000000` && market;
     });
     expect(reported.tickSize).toBe("0.100000");
     expect(reported.lotSize).toBe("0.001000");
@@ -260,13 +266,17 @@ describe("the service on the real program (local network)", () => {
 
       const mark = (await program.price(chain, PERP_ID)).price;
       const lots = 40n;
-      const placed = await trader.place(PERP_ID, {
-        side: "buy",
-        type: "market",
-        price: mark + 1_500n,
-        size: lots,
-        reduceOnly: false,
-        secret: new Uint8Array(randomBytes(16)),
+      // The maker's book is empty for an instant while it requotes, and a market order then fills nothing.
+      const placed = await eventually("a market order to find the maker's quotes", async () => {
+        const result = await trader.place(PERP_ID, {
+          side: "buy",
+          type: "market",
+          price: mark + 1_500n,
+          size: lots,
+          reduceOnly: false,
+          secret: new Uint8Array(randomBytes(16)),
+        });
+        return result.status !== "cancelled" && result;
       });
       expect(placed.status).toBe("filled");
       expect(placed.filled).toBe(lots);
@@ -351,7 +361,7 @@ describe("the service on the real program (local network)", () => {
     await startService();
     const stats = await eventually("the restarted bots to have orders executed", async () => {
       const { body } = await getJson("/v1/stats");
-      return body.orders.bot >= 5 && body;
+      return body.orders.bot >= 5 && body.latency.sampleSize > 0 && body;
     });
     expect(stats.latency.sampleSize).toBeGreaterThan(0);
   });
@@ -359,7 +369,6 @@ describe("the service on the real program (local network)", () => {
   it("says it is not healthy while its network fails and then hangs, and heals by itself when it returns", async () => {
     const healthNow = async () => (await getJson("/v1/health")).status;
     const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-    const keepPricing = setInterval(() => pushPrices(REAL_SOL_PRICE, 181), 1_000);
     try {
       network.cut("refuse");
       await eventually("health to turn 503 once the network refuses", async () => {
@@ -372,13 +381,11 @@ describe("the service on the real program (local network)", () => {
 
       const cutUntil = Date.now();
       const fillsBefore = (await program.tape(chain, PERP_ID)).lastSequence;
-      const priceBefore = (await program.price(chain, PERP_ID)).publishTimeSeconds;
       network.restore();
       await eventually("health to turn 200 again", async () => (await healthNow()) === 200, 60_000);
       // Loops that failed for a while wait up to 30 s before they ask again.
       expect(Date.now() - cutUntil).toBeLessThan(60_000);
 
-      expect((await program.price(chain, PERP_ID)).publishTimeSeconds).toBeGreaterThan(priceBefore);
       await eventually("the bots to fill again", async () => {
         return (await program.tape(chain, PERP_ID)).lastSequence > fillsBefore;
       });
@@ -388,10 +395,10 @@ describe("the service on the real program (local network)", () => {
         return latest.sequence > Number(fillsBefore) || latest.sequence > served.sequence;
       });
     } finally {
-      clearInterval(keepPricing);
       network.restore();
     }
-  });
+    // The makers hold their quotes until the orders the cut left unsettled are known, which takes over a minute.
+  }, 240_000);
 
   it("sends nothing to the rollup while nobody uses it, and wakes on the next request", async () => {
     await running.close();
@@ -402,23 +409,18 @@ describe("the service on the real program (local network)", () => {
       const { status, body } = await getJson("/v1/health");
       return status === 200 && body.awake === false;
     });
-    const publishedAt = (await program.price(chain, PERP_ID)).publishTimeSeconds;
     const fillsAt = (await program.tape(chain, PERP_ID)).lastSequence;
 
     await pause(15_000);
-    expect((await program.price(chain, PERP_ID)).publishTimeSeconds).toBe(publishedAt);
     expect((await program.tape(chain, PERP_ID)).lastSequence).toBe(fillsAt);
     const stillAsleep = await getJson("/v1/health");
     expect(stillAsleep.status).toBe(200);
     expect(stillAsleep.body.awake).toBe(false);
 
-    pushPrices(REAL_SOL_PRICE, 181);
     const waking = await getJson("/v1/markets");
     expect(waking.body.markets.every((market) => market.warmingUp)).toBe(true);
-    await eventually("a fresh price on chain", async () => {
-      return (await program.price(chain, PERP_ID)).publishTimeSeconds > publishedAt;
-    });
     await eventually("the bots to fill again", async () => {
+      await getJson("/v1/markets");
       return (await program.tape(chain, PERP_ID)).lastSequence > fillsAt;
     });
     const awake = await getJson("/v1/health");
