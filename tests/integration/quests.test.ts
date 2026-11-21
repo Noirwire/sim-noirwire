@@ -2,15 +2,8 @@ import { createHash, createPrivateKey, randomBytes, sign } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type IncomingHttpHeaders, type Server, createServer } from "node:http";
 import { join } from "node:path";
-import {
-  Instructions,
-  ROLE,
-  clockOf,
-  decodePriceFeed,
-  receipt,
-  sendAndConfirm,
-} from "@noirwire/orderbook";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { ROLE, receipt } from "@noirwire/orderbook";
+import { Keypair } from "@solana/web3.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { prepareRequest, submitRequest } from "../../scripts/fund-client.js";
 import { type RunningApp, startApp } from "../../src/app.js";
@@ -25,6 +18,7 @@ import type { ChainFill } from "../../src/rollup/chain-types.js";
 import { dollars } from "../helpers.js";
 import { type Signer, newSigner } from "../quest-helpers.js";
 import { FixedPriceSource } from "./fixed-price-source.js";
+import { startPricePublisher } from "./price-publisher.js";
 
 const LOCALNET = process.env.ORDERBOOK_LOCALNET;
 if (!LOCALNET) throw new Error("Run this suite with `make test-rollup`.");
@@ -281,45 +275,8 @@ const seedEarlierDays = (wallet: string): void => {
   writeFileSync(join(QUESTS_DIR, "credits.json"), JSON.stringify({ credits }));
 };
 
-const PUBLISH_EVERY_MS = 1_000;
-const ROLLUP_PORT_URL = "http://127.0.0.1:7799";
 const PERP_MARKET_IDS = [0, 1];
-let publishing: ReturnType<typeof setInterval> | null = null;
-let publishingNow = false;
-
-const startPricePublisher = async (): Promise<void> => {
-  const oracle = Keypair.fromSecretKey(
-    Uint8Array.from(JSON.parse(localFile("localnet-oracle.json")) as number[]),
-  );
-  const connection = new Connection(ROLLUP_PORT_URL, "confirmed");
-  const instructions = new Instructions(new PublicKey(deployment.programId));
-  const publishOnce = async (): Promise<void> => {
-    const time = BigInt(await clockOf(connection));
-    for (const marketId of PERP_MARKET_IDS) {
-      const account = await connection.getAccountInfo(instructions.addresses.priceFeed(marketId));
-      if (!account) throw new Error(`market ${marketId} has no price feed`);
-      const feed = decodePriceFeed(account.data);
-      if (feed.publishTime >= time || feed.acceptedAt >= time) continue;
-      await sendAndConfirm(
-        connection,
-        [instructions.publishPrice(oracle.publicKey, marketId, feed.price, time)],
-        oracle,
-      );
-    }
-  };
-  await publishOnce();
-  publishing = setInterval(() => {
-    if (publishingNow) return;
-    publishingNow = true;
-    publishOnce()
-      .catch((error: unknown) => {
-        process.stderr.write(`price publish failed: ${String(error).slice(0, 120)}\n`);
-      })
-      .finally(() => {
-        publishingNow = false;
-      });
-  }, PUBLISH_EVERY_MS);
-};
+let stopPublishing: (() => void) | null = null;
 
 const perpOnlyDeployment = (): string => {
   const whole = JSON.parse(localFile("deployment.json")) as { markets: { kind: string }[] };
@@ -333,7 +290,7 @@ const perpOnlyDeployment = (): string => {
 };
 
 beforeAll(async () => {
-  await startPricePublisher();
+  stopPublishing = await startPricePublisher(LOCALNET, deployment.programId, PERP_MARKET_IDS);
   const pushUrl = await startStandIn();
   seedEarlierDays(users.c.wallet.key);
   const config = loadConfig({
@@ -371,7 +328,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (publishing) clearInterval(publishing);
+  stopPublishing?.();
   for (const user of Object.values(users)) user.trader?.close();
   await running?.close();
   await new Promise<void>((resolve) => standIn?.close(() => resolve()));
