@@ -158,7 +158,7 @@ const ORDER_EXPIRED = /OrderExpired/;
  * maker drops the ladder and waits for the venue as it would have, rather than stopping.
  */
 const VENUE_STATE_REFUSAL =
-  /ExchangePaused|MarketPaused|MarketReduceOnly|StalePrice|OracleDislocated|QuoteGuardTripped/;
+  /ExchangePaused|LayoutNotActive|MarketPaused|MarketReduceOnly|StalePrice|OracleDislocated|QuoteGuardTripped/;
 
 const isRoutineRefusal = (order: NewOrder, reason: string | undefined): boolean =>
   ROUTINE_REFUSAL.test(reason ?? "") ||
